@@ -242,9 +242,8 @@ export const deleteCard = async (cardId: string): Promise<ApiResponse> => {
   return del(`/cards/${cardId}`);
 };
 
-export const getCardDetails = async (cardId: string): Promise<any> => {
-  return get(`/cards/${cardId}/details`);
-};
+// 注：原 getCardDetails 调用不存在的 /cards/{id}/details，且全项目无任何调用方，
+// 已移除。若后续需要卡密详情，请直接使用 GET /cards/{id}。
 
 // Items
 export const getItems = async (): Promise<Item[]> => {
@@ -528,7 +527,8 @@ export const deleteAccountNotifications = async (cookieId: string): Promise<ApiR
 
 // Default Reply
 export const getDefaultReplies = async (): Promise<Record<string, DefaultReply>> => {
-  return get('/api/default-replies');
+  // 后端实际路由为 GET /default-replies（reply_server.py），此前误写为 /api/default-replies 导致 404
+  return get('/default-replies');
 };
 
 export const getDefaultReply = async (cookieId: string): Promise<DefaultReply> => {

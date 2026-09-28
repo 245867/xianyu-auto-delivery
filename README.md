@@ -1,11 +1,15 @@
+<div align="center">
+
 # 闲鱼智控 Pro
 
-闲鱼自动发货、自动回复、AI 智能议价一体化管理系统。基于 FastAPI + React 构建，支持多账号管理、卡密库存、订单同步、关键词规则与 AI 回复。
+**闲鱼自动发货、自动回复与 AI 智能议价一体化管理系统**
 
-![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
-![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)
-![React](https://img.shields.io/badge/react-19-61DAFB)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.111%2B-009688)
+[![Language](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-4D4D4D?style=for-the-badge)
+![UI](https://img.shields.io/badge/UI-Web%20React-0A8FCC?style=for-the-badge)
+[![License](https://img.shields.io/badge/License-AGPL--3.0-2E7D32?style=for-the-badge&logo=gnu&logoColor=white)](LICENSE)
+
+</div>
 
 ---
 
@@ -14,18 +18,21 @@
 - [项目简介](#项目简介)
 - [界面预览](#界面预览)
 - [核心功能](#核心功能)
+- [系统架构](#系统架构)
 - [技术栈](#技术栈)
 - [环境要求](#环境要求)
 - [快速开始](#快速开始)
-- [Docker 部署](#docker-部署)
+- [容器化部署（Docker）](#容器化部署docker)
 - [认证配置](#认证配置)
-- [AI 服务商配置](#ai-服务商配置)
+- [人工智能服务商配置](#人工智能服务商配置)
 - [目录结构](#目录结构)
 - [使用流程](#使用流程)
 - [数据与安全](#数据与安全)
 - [部署失败排查](#部署失败排查)
 - [更新与验证](#更新与验证)
 - [许可证](#许可证)
+- [免责声明](#免责声明)
+- [交流社群](#交流社群)
 
 ---
 
@@ -49,61 +56,81 @@
 
 店铺实时经营数据总览，包含累计营收、账号在线数、订单数与库存余量，以及营收趋势与商品分析。
 
-![仪表盘](docs/images/dashboard.png)
+<p align="center">
+  <img src="docs/images/dashboard.png" alt="仪表盘" width="820">
+</p>
 
 ### 账号管理
 
 管理闲鱼授权账号，支持扫码添加、在线状态与自动回复开关。
 
-![账号管理](docs/images/accounts.png)
+<p align="center">
+  <img src="docs/images/accounts.png" alt="账号管理" width="820">
+</p>
 
 ### 订单管理
 
 订单列表支持状态筛选、一键同步、手动插入与立即发货。
 
-![订单管理](docs/images/orders.png)
+<p align="center">
+  <img src="docs/images/orders.png" alt="订单管理" width="820">
+</p>
 
 ### 卡密库存
 
 管理自动发货所需的卡密、链接或图片资源，支持批量库存、固定文本、API 取卡与图片四种类型。
 
-![卡密库存](docs/images/cards.png)
+<p align="center">
+  <img src="docs/images/cards.png" alt="卡密库存" width="820">
+</p>
 
 ### 商品列表
 
 监控并管理所有账号下的闲鱼商品，可单独设置自动发货与 AI 回复开关。
 
-![商品列表](docs/images/items.png)
+<p align="center">
+  <img src="docs/images/items.png" alt="商品列表" width="820">
+</p>
 
 ### 关键词回复
 
 配置命中关键词后自动发送的回复内容，支持精确匹配与模糊匹配。
 
-![关键词回复](docs/images/keywords-reply.png)
+<p align="center">
+  <img src="docs/images/keywords-reply.png" alt="关键词回复" width="820">
+</p>
 
 ### 关键词发货
 
 配置「商品标题/详情关键词 → 卡密分组」的兜底发货规则，并支持多规格条件匹配。
 
-![关键词发货](docs/images/keywords-delivery.png)
+<p align="center">
+  <img src="docs/images/keywords-delivery.png" alt="关键词发货" width="820">
+</p>
 
 ### 账号默认回复
 
 为指定账号配置默认回复内容，在未命中任何关键词时兜底发送。
 
-![账号默认回复](docs/images/keywords-default.png)
+<p align="center">
+  <img src="docs/images/keywords-default.png" alt="账号默认回复" width="820">
+</p>
 
 ### 黑名单管理
 
 本地买家风控记录，支持退款凭证留档、永久白名单与按账号筛选。
 
-![黑名单管理](docs/images/blacklist.png)
+<p align="center">
+  <img src="docs/images/blacklist.png" alt="黑名单管理" width="820">
+</p>
 
 ### 系统与 AI 设置
 
 配置全局自动化规则、AI 智能回复、SMTP 邮件通知等系统参数。
 
-![系统与 AI 设置](docs/images/settings.png)
+<p align="center">
+  <img src="docs/images/settings.png" alt="系统与 AI 设置" width="820">
+</p>
 
 ---
 
@@ -123,6 +150,52 @@
 | 数据看板 | 营收趋势、商品分析、订单明细、城市分布统计 |
 
 完整的发货判定流程与卡密消费规则见 [`自动发货逻辑说明.md`](自动发货逻辑说明.md)。
+
+---
+
+## 系统架构
+
+```mermaid
+flowchart TD
+    subgraph 前端["前端（React 19 + Vite）"]
+        UI[管理后台页面]
+    end
+
+    subgraph 后端["后端（FastAPI）"]
+        API[REST 接口与 WebSocket]
+        AUTH[认证与令牌校验]
+        CORE[自动化核心<br/>XianyuAutoAsync]
+        RULE[发货判定与关键词匹配]
+        AI[AI 回复适配层]
+        NOTIFY[外部通知渠道]
+    end
+
+    subgraph 存储["本地存储"]
+        DB[(SQLite<br/>商品/订单/卡密/黑名单)]
+        CFG[global_config.yml<br/>管理员与 AI 服务商配置]
+        COOKIE[Cookie 与浏览器状态]
+    end
+
+    XY[闲鱼 WebSocket 与页面接口]
+    LLM[OpenAI 兼容模型接口]
+
+    UI -->|HTTP / WS| API
+    API --> AUTH
+    API --> CORE
+    API --> RULE
+    API --> AI
+    CORE -->|收发消息| XY
+    CORE --> COOKIE
+    RULE --> DB
+    AI -->|按商品上下文请求| LLM
+    AI --> DB
+    CORE --> DB
+    API --> CFG
+    CORE --> NOTIFY
+    NOTIFY -->|邮件 / 钉钉 / 飞书| EXT[外部渠道]
+```
+
+上图的调用关系：前端通过 REST 接口与 WebSocket 访问后端；`XianyuAutoAsync` 负责与闲鱼建立长连接、收发消息并执行发货动作；发货判定与关键词匹配、AI 回复适配层分别读写 SQLite 中的商品、订单与卡密数据；管理员密码与 AI 服务商配置只保存在根目录 `global_config.yml`，模型 API Key 不落库。
 
 ---
 
@@ -147,15 +220,15 @@
 
 ## 快速开始
 
-### Windows 一键启动
+### 一键启动（Windows）
 
 Windows 用户可直接双击根目录的 `start.bat`，脚本会自动创建虚拟环境、安装依赖并启动服务。
 
 ### 手动启动
 
 ```bash
-git clone https://github.com/23Star/xianyu-super-butler.git
-cd xianyu-super-butler
+git clone https://github.com/245867/xianyu-auto-delivery.git
+cd xianyu-auto-delivery
 
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -181,7 +254,7 @@ copy global_config.example.yml global_config.yml   # Linux/macOS 使用 cp
 
 ---
 
-## Docker 部署
+## 容器化部署（Docker）
 
 可选：在根目录创建 `.env`，至少设置强密码和随机密钥：
 
@@ -230,7 +303,7 @@ docker compose -f deploy/docker-compose.yml --profile with-nginx up -d --build
 
 ---
 
-## AI 服务商配置
+## 人工智能服务商配置
 
 - 模型名、服务商模型标识、API 地址和 API Key 只在根目录 `global_config.yml` 的 `AI_PROVIDER` 节维护。
 - 网页只显示配置状态，不显示或修改 API Key 与 API 地址。
@@ -343,3 +416,49 @@ npm run build
 ## 许可证
 
 本项目采用 [AGPL-3.0](LICENSE) 许可证。
+
+---
+
+## 免责声明
+
+**数据存储说明**
+
+本系统在运行过程中，数据全部保存在使用者本地的 `data` 目录下，不会上传至任何第三方服务器。请在部署前自行确认这一点。
+
+**用户须知**
+
+1. **数据安全**：请妥善保管您的账号密码和服务器访问权限，因用户自身原因导致的数据泄露，本系统不承担责任。
+2. **合规使用**：用户应确保使用本系统的行为符合相关平台的用户协议和法律法规，因违规使用导致的账号封禁或其他损失，由用户自行承担。
+3. **数据备份**：建议用户定期备份重要数据，因系统故障、服务器问题、黑客攻击等导致的数据丢失，本系统不承担责任。
+4. **服务中断**：本系统不保证服务的持续性和稳定性，因系统维护、升级或不可抗力导致的服务中断，本系统不承担责任。
+5. **第三方平台**：本系统依赖第三方平台接口运行，因第三方平台政策变更、接口调整等导致的功能异常，本系统不承担责任。
+6. **免费服务**：本项目未收取任何费用，没有义务解答任何疑问，没有义务解决任何问题。
+7. **安全声明**：本人技术有限，不是专业安全人员，无法完全保证数据安全，请用户自行评估风险。
+
+**隐私保护承诺**
+
+- 所有用户数据仅用于本系统功能运行。
+- 用户可随时自行删除其存储的数据。
+
+---
+
+## 交流社群
+
+<div align="center">
+
+<p><strong>遇到问题？欢迎加群交流 —— 版本更新与问题答疑第一时间同步</strong></p>
+
+<p>
+<a href="https://qm.qq.com/q/89nIPLRrCU" title="易语言+AI-吹牛逼（群号 607124662）"><img src="https://img.shields.io/badge/%E7%82%B9%E5%87%BB%E5%8A%A0%E5%85%A5-QQ%E7%BE%A4_607124662-12B7F5?style=for-the-badge&logo=qq&logoColor=white&labelColor=0A8FCC" alt="点击加入 QQ 群 607124662"></a>
+&nbsp;&nbsp;
+<a href="https://qm.qq.com/q/Fv9KjpGCEq" title="易语言 jadeView 前端UI（群号 1103426302）"><img src="https://img.shields.io/badge/%E7%82%B9%E5%87%BB%E5%8A%A0%E5%85%A5-QQ%E7%BE%A4_1103426302-8B5CF6?style=for-the-badge&logo=qq&logoColor=white&labelColor=6D3FD4" alt="点击加入 QQ 群 1103426302"></a>
+</p>
+
+<p>
+<strong>易语言+AI-吹牛逼</strong> ｜ 群号 <code>607124662</code><br>
+<strong>易语言 jadeView 前端UI</strong> ｜ 群号 <code>1103426302</code>
+</p>
+
+<p><sub>点击上方按钮即可一键加群，无需手动搜索群号</sub></p>
+
+</div>

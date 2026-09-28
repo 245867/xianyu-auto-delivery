@@ -341,7 +341,7 @@ const Keywords: React.FC = () => {
 
       {/* Tab 切换 - 精美设计 */}
       <div className="flex justify-center">
-        <div className="inline-flex bg-gradient-to-br from-gray-100 to-gray-200 p-2 rounded-3xl shadow-xl">
+        <div className="inline-flex bg-gradient-to-br from-gray-100 to-gray-200 dark:from-[#25282d] dark:to-[#1f2226] p-2 rounded-3xl shadow-xl">
           <button
             onClick={() => setActiveTab('reply')}
             className={`flex items-center gap-3 px-6 py-4 rounded-2xl font-bold text-lg transition-all duration-300 ${
@@ -412,7 +412,7 @@ const Keywords: React.FC = () => {
                 else if (activeTab === 'delivery') loadShippingRules();
                 else loadDefaultReplies();
               }}
-              className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-6 py-3 rounded-2xl font-bold bg-gradient-to-br from-gray-100 to-gray-200 hover:from-gray-200 hover:to-gray-300 transition-all shadow-lg"
+              className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-6 py-3 rounded-2xl font-bold bg-gradient-to-br from-gray-100 to-gray-200 dark:from-[#25282d] dark:to-[#1f2226] hover:from-gray-200 hover:to-gray-300 dark:hover:from-[#2b2f35] dark:hover:to-[#25282d] transition-all shadow-lg"
             >
               <RefreshCw className="w-5 h-5" />
               刷新
@@ -431,7 +431,7 @@ const Keywords: React.FC = () => {
 
       {/* 内容区域 */}
       {!selectedAccount ? (
-        <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 rounded-[2.5rem] border-3 border-dashed border-gray-300 shadow-xl">
+        <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 dark:from-[#1B1E22] dark:to-[#16181b] rounded-[2.5rem] border-3 border-dashed border-gray-300 dark:border-gray-700 shadow-xl">
           <div className="w-24 h-24 bg-gradient-to-br from-[#FFE815]/20 to-[#FFD700]/20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
             <MessageSquare className="w-12 h-12 text-[#FFE815]" />
           </div>
@@ -452,7 +452,7 @@ const Keywords: React.FC = () => {
             {keywords.map((keyword, index) => (
               <div
                 key={keyword.id}
-                className="group relative bg-gradient-to-br from-white to-gray-50 rounded-3xl p-6 shadow-lg hover:shadow-2xl transition-all duration-300 border-2 border-transparent hover:border-[#FFE815]/30 overflow-hidden"
+                className="group relative bg-gradient-to-br from-white to-gray-50 dark:from-[#1B1E22] dark:to-[#16181b] rounded-3xl p-6 shadow-lg hover:shadow-2xl transition-all duration-300 border-2 border-transparent hover:border-[#FFE815]/30 dark:hover:border-[#FFE815]/40 overflow-hidden"
               >
                 {/* 背景装饰 */}
                 <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-[#FFE815]/10 to-transparent rounded-full -translate-y-1/2 translate-x-1/2 group-hover:scale-150 transition-transform duration-500"></div>
@@ -482,14 +482,14 @@ const Keywords: React.FC = () => {
                   <div className="flex gap-2 flex-shrink-0">
                     <button
                       onClick={() => handleEdit(keyword)}
-                      className="p-3.5 bg-gradient-to-br from-amber-50 to-amber-100 text-amber-600 rounded-2xl hover:from-amber-100 hover:to-amber-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
+                      className="p-3.5 bg-gradient-to-br from-amber-50 to-amber-100 dark:from-[#342F1F] dark:to-[#3E3825] text-amber-600 dark:text-amber-300 rounded-2xl hover:from-amber-100 hover:to-amber-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
                       title="编辑"
                     >
                       <Edit2 className="w-5 h-5" />
                     </button>
                     <button
                       onClick={() => handleDelete(keyword.id)}
-                      className="p-3.5 bg-gradient-to-br from-red-50 to-red-100 text-red-500 rounded-2xl hover:from-red-100 hover:to-red-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
+                      className="p-3.5 bg-gradient-to-br from-red-50 to-red-100 dark:from-[#352327] dark:to-[#3F2A2F] text-red-500 dark:text-red-300 rounded-2xl hover:from-red-100 hover:to-red-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
                       title="删除"
                     >
                       <Trash2 className="w-5 h-5" />
@@ -500,7 +500,7 @@ const Keywords: React.FC = () => {
             ))}
 
             {keywords.length === 0 && (
-              <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 rounded-[2.5rem] border-3 border-dashed border-gray-300 shadow-xl">
+              <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 dark:from-[#1B1E22] dark:to-[#16181b] rounded-[2.5rem] border-3 border-dashed border-gray-300 dark:border-gray-700 shadow-xl">
                 <div className="w-24 h-24 bg-gradient-to-br from-[#FFE815]/20 to-[#FFD700]/20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
                   <MessageSquare className="w-12 h-12 text-[#FFE815]" />
                 </div>
@@ -516,7 +516,7 @@ const Keywords: React.FC = () => {
           {shippingRules.map((rule) => (
             <div
               key={rule.id}
-              className={`group relative bg-gradient-to-br ${rule.enabled ? 'from-white to-blue-50/30' : 'from-gray-100 to-gray-150'} rounded-3xl p-6 shadow-lg hover:shadow-2xl transition-all duration-300 border-2 ${rule.enabled ? 'border-transparent hover:border-blue-400/30' : 'border-gray-200'} overflow-hidden`}
+              className={`group relative bg-gradient-to-br ${rule.enabled ? 'from-white to-blue-50/30 dark:from-[#1B1E22] dark:to-[#1a1e22]' : 'from-gray-100 to-gray-200 dark:from-[#1f2226] dark:to-[#1a1c1f]'} rounded-3xl p-6 shadow-lg hover:shadow-2xl transition-all duration-300 border-2 ${rule.enabled ? 'border-transparent hover:border-blue-400/30' : 'border-gray-200 dark:border-gray-700'} overflow-hidden`}
             >
               {/* 背景装饰 */}
               {rule.enabled && (
@@ -564,7 +564,7 @@ const Keywords: React.FC = () => {
                     onClick={() => handleToggleDelivery(rule)}
                     className={`p-3.5 rounded-2xl transition-all shadow-md hover:shadow-lg hover:scale-110 ${
                       rule.enabled
-                        ? 'bg-gradient-to-br from-amber-50 to-amber-100 text-amber-600 hover:from-amber-100 hover:to-amber-200'
+                        ? 'bg-gradient-to-br from-amber-50 to-amber-100 dark:from-[#342F1F] dark:to-[#3E3825] text-amber-600 dark:text-amber-300 hover:from-amber-100 hover:to-amber-200'
                         : 'bg-gradient-to-br from-green-50 to-green-100 text-green-600 hover:from-green-100 hover:to-green-200'
                     }`}
                     title={rule.enabled ? '禁用' : '启用'}
@@ -573,14 +573,14 @@ const Keywords: React.FC = () => {
                   </button>
                   <button
                     onClick={() => handleEditDelivery(rule)}
-                    className="p-3.5 bg-gradient-to-br from-amber-50 to-amber-100 text-amber-600 rounded-2xl hover:from-amber-100 hover:to-amber-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
+                    className="p-3.5 bg-gradient-to-br from-amber-50 to-amber-100 dark:from-[#342F1F] dark:to-[#3E3825] text-amber-600 dark:text-amber-300 rounded-2xl hover:from-amber-100 hover:to-amber-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
                     title="编辑"
                   >
                     <Edit2 className="w-5 h-5" />
                   </button>
                   <button
                     onClick={() => handleDeleteDelivery(rule.id)}
-                    className="p-3.5 bg-gradient-to-br from-red-50 to-red-100 text-red-500 rounded-2xl hover:from-red-100 hover:to-red-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
+                    className="p-3.5 bg-gradient-to-br from-red-50 to-red-100 dark:from-[#352327] dark:to-[#3F2A2F] text-red-500 dark:text-red-300 rounded-2xl hover:from-red-100 hover:to-red-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
                     title="删除"
                   >
                     <Trash2 className="w-5 h-5" />
@@ -591,7 +591,7 @@ const Keywords: React.FC = () => {
           ))}
 
           {shippingRules.length === 0 && (
-            <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 rounded-[2.5rem] border-3 border-dashed border-gray-300 shadow-xl">
+            <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 dark:from-[#1B1E22] dark:to-[#16181b] rounded-[2.5rem] border-3 border-dashed border-gray-300 dark:border-gray-700 shadow-xl">
               <div className="w-24 h-24 bg-gradient-to-br from-blue-400/20 to-blue-500/20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
                 <Truck className="w-12 h-12 text-blue-400" />
               </div>
@@ -609,7 +609,7 @@ const Keywords: React.FC = () => {
             return (
               <div
                 key={account.id}
-                className={`group relative bg-gradient-to-br ${hasDefaultReply ? 'from-white to-purple-50/30' : 'from-gray-100 to-gray-150'} rounded-3xl p-6 shadow-lg hover:shadow-2xl transition-all duration-300 border-2 ${hasDefaultReply ? 'border-transparent hover:border-purple-400/30' : 'border-gray-200'} overflow-hidden`}
+                className={`group relative bg-gradient-to-br ${hasDefaultReply ? 'from-white to-purple-50/30 dark:from-[#1B1E22] dark:to-[#1d1a22]' : 'from-gray-100 to-gray-200 dark:from-[#1f2226] dark:to-[#1a1c1f]'} rounded-3xl p-6 shadow-lg hover:shadow-2xl transition-all duration-300 border-2 ${hasDefaultReply ? 'border-transparent hover:border-purple-400/30' : 'border-gray-200 dark:border-gray-700'} overflow-hidden`}
               >
                 {/* 背景装饰 */}
                 {hasDefaultReply && (
@@ -656,7 +656,7 @@ const Keywords: React.FC = () => {
                   <div className="flex gap-2 flex-shrink-0">
                     <button
                       onClick={() => loadDefaultReplyForEdit(account.id)}
-                      className="p-3.5 bg-gradient-to-br from-purple-50 to-purple-100 text-purple-600 rounded-2xl hover:from-purple-100 hover:to-purple-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
+                      className="p-3.5 bg-gradient-to-br from-purple-50 to-purple-100 dark:from-[#2C2538] dark:to-[#352C44] text-purple-600 dark:text-purple-300 rounded-2xl hover:from-purple-100 hover:to-purple-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
                       title="编辑"
                     >
                       <Edit2 className="w-5 h-5" />
@@ -665,14 +665,14 @@ const Keywords: React.FC = () => {
                       <>
                         <button
                           onClick={() => handleClearRecords(account.id)}
-                          className="p-3.5 bg-gradient-to-br from-blue-50 to-blue-100 text-blue-600 rounded-2xl hover:from-blue-100 hover:to-blue-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
+                          className="p-3.5 bg-gradient-to-br from-blue-50 to-blue-100 dark:from-[#1D2938] dark:to-[#243347] text-blue-600 dark:text-blue-300 rounded-2xl hover:from-blue-100 hover:to-blue-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
                           title="清空回复记录"
                         >
                           <RefreshCw className="w-5 h-5" />
                         </button>
                         <button
                           onClick={() => handleDeleteDefault(account.id)}
-                          className="p-3.5 bg-gradient-to-br from-red-50 to-red-100 text-red-500 rounded-2xl hover:from-red-100 hover:to-red-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
+                          className="p-3.5 bg-gradient-to-br from-red-50 to-red-100 dark:from-[#352327] dark:to-[#3F2A2F] text-red-500 dark:text-red-300 rounded-2xl hover:from-red-100 hover:to-red-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
                           title="删除"
                         >
                           <Trash2 className="w-5 h-5" />
@@ -686,7 +686,7 @@ const Keywords: React.FC = () => {
           })}
 
           {accounts.length === 0 && (
-            <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 rounded-[2.5rem] border-3 border-dashed border-gray-300 shadow-xl">
+            <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 dark:from-[#1B1E22] dark:to-[#16181b] rounded-[2.5rem] border-3 border-dashed border-gray-300 dark:border-gray-700 shadow-xl">
               <div className="w-24 h-24 bg-gradient-to-br from-purple-400/20 to-purple-500/20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
                 <Bot className="w-12 h-12 text-purple-400" />
               </div>
@@ -853,7 +853,7 @@ const Keywords: React.FC = () => {
                 />
               </div>
 
-              <div className="flex items-center justify-between p-5 bg-gradient-to-r from-blue-50 to-blue-100/50 rounded-2xl border-2 border-blue-200">
+              <div className="flex items-center justify-between p-5 bg-gradient-to-r from-blue-50 to-blue-100/50 dark:from-[#1D2938] dark:to-[#1a2331] rounded-2xl border-2 border-blue-200 dark:border-[#2f4055]">
                 <div className="flex items-center gap-3">
                   <Power className="w-6 h-6 text-blue-500" />
                   <span className="text-base font-black text-gray-900">启用此规则</span>
@@ -943,7 +943,7 @@ const Keywords: React.FC = () => {
                 <p className="text-sm text-gray-500 mt-2 ml-1">🤖 为此账号设置默认回复内容</p>
               </div>
 
-              <div className="flex items-center justify-between p-5 bg-gradient-to-r from-purple-50 to-purple-100/50 rounded-2xl border-2 border-purple-200">
+              <div className="flex items-center justify-between p-5 bg-gradient-to-r from-purple-50 to-purple-100/50 dark:from-[#2C2538] dark:to-[#241f2e] rounded-2xl border-2 border-purple-200 dark:border-[#463a57]">
                 <div className="flex items-center gap-3">
                   <Power className="w-6 h-6 text-purple-500" />
                   <span className="text-base font-black text-gray-900">启用默认回复</span>
@@ -978,7 +978,7 @@ const Keywords: React.FC = () => {
                 <p className="text-sm text-gray-500 mt-2 ml-1">💬 当没有匹配的关键词时，系统将自动发送此内容</p>
               </div>
 
-              <div className="flex items-center justify-between p-5 bg-gradient-to-r from-amber-50 to-amber-100/50 rounded-2xl border-2 border-amber-200">
+              <div className="flex items-center justify-between p-5 bg-gradient-to-r from-amber-50 to-amber-100/50 dark:from-[#342F1F] dark:to-[#2a2619] rounded-2xl border-2 border-amber-200 dark:border-[#544a2c]">
                 <div className="flex items-center gap-3">
                   <span className="text-base font-black text-gray-900">🔁 只回复一次</span>
                   <span className="text-xs text-gray-500">启用后，每个对话只使用一次默认回复</span>

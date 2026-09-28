@@ -529,6 +529,14 @@ user_stats.db
 stats.log
 stats_*.log
 
+# 论坛发帖内容（严禁入库）
+# 发帖素材属于运营资源，不是项目源码。一旦推送，帖子里的推广链接、群号等
+# 会被搜索引擎和爬虫索引，等同于公开暴露运营素材。详见《Git 发布通用指南》铁律 4。
+*_DZ论坛帖子.txt
+*风格*_DZ论坛帖子.txt
+*DZ论坛*.txt
+发帖*.txt
+
 # 临时Python脚本（不要提交临时脚本）
 temp_*.py
 tmp_*.py
@@ -537,6 +545,9 @@ fix_*.py
 test_*.py
 check_*.py
 debug_*.py
+
+# 例外：tools/ 下的校验脚本是项目资产（如乱码检查、接口路径检查），需要入库
+!tools/check_*.py
 
 # 数据导出文件（避免提交用户数据）
 export_*.xlsx
