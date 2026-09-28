@@ -21,6 +21,11 @@
 用法：
     python tools/shoot_screenshots.py [--base http://127.0.0.1:8099]
                                       [--theme light|dark] [--out docs/images]
+                                      [--suffix -dark]
+
+说明：浅色截图不带后缀，暗色截图默认带 -dark 后缀，两套主题可共存。
+    python tools/shoot_screenshots.py --theme light            # dashboard.png ...
+    python tools/shoot_screenshots.py --theme dark             # dashboard-dark.png ...
 """
 import argparse
 import io
@@ -102,8 +107,15 @@ def main():
     ap.add_argument("--config", default=os.path.join(ROOT, "global_config.yml"))
     ap.add_argument("--theme", choices=["light", "dark"], default="light",
                     help="截图主题，默认 light（与仓库已提交截图保持一致）")
+    ap.add_argument("--suffix", default=None,
+                    help="输出文件名后缀。默认：浅色不加后缀，暗色加 -dark，"
+                         "以便两套主题共存于 docs/images/")
     ap.add_argument("--settle", type=float, default=2.2, help="每页渲染等待秒数")
     args = ap.parse_args()
+
+    # 默认后缀：浅色不加，暗色加 -dark，保证两套主题互不覆盖
+    if args.suffix is None:
+        args.suffix = "-dark" if args.theme == "dark" else ""
 
     import yaml
     cfg = yaml.safe_load(open(args.config, encoding="utf-8"))
@@ -168,7 +180,8 @@ def main():
                     pass
                 page.wait_for_timeout(600)
 
-                out = os.path.join(args.out, fname)
+                out_name = fname.replace(".png", f"{args.suffix}.png")
+                out = os.path.join(args.out, out_name)
                 page.screenshot(path=out, full_page=False)
                 luma = avg_luma(out)
                 if want_dark:
@@ -178,8 +191,8 @@ def main():
                     ok = luma > LIGHT_LUMA_MIN
                     why = "偏暗"
                 label = f"{nav}/{tab}" if tab else nav
-                print(f"  [{'OK ' if ok else why}] {label:14} -> {fname:22} 亮度 {luma:6.2f}")
-                written.append((fname, luma, ok))
+                print(f"  [{'OK ' if ok else why}] {label:14} -> {out_name:27} 亮度 {luma:6.2f}")
+                written.append((out_name, luma, ok))
                 if not ok:
                     failures.append(f"{label}: 亮度异常 {luma:.1f}")
 
@@ -187,7 +200,7 @@ def main():
 
     print("\n=== 汇总 ===")
     for fname, luma, ok in written:
-        print(f"  {'✓' if ok else '✗'} {fname:22} {luma:6.2f}")
+        print(f"  {'✓' if ok else '✗'} {fname:27} {luma:6.2f}")
     print(f"\n共生成 {len(written)} 张截图（主题 {args.theme}）")
     if failures:
         print("\n存在问题:")

@@ -47,6 +47,7 @@
 - **运营看板**：营收趋势、商品分析、订单明细与库存余量实时统计。
 
 > 说明：README 中所有界面截图均为**演示数据**，用于展示页面布局，与真实账号数据无关。
+> 截图分浅色与深色两套，深色截图文件名带 `-dark` 后缀，均取自当前发布版本。
 
 ---
 
@@ -130,6 +131,49 @@
 
 <p align="center">
   <img src="docs/images/settings.png" alt="系统与 AI 设置" width="820">
+</p>
+
+### 深色主题
+
+系统内置浅色 / 深色两套主题，点击界面右上角的主题按钮即可一键切换（切换结果保存在浏览器本地，首次访问会跟随系统偏好）。
+下图为深色主题下的部分界面（完整 10 张深色截图见 `docs/images/`，命名规则为 `<页面>-dark.png`）。
+
+**仪表盘**
+
+<p align="center">
+  <img src="docs/images/dashboard-dark.png" alt="深色主题 - 仪表盘" width="820">
+</p>
+
+**商品列表**
+
+<p align="center">
+  <img src="docs/images/items-dark.png" alt="深色主题 - 商品列表" width="820">
+</p>
+
+**订单管理**
+
+<p align="center">
+  <img src="docs/images/orders-dark.png" alt="深色主题 - 订单管理" width="820">
+</p>
+
+**关键词回复**
+
+关键词管理页的选项卡与卡片在深色下使用深灰渐变（`#25282D → #1F2226`），替代浅色主题的浅灰渐变。
+
+<p align="center">
+  <img src="docs/images/keywords-reply-dark.png" alt="深色主题 - 关键词回复" width="820">
+</p>
+
+**账号默认回复**
+
+<p align="center">
+  <img src="docs/images/keywords-default-dark.png" alt="深色主题 - 账号默认回复" width="820">
+</p>
+
+**系统与 AI 设置**
+
+<p align="center">
+  <img src="docs/images/settings-dark.png" alt="深色主题 - 系统与 AI 设置" width="820">
 </p>
 
 ---
