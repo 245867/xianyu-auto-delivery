@@ -26,11 +26,14 @@ export interface LoginResponse {
 }
 
 // Accounts
+export type AccountConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'failed' | 'closed';
+
 export interface AccountDetail {
   id: string;
   value?: string; // cookie value from backend
   cookie?: string; // alias for value
   enabled: boolean;
+  connection_state?: AccountConnectionState | null;
   auto_confirm: boolean;
   remark?: string;
   note?: string; // alias for remark
@@ -107,6 +110,8 @@ export interface Card {
   is_multi_spec?: boolean;
   spec_name?: string;
   spec_value?: string;
+  spec_name_2?: string;
+  spec_value_2?: string;
   created_at: string;
   updated_at: string;
 }
@@ -183,6 +188,7 @@ export interface AdminStats {
   total_cookies: number;
   active_cookies: number;
   total_cards: number;
+  available_cards: number;
   total_keywords: number;
   total_orders: number;
 }
@@ -192,7 +198,7 @@ export interface OrderAnalytics {
     total_amount: number;
     total_orders: number;
   };
-  daily_stats: Array<{ date: string; amount: number }>;
+  daily_stats: Array<{ date: string; amount: number; order_count: number }>;
   item_stats?: Array<{
     item_id: string;
     order_count: number;
@@ -233,4 +239,198 @@ export interface DefaultReply {
   reply_content: string;
   reply_once: boolean;
   reply_image_url?: string;
+}
+
+// Opportunity fulfillment
+export type OpportunityFulfillmentDelivery =
+  | '无需邮寄'
+  | '包邮'
+  | '按距离计费'
+  | '一口价';
+
+export interface OpportunityFulfillmentSource {
+  title: string;
+  price: number;
+  supplier: string;
+  url: string;
+  source?: string;
+  source_label?: string;
+  source_url?: string;
+  updated_at?: string | null;
+}
+
+export interface OpportunityFulfillmentCategory {
+  catId: string;
+  catName: string;
+  channelCatId: string;
+  tbCatId: string;
+}
+
+export interface OpportunityFulfillmentTaskPayload {
+  cookie_id: string;
+  card_id: number;
+  title: string;
+  desc: string;
+  imageUrls: string[];
+  price: number;
+  quantity: number;
+  delivery: OpportunityFulfillmentDelivery;
+  postPrice: number;
+  tags?: string[];
+  category?: OpportunityFulfillmentCategory;
+  source?: OpportunityFulfillmentSource;
+}
+
+export type OpportunityFulfillmentStatus =
+  | 'draft'
+  | 'ready_to_publish'
+  | 'inventory_not_ready'
+  | 'publishing'
+  | 'publish_throttled'
+  | 'publish_blocked_night'
+  | 'publish_blocked_guard'
+  | 'submitted_pending_readback'
+  | 'readback_not_visible'
+  | 'readback_failed'
+  | 'readback_confirmed'
+  | 'sync_confirmed'
+  | 'delivery_bound'
+  | 'delivery_ready'
+  | 'submission_unknown_review_required'
+  | 'duplicate_submission'
+  | 'failed';
+
+export interface OpportunityFulfillmentInventory {
+  ready: boolean;
+  kind: string;
+  available?: number;
+  reason: string;
+}
+
+export interface OpportunityFulfillmentTaskResult {
+  inventory?: OpportunityFulfillmentInventory;
+  guard_warnings?: string[];
+  supplier_procurement?: {
+    configured: boolean;
+    mode: string;
+    message: string;
+  };
+}
+
+export interface OpportunityFulfillmentTask {
+  id: string;
+  user_id: number;
+  cookie_id: string;
+  card_id: number;
+  status: OpportunityFulfillmentStatus;
+  stage: string;
+  message: string;
+  idempotency_key: string;
+  item_id: string;
+  payload: OpportunityFulfillmentTaskPayload;
+  result: OpportunityFulfillmentTaskResult;
+  item_detail: Record<string, unknown>;
+  error: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OpportunityFulfillmentEvent {
+  id: number;
+  status: OpportunityFulfillmentStatus;
+  stage: string;
+  message: string;
+  detail: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface OpportunityFulfillmentCreateResponse {
+  ok: boolean;
+  task: OpportunityFulfillmentTask;
+}
+
+export interface OpportunityFulfillmentTaskResponse {
+  ok: boolean;
+  task: OpportunityFulfillmentTask;
+  events: OpportunityFulfillmentEvent[];
+}
+
+export interface OpportunityFulfillmentRecoverResponse {
+  ok: boolean;
+  task: OpportunityFulfillmentTask;
+  scheduled: boolean;
+}
+
+// Materials
+export interface MaterialItem {
+  id: number;
+  name: string;
+  kind: 'image' | 'text';
+  tags: string[];
+  tags_text: string;
+  note: string;
+  content: string;
+  file_count: number;
+  created_at: string;
+  updated_at: string;
+  cover_url: string;
+}
+
+export interface MaterialTagCount {
+  tag: string;
+  count: number;
+}
+
+export interface MaterialStats {
+  materials: number;
+  files: number;
+  bytes: number;
+  bytes_text: string;
+  max_files: number;
+}
+
+export interface MaterialListResponse {
+  ok: boolean;
+  items: MaterialItem[];
+  total: number;
+  tags: MaterialTagCount[];
+  stats: MaterialStats;
+  error?: string;
+}
+
+export interface MaterialPathsResponse {
+  ok: boolean;
+  id?: number;
+  name?: string;
+  paths?: string[];
+  count?: number;
+  error?: string;
+}
+
+// 智能配图生图
+export interface GenerateImagePayload {
+  title: string;
+  price?: number;
+  tags?: string[];
+  mode?: 'auto' | 'canvas' | 'ai';
+  count?: number;
+}
+
+export interface GeneratedImageItem {
+  path: string;
+  url: string;
+  filename: string;
+  mode_used: 'ai' | 'canvas';
+  kind: 'main' | 'guide' | 'guarantee';
+}
+
+export interface GenerateImageResponse {
+  ok: boolean;
+  images?: GeneratedImageItem[];
+  paths?: string[];
+  urls?: string[];
+  primary_path?: string;
+  primary_url?: string;
+  error?: string;
+  message?: string;
 }

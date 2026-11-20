@@ -6,6 +6,7 @@ import asyncio
 import json
 from typing import Dict, Any
 from playwright.async_api import async_playwright
+from browser_limit import launch_browser
 from utils.xianyu_utils import trans_cookies
 
 
@@ -78,7 +79,8 @@ class OrderStatusQueryPlaywright:
             browser = None
             try:
                 print(f"\n启动浏览器...")
-                browser = await p.chromium.launch(headless=self.headless)
+                browser = await launch_browser(
+                    p, {'headless': self.headless}, f'订单状态查询 {self.cookie_id}')
 
                 context = await browser.new_context(
                     viewport={'width': 1920, 'height': 1080},

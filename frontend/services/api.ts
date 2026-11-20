@@ -3,7 +3,13 @@ import {
   LoginResponse, AccountDetail, Order, PaginatedResponse,
   AdminStats, Card, SystemSettings, ApiResponse, OrderAnalytics,
   Item, AIReplySettings, ShippingRule, ReplyRule, DefaultReply,
-  RefundBlacklistEntry, RefundBlacklistPayload
+  RefundBlacklistEntry, RefundBlacklistPayload,
+  MaterialListResponse, MaterialPathsResponse,
+  GenerateImagePayload, GenerateImageResponse,
+  OpportunityFulfillmentCreateResponse,
+  OpportunityFulfillmentRecoverResponse,
+  OpportunityFulfillmentTaskPayload,
+  OpportunityFulfillmentTaskResponse
 } from '../types';
 
 // Auth
@@ -46,6 +52,7 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     value: item.value,
     cookie: item.value,
     enabled: item.enabled,
+    connection_state: item.connection_state,
     auto_confirm: item.auto_confirm,
     remark: item.remark,
     note: item.remark,
@@ -151,21 +158,25 @@ export const deleteOrder = async (orderId: string): Promise<ApiResponse> => {
   return del(`/api/orders/${orderId}`);
 };
 
-export const syncOrders = async (cookieId?: string, status?: string): Promise<any> => {
+interface OrderSyncResponse {
+  success: boolean;
+  message: string;
+  results: {
+    cookie_id: string;
+    fetched: number;
+    registered: number;
+    refreshed: number;
+    failed: number;
+    failed_pages: number[];
+    has_more: boolean;
+    error?: string;
+  }[];
+}
+
+export const syncOrders = async (cookieId?: string): Promise<OrderSyncResponse> => {
   const formData = new FormData();
   if (cookieId) formData.append('cookie_id', cookieId);
-  if (status) formData.append('status', status);
-
-  // 使用 fetch 来发送 FormData
-  const token = localStorage.getItem('auth_token');
-  const response = await fetch('/api/orders/refresh', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`
-    },
-    body: formData
-  });
-  return response.json();
+  return post('/api/orders/sync', formData);
 };
 
 export const syncSingleOrder = async (orderId: string): Promise<any> => {
@@ -180,17 +191,18 @@ export const manualShipOrder = async (orderIds: string[], shipMode: 'status_only
     });
 }
 
-export const importOrders = async (data: Partial<Order>[] | FormData): Promise<any> => {
-  const isFormData = data instanceof FormData;
-  const response = await fetch('/api/orders/import', {
-    method: 'POST',
-    headers: {
-      ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
-      'Authorization': `Bearer ${localStorage.getItem('auth_token')}`
-    },
-    body: isFormData ? data : JSON.stringify(data)
-  });
-  return response.json();
+export interface OrderImportResponse {
+  success: boolean;
+  message: string;
+  success_count: number;
+  failed_count: number;
+  results: { row: number; order_id: string; success: boolean; message: string }[];
+}
+
+export const importOrdersExcel = async (file: File): Promise<OrderImportResponse> => {
+  const form = new FormData();
+  form.append('file', file);
+  return post('/api/orders/import-excel', form);
 }
 
 // Stats
@@ -216,12 +228,16 @@ export const getOrderAnalytics = async (daysOrParams: number | {start_date: stri
     return get('/analytics/orders', params);
 }
 
-export const getValidOrders = async (dateRange: {start_date: string; end_date: string}): Promise<Order[]> => {
-    const res = await get<any>('/analytics/orders/valid', {
+export type AnalyticsOrder = Pick<Order, 'order_id' | 'item_id' | 'buyer_id' | 'quantity' | 'created_at' | 'status'> & {
+  amount: string | null;
+};
+
+export const getValidOrders = async (dateRange: {start_date: string; end_date: string}): Promise<AnalyticsOrder[]> => {
+    const res = await get<{ orders: (Omit<AnalyticsOrder, 'status'> & { order_status: Order['status'] })[] }>('/analytics/orders/valid', {
         start_date: dateRange.start_date,
         end_date: dateRange.end_date
     });
-    return res.orders || [];
+    return res.orders.map(({ order_status, ...order }) => ({ ...order, status: order_status }));
 }
 
 // Cards
@@ -236,6 +252,10 @@ export const createCard = async (data: Partial<Card>): Promise<{ id: number; mes
 
 export const updateCard = async (cardId: string, data: Partial<Card>): Promise<ApiResponse> => {
   return put(`/cards/${cardId}`, data);
+};
+
+export const appendCardInventory = async (cardId: number, content: string): Promise<ApiResponse> => {
+  return post(`/cards/${cardId}/inventory`, { content });
 };
 
 export const deleteCard = async (cardId: string): Promise<ApiResponse> => {
@@ -557,4 +577,43 @@ export const deleteDefaultReply = async (cookieId: string): Promise<ApiResponse>
 
 export const clearDefaultReplyRecords = async (cookieId: string): Promise<ApiResponse> => {
   return post(`/api/default-reply/${cookieId}/clear-records`, {});
+};
+
+// Opportunity fulfillment
+export const createOpportunityFulfillmentTask = async (
+  payload: OpportunityFulfillmentTaskPayload
+): Promise<OpportunityFulfillmentCreateResponse> => {
+  return post('/api/opportunity/fulfillment/tasks', { ...payload });
+};
+
+export const getOpportunityFulfillmentTask = async (
+  taskId: string
+): Promise<OpportunityFulfillmentTaskResponse> => {
+  return get(`/api/opportunity/fulfillment/tasks/${taskId}`);
+};
+
+export const recoverOpportunityFulfillmentTask = async (
+  taskId: string
+): Promise<OpportunityFulfillmentRecoverResponse> => {
+  return post(`/api/opportunity/fulfillment/tasks/${taskId}/recover`, {});
+};
+
+// Materials
+export const getImageMaterials = async (
+  limit: number = 200
+): Promise<MaterialListResponse> => {
+  return get('/api/materials', { kind: 'image', limit });
+};
+
+export const getMaterialPaths = async (
+  materialId: number
+): Promise<MaterialPathsResponse> => {
+  return get(`/api/materials/${materialId}/paths`);
+};
+
+// 智能配图生图
+export const generateOpportunityImage = async (
+  payload: GenerateImagePayload
+): Promise<GenerateImageResponse> => {
+  return post('/api/opportunity/generate-image', payload);
 };

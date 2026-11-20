@@ -1,0 +1,395 @@
+export interface QualityListing {
+  itemId: string;
+  itemUrl: string;
+  title: string;
+  price: number | null;
+  detail_sold_count?: number;
+  sold_count?: number;
+  detail_stock?: number;
+  sold_out?: boolean;
+  view_count?: number;
+  want_count?: number;
+  browse_count?: number;
+  want_source?: string;
+  want_stale?: boolean;
+}
+
+export interface QualityQuote {
+  title: string;
+  price: number;
+}
+
+export type MarketConfidence = 'high' | 'medium' | 'low' | 'invalid';
+
+export interface ListingAssessment {
+  listing: QualityListing;
+  comparable: boolean;
+  priceSane: boolean;
+  sellable: boolean;
+  reasons: string[];
+  activityScore: number;
+  sold: number | null;
+  want: number | null;
+  browse: number | null;
+}
+
+export interface MarketEvidence {
+  confidence: MarketConfidence;
+  eligibleForProfit: boolean;
+  benchmark: QualityListing | null;
+  benchmarkBasis: 'activity' | 'median' | '';
+  comparableCount: number;
+  validCount: number;
+  suspiciousCount: number;
+  reasons: string[];
+  assessments: ListingAssessment[];
+}
+
+const LOW_PRICE_RATIO = 0.45;
+const HIGH_PRICE_RATIO = 8;
+
+const BRAND_ALIASES: string[][] = [
+  ['哔哩哔哩', 'b站', 'bilibili'],
+  ['优酷', 'youku'],
+  ['爱奇艺', 'iqiyi'],
+  ['腾讯视频', '腾讯影音'],
+  ['芒果tv', '芒果视频'],
+  ['网易云音乐', '网易云'],
+  ['qq音乐'],
+  ['喜马拉雅'],
+  ['酷狗音乐'],
+  ['qq会员'],
+];
+
+const CHOICE_RELATION = /或者|任选(?:其一)?|可选|(?:二|三|四|五|六|七|八|九|十)选一|择一|其一/;
+
+const ATTRIBUTE_LABELS: Record<string, string> = {
+  size: '杯型/尺寸',
+  amount: '面额',
+};
+
+function normalizeTitle(title: string) {
+  return title.normalize('NFKC').replace(/\s+/g, '').toLowerCase();
+}
+
+function normalizeProductText(title: string) {
+  return normalizeTitle(title)
+    .replace(/【[^】]*】/g, '')
+    .replace(/[+＋&＆/／、,，·•|｜—_-]/g, '');
+}
+
+function finiteCount(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function brandsIn(title: string) {
+  const text = normalizeTitle(title);
+  return new Set(
+    BRAND_ALIASES
+      .filter(aliases => aliases.some(alias => text.includes(alias)))
+      .map(aliases => aliases[0]),
+  );
+}
+
+export function hasComparableProductIdentity(quoteTitle: string, listingTitle: string) {
+  const quoteBrands = brandsIn(quoteTitle);
+  const listingBrands = brandsIn(listingTitle);
+  if (quoteBrands.size) {
+    if (quoteBrands.size !== listingBrands.size) return false;
+    return [...quoteBrands].every(brand => listingBrands.has(brand));
+  }
+  const quoteText = normalizeProductText(quoteTitle);
+  return Boolean(quoteText) && normalizeProductText(listingTitle).includes(quoteText);
+}
+
+function attributeValues(title: string) {
+  const text = normalizeTitle(title);
+  const groups = new Map<string, Set<string>>();
+  const add = (key: string, value: string) => {
+    const values = groups.get(key) ?? new Set<string>();
+    values.add(value);
+    groups.set(key, values);
+  };
+
+  for (const match of text.matchAll(/超大杯|大杯|中杯|小杯/g)) {
+    add('size', match[0]);
+  }
+  for (const match of text.matchAll(/(\d+(?:\.\d+)?)\s*元/g)) {
+    add('amount', String(Number(match[1])));
+  }
+  for (const match of text.matchAll(
+    /(\d+)\s*(张|杯|份|次|件|个|瓶|包|盒|套|枚|支|根|袋|串)/g,
+  )) {
+    add(`quantity:${match[2]}`, String(Number(match[1])));
+  }
+  return groups;
+}
+
+function attributeLabel(key: string) {
+  if (key.startsWith('quantity:')) return `${key.slice('quantity:'.length)}数`;
+  return ATTRIBUTE_LABELS[key] ?? key;
+}
+
+function sameValueSet(left: Set<string>, right: Set<string>) {
+  return left.size === right.size && [...left].every(value => right.has(value));
+}
+
+export function durationDays(title: string): number[] {
+  const text = normalizeTitle(title);
+  const found = new Set<number>();
+
+  const explicitDays = /(\d{1,4})(?:天|日)(?:卡|会员|体验|有效期)?/g;
+  for (const match of text.matchAll(explicitDays)) found.add(Number(match[1]));
+
+  const explicitMonths = /(\d{1,3})(?:个)?月(?:卡|会员|有效期)?/g;
+  for (const match of text.matchAll(explicitMonths)) found.add(Number(match[1]) * 30);
+
+  const explicitYears = /(\d{1,2})(?:个)?年(?:卡|会员|有效期)?/g;
+  for (const match of text.matchAll(explicitYears)) found.add(Number(match[1]) * 365);
+
+  if (/日卡|天卡|单日|一天|24小时/.test(text)) found.add(1);
+  if (/周卡|一星期|一週|1周|七天|7天/.test(text)) found.add(7);
+  if (/月卡|一个月|1个月/.test(text)) found.add(30);
+  if (/季卡|季度卡|三个月|3个月/.test(text)) found.add(90);
+  if (/半年|六个月|6个月/.test(text)) found.add(180);
+  if (/年卡|一年|12个月/.test(text)) found.add(365);
+
+  return [...found].sort((left, right) => left - right);
+}
+
+type DeliveryKind = 'direct' | 'code' | 'mixed' | 'unknown';
+
+function deliveryKind(title: string): DeliveryKind {
+  const text = normalizeTitle(title);
+  const direct = /账号直充|直充|直接充值|自动充值|充值到账/.test(text);
+  const code = /卡密|兑换码|激活码|礼品卡|cdk/.test(text);
+  if (direct && code) return 'mixed';
+  if (direct) return 'direct';
+  if (code) return 'code';
+  return 'unknown';
+}
+
+function countOf(listing: QualityListing, key: keyof QualityListing): number | null {
+  return finiteCount(listing[key]);
+}
+
+function activityOf(listing: QualityListing) {
+  const detailSold = countOf(listing, 'detail_sold_count');
+  const listSold = countOf(listing, 'sold_count');
+  const sold = detailSold ?? (listSold !== null && listSold > 0 ? listSold : null);
+  const rawWant = countOf(listing, 'want_count');
+  const want = rawWant !== null
+    && (
+      rawWant > 0
+      || listing.want_source === 'detail'
+      || listing.want_stale === false
+    )
+    ? rawWant
+    : null;
+  const rawBrowse = countOf(listing, 'browse_count') ?? countOf(listing, 'view_count');
+  const browse = rawBrowse !== null && rawBrowse > 0 ? rawBrowse : null;
+  return {
+    sold,
+    want,
+    browse,
+    score: Math.max(0, sold ?? 0) * 100
+      + Math.max(0, want ?? 0) * 5
+      + Math.max(0, browse ?? 0) * 0.1,
+  };
+}
+
+function median(values: number[]) {
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+export function assessListing(
+  quote: QualityQuote,
+  listing: QualityListing,
+): ListingAssessment {
+  const reasons: string[] = [];
+  let comparable = hasComparableProductIdentity(quote.title, listing.title);
+  if (!comparable) {
+    reasons.push('商品对象不一致：品牌、数量或标题中的商品组合不同');
+  }
+
+  if (CHOICE_RELATION.test(normalizeTitle(listing.title))) {
+    comparable = false;
+    reasons.push('挂牌含“或者/任选”关系，不能证明交付了全部联合规格');
+  }
+
+  const quoteAttributes = attributeValues(quote.title);
+  const listingAttributes = attributeValues(listing.title);
+  for (const key of new Set([...quoteAttributes.keys(), ...listingAttributes.keys()])) {
+    const quoteValues = quoteAttributes.get(key) ?? new Set<string>();
+    const listingValues = listingAttributes.get(key) ?? new Set<string>();
+    if (!sameValueSet(quoteValues, listingValues)) {
+      comparable = false;
+      const format = (values: Set<string>) => values.size ? [...values].join('/') : '未写';
+      reasons.push(
+        `${attributeLabel(key)}不一致：上游 ${format(quoteValues)}，挂牌 ${format(listingValues)}`,
+      );
+    }
+  }
+
+  const quoteDurations = durationDays(quote.title);
+  const listingDurations = durationDays(listing.title);
+  if (quoteDurations.length && listingDurations.length) {
+    const quoteSet = new Set(quoteDurations);
+    const listingSet = new Set(listingDurations);
+    const sameSpec = quoteSet.size === listingSet.size
+      && [...quoteSet].every(value => listingSet.has(value));
+    if (!sameSpec) {
+      comparable = false;
+      reasons.push(
+        `时长不一致：上游 ${quoteDurations.join('/')} 天，挂牌 ${listingDurations.join('/')} 天`,
+      );
+    }
+  } else if (quoteDurations.length && !listingDurations.length) {
+    comparable = false;
+    reasons.push('挂牌标题未写明与上游一致的时长');
+  }
+
+  const quoteDelivery = deliveryKind(quote.title);
+  const listingDelivery = deliveryKind(listing.title);
+  if (
+    quoteDelivery !== 'unknown'
+    && listingDelivery !== 'unknown'
+    && quoteDelivery !== listingDelivery
+  ) {
+    comparable = false;
+    reasons.push('交付方式不一致：直充与卡密不能直接比价');
+  }
+
+  let sellable = true;
+  if (
+    listing.sold_out === true
+    || (typeof listing.detail_stock === 'number' && Number.isFinite(listing.detail_stock)
+      && listing.detail_stock <= 0)
+  ) {
+    sellable = false;
+    reasons.push('挂牌已售罄，不能作为可成交市场参照');
+  }
+
+  const upstreamPrice = Number(quote.price);
+  const listingPrice = Number(listing.price);
+  let priceSane = Number.isFinite(upstreamPrice) && upstreamPrice > 0
+    && Number.isFinite(listingPrice) && listingPrice > 0;
+  if (priceSane) {
+    const ratio = listingPrice / upstreamPrice;
+    if (ratio < LOW_PRICE_RATIO) {
+      priceSane = false;
+      reasons.push(`异常低价：挂牌仅为上游的 ${(ratio * 100).toFixed(1)}%`);
+    } else if (ratio > HIGH_PRICE_RATIO) {
+      priceSane = false;
+      reasons.push(`异常价差：挂牌为上游的 ${ratio.toFixed(1)} 倍`);
+    }
+  } else {
+    reasons.push('价格缺失，无法判断规格与价差');
+  }
+
+  const activity = activityOf(listing);
+  return {
+    listing,
+    comparable,
+    priceSane,
+    sellable,
+    reasons,
+    activityScore: activity.score,
+    sold: activity.sold,
+    want: activity.want,
+    browse: activity.browse,
+  };
+}
+
+export function selectMarketEvidence(
+  quote: QualityQuote,
+  listings: QualityListing[],
+): MarketEvidence {
+  const assessments = listings
+    .filter(listing => listing.itemId && listing.itemUrl && listing.title)
+    .map(listing => assessListing(quote, listing));
+
+  const comparable = assessments.filter(item => item.comparable);
+  const valid = comparable.filter(item => item.priceSane && item.sellable);
+  const suspiciousCount = assessments.length - valid.length;
+  if (!valid.length) {
+    return {
+      confidence: 'invalid',
+      eligibleForProfit: false,
+      benchmark: null,
+      benchmarkBasis: '',
+      comparableCount: comparable.length,
+      validCount: 0,
+      suspiciousCount,
+      reasons: comparable.length
+        ? ['同标题挂牌全部未通过时长、交付方式或价格合理性检查']
+        : ['没有与上游规格对齐的闲鱼挂牌'],
+      assessments,
+    };
+  }
+
+  const active = valid.filter(item =>
+    (item.sold !== null && item.sold > 0)
+    || (item.want !== null && item.want > 0)
+    || (item.browse !== null && item.browse > 0),
+  );
+  let benchmark: ListingAssessment;
+  let benchmarkBasis: 'activity' | 'median';
+  if (active.length) {
+    benchmark = active.sort((left, right) =>
+      compareNullableDesc(left.sold, right.sold)
+      || compareNullableDesc(left.want, right.want)
+      || compareNullableDesc(left.browse, right.browse)
+      || left.listing.price! - right.listing.price!,
+    )[0];
+    benchmarkBasis = 'activity';
+  } else if (valid.length > 1) {
+    const midpoint = median(valid.map(item => item.listing.price!));
+    benchmark = [...valid].sort((left, right) =>
+      Math.abs(left.listing.price! - midpoint) - Math.abs(right.listing.price! - midpoint),
+    )[0];
+    benchmarkBasis = 'median';
+  } else {
+    benchmark = valid[0];
+    benchmarkBasis = 'median';
+  }
+
+  const highActivity = (benchmark.sold ?? 0) >= 3 || (benchmark.want ?? 0) >= 10;
+  const someActivity = active.length > 0;
+  const confidence: MarketConfidence = highActivity
+    ? 'high'
+    : someActivity || valid.length >= 2
+      ? 'medium'
+      : 'low';
+  const reasons: string[] = [];
+  if (benchmarkBasis === 'activity') {
+    reasons.push('市场参照按详情成交、想要、浏览依次选择同规格高互动挂牌');
+  } else if (valid.length > 1) {
+    reasons.push('缺少已核验成交，采用多个同规格挂牌价格中位数附近的真实链接');
+  } else {
+    reasons.push('只有一条零互动同规格挂牌，不能据此确认利润');
+  }
+  if (suspiciousCount) {
+    reasons.push(`${suspiciousCount} 条挂牌因规格或价格异常未进入利润计算`);
+  }
+
+  return {
+    confidence,
+    eligibleForProfit: confidence === 'high' || confidence === 'medium',
+    benchmark: benchmark.listing,
+    benchmarkBasis,
+    comparableCount: comparable.length,
+    validCount: valid.length,
+    suspiciousCount,
+    reasons,
+    assessments,
+  };
+}
+
+function compareNullableDesc(left: number | null, right: number | null) {
+  return (right ?? -1) - (left ?? -1);
+}

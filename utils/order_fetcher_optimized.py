@@ -12,6 +12,7 @@ from loguru import logger
 from collections import defaultdict
 
 from utils.browser_pool import get_browser_pool
+from utils.order_detail_fetcher import read_order_trade_fields
 
 
 class OrderFetcherOptimized:
@@ -98,7 +99,7 @@ class OrderFetcherOptimized:
                     receiver_address = existing_order.get('receiver_address', '')
 
                     # 只有在非强制刷新且金额有效时才使用缓存（状态检测需要真实访问页面）
-                    if amount_valid and not force_refresh:
+                    if amount_valid and existing_order.get('created_at') and not force_refresh:
                         logger.info(f"[CLIPBOARD] 订单 {order_id} 已存在于数据库中且金额有效，直接返回缓存数据")
                         print(f"[OK] 订单 {order_id} 使用缓存数据")
 
@@ -248,7 +249,7 @@ class OrderFetcherOptimized:
                 result['spec_name'] = dom_data.get('spec_name', '')
                 result['spec_value'] = dom_data.get('spec_value', '')
                 result['quantity'] = dom_data.get('quantity', '1')
-                result['amount'] = dom_data.get('amount', api_data.get('price', ''))
+                result['amount'] = dom_data.get('amount') or api_data.get('price', '')
                 result['order_time'] = dom_data.get('order_time', '')
                 result['receiver_name'] = dom_data.get('receiver_name', api_data.get('receiver_name', ''))
                 result['receiver_phone'] = dom_data.get('receiver_phone', api_data.get('receiver_phone', ''))
@@ -376,9 +377,12 @@ class OrderFetcherOptimized:
         result = {}
 
         try:
+            result.update(await read_order_trade_fields(self.page))
             # 获取金额
             amount_selector = '.boldNum--JgEOXfA3'
-            amount_element = await self.page.query_selector(amount_selector)
+            amount_element = (
+                await self.page.query_selector(amount_selector) if 'amount' not in result else None
+            )
             if amount_element:
                 amount_text = await amount_element.text_content()
                 if amount_text:
@@ -386,7 +390,8 @@ class OrderFetcherOptimized:
                     logger.info(f"找到金额: {result['amount']}")
 
             # 获取订单时间
-            await self._get_order_time(result)
+            if 'order_time' not in result:
+                await self._get_order_time(result)
 
             # 获取收货人信息
             await self._get_receiver_info(result)
@@ -682,6 +687,28 @@ async def process_orders_batch(
     logger.info(f"开始批量处理 {len(order_ids)} 个订单，最大并发数: {max_concurrent}")
     # print(f"[BATCH] Processing {len(order_ids)} orders (concurrent: {max_concurrent})")  # 已移除
 
+    # 快路径：卖家端 sold.get 一次请求拿 20 单，不用起浏览器（拆解 1c）。
+    # 只对接口没覆盖到的订单回退浏览器；接口异常/关闭时 direct_map 为空，行为与改造前一致。
+    # 顺序契约：返回值必须与入参逐位对齐（调用方按下标取结果），所以最后按原序拼回。
+    original_order = [str(order_id) for order_id in order_ids]
+    direct_map: Dict[str, Dict[str, Any]] = {}
+    try:
+        from seller_api import fetch_orders_by_ids, enabled as _seller_api_enabled
+        if _seller_api_enabled() and original_order:
+            direct_map = await asyncio.to_thread(
+                fetch_orders_by_ids, cookie_string, cookie_id, original_order)
+    except Exception as _e:
+        logger.warning(f"卖家端订单接口不可用，全部回退浏览器抓取: {_e}")
+        direct_map = {}
+
+    remaining = [oid for oid in original_order if oid not in direct_map]
+    if direct_map:
+        logger.info(f"卖家端接口已直取 {len(direct_map)} 个订单，剩余 {len(remaining)} 个回退浏览器")
+    if not remaining:
+        return [direct_map[oid] for oid in original_order]
+
+    order_ids = remaining
+
     # 创建信号量控制并发数
     semaphore = asyncio.Semaphore(max_concurrent)
 
@@ -765,7 +792,19 @@ async def process_orders_batch(
     # print(f"   [OK] 成功: {success_count}")  # 已移除
     # print(f"   [FAIL] 失败: {fail_count}")  # 已移除
 
-    return processed_results
+    if not direct_map:
+        return processed_results
+
+    # 拼接：按原序，快路径的结果插回它原来的位置
+    by_id = {r.get("order_id"): r for r in processed_results if isinstance(r, dict)}
+    merged = []
+    for oid in original_order:
+        if oid in direct_map:
+            merged.append(direct_map[oid])
+        else:
+            merged.append(by_id.get(oid) or {
+                'order_id': oid, 'success': False, 'error': '结果缺失'})
+    return merged
 
 
 async def process_orders_in_batches(

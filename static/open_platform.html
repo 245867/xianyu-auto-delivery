@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>闲管家开放平台</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b23; --line:#242c38; --txt:#e6edf3;
+    --dim:#8b98a9; --acc:#3fb950; --warn:#d29922; --err:#f85149; --blue:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:24px 20px 60px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 12px;font-weight:600}
+  .row{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px}
+  label.f{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+  input[type=text],input[type=password],input[type=number],select,textarea{
+    background:#0d1117;border:1px solid var(--line);color:var(--txt);
+    border-radius:6px;padding:6px 9px;font:13px/1.5 inherit;min-width:140px}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--blue)}
+  textarea{min-width:100%;min-height:70px;resize:vertical;
+           font:12px/1.6 ui-monospace,Consolas,monospace}
+  button{background:#21262d;color:var(--txt);border:1px solid var(--line);
+         border-radius:6px;padding:6px 13px;font:13px inherit;cursor:pointer}
+  button:hover{border-color:#3d4756;background:#262d36}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+  button.primary:hover{background:#388bfd}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
+        border:1px solid var(--line)}
+  .on{color:var(--acc);border-color:#1d4429;background:#0f2417}
+  .off{color:var(--dim)}
+  .dr{color:var(--warn);border-color:#4a3a12;background:#241d09}
+  .muted{color:var(--dim)}
+  .err{color:var(--err)}
+  .ok{color:var(--acc)}
+  .warn{color:var(--warn)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:6px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:500;font-size:12px}
+  .logs{font:12px/1.7 ui-monospace,Consolas,monospace;max-height:260px;overflow:auto;
+        background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:10px}
+  .logs div{border-bottom:1px dashed #1b222c;padding:2px 0}
+  #toast{position:fixed;right:20px;bottom:20px;background:#21262d;border:1px solid var(--line);
+         border-radius:8px;padding:10px 16px;font-size:13px;opacity:0;transition:opacity .2s;
+         pointer-events:none;max-width:380px}
+  #toast.show{opacity:1}
+  .hint{color:var(--dim);font-size:12px;margin-top:6px}
+  .kv{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .kv span{background:#0d1117;border:1px solid var(--line);border-radius:6px;
+           padding:3px 10px;font-size:12px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:780px){.grid2{grid-template-columns:1fr}}
+  .box{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  .box h3{font-size:13px;margin:0 0 8px;color:var(--dim);font-weight:500}
+  .box ul{margin:0;padding-left:18px;font-size:12.5px;line-height:1.8}
+  pre{background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:10px;
+      overflow:auto;max-height:280px;font-size:12px;margin:8px 0 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>闲管家开放平台</h1>
+  <div class="sub">官方授权通道。写商品、改库存、发货走这里，比模拟接口稳；但读数据和擦亮仍然只能走闲鱼接口。</div>
+
+  <div class="card">
+    <h2>当前状态</h2>
+    <div class="kv" id="kv"><span class="muted">加载中…</span></div>
+    <div class="row">
+      <button id="btnRefresh">刷新</button>
+      <button id="btnSelfCheck">检查配置（不联网）</button>
+      <button class="primary" id="btnTest">测试连通性（只读）</button>
+    </div>
+    <div id="testOut"></div>
+  </div>
+
+  <div class="card">
+    <h2>填写应用信息</h2>
+    <div class="hint" style="margin-bottom:12px">
+      获取方式：登录闲管家 → 我的应用 → 添加应用 → 选「我有自研系统」→ 应用类型选「进销存」→ 上线 →
+      应用详情里看 AppKey / AppSecret。
+      <b>高级版不能创建应用，必须铂金版或 ERP 专业版</b>（约 198 元/年，按闲鱼店铺数计）。
+    </div>
+    <div class="row">
+      <label class="f">AppKey
+        <input type="text" id="fKey" placeholder="应用详情里的 AppKey" style="min-width:260px">
+      </label>
+      <label class="f">AppSecret
+        <input type="password" id="fSecret" placeholder="留空表示不修改" style="min-width:260px">
+      </label>
+      <label class="f">seller_id
+        <input type="text" id="fSeller" placeholder="自研单店可留空" style="min-width:180px">
+      </label>
+    </div>
+    <div class="row">
+      <label class="f">通道开关
+        <select id="fEnabled"><option value="0">关闭（默认）</option><option value="1">启用</option></select>
+      </label>
+      <label class="f">写操作
+        <select id="fDry"><option value="1">演练（拒绝一切写）</option><option value="0">允许写</option></select>
+      </label>
+      <label class="f">本地限速 QPS
+        <input type="number" id="fQps" min="1" max="20" style="min-width:100px">
+      </label>
+      <button class="primary" id="btnSave">保存</button>
+    </div>
+    <div class="hint">AppSecret 保存后不会再显示，页面上只会出现打码结果。四步顺序建议：填 Key → 保存 → 开通道 → 测连通性。</div>
+  </div>
+
+  <div class="card">
+    <h2>接口清单</h2>
+    <div class="grid2">
+      <div class="box">
+        <h3 id="hRead">只读</h3>
+        <ul id="listRead"></ul>
+      </div>
+      <div class="box">
+        <h3 id="hWrite">写操作</h3>
+        <ul id="listWrite"></ul>
+      </div>
+    </div>
+    <div class="hint" id="limits"></div>
+  </div>
+
+  <div class="card">
+    <h2>手动验证一个只读接口</h2>
+    <div class="row">
+      <label class="f">接口
+        <select id="apiSel" style="min-width:280px"></select>
+      </label>
+      <label class="f" style="flex:1">参数（JSON）
+        <textarea id="apiBody" spellcheck="false">{"page_no":1,"page_size":5}</textarea>
+      </label>
+    </div>
+    <div class="row"><button class="primary" id="btnCall">调用</button>
+      <span class="hint">只允许只读接口；写接口从这里点不动，那是有意的。</span>
+    </div>
+    <pre id="callOut" style="display:none"></pre>
+  </div>
+
+  <div class="card">
+    <h2>它没有的能力</h2>
+    <div class="hint" style="line-height:1.9">
+      官方 FAQ 明确写死的缺口，别指望这个通道能替掉闲鱼接口：<br>
+      · 曝光 / 浏览 / 想要 / 收藏 / 咨询数 / 搜索排名 —— <span class="err">没有</span><br>
+      · 闲鱼消息、聊天 API —— <span class="err">没有，且官方说后续也不支持</span><br>
+      · 图片上传 —— <span class="err">没有，只能传公网可访问的图片 URL</span><br>
+      · 擦亮（polish）—— <span class="err">没有</span><br>
+      所以选品、擦亮、客服议价、热度统计仍然只能走闲鱼接口，两条腿并行。
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>调用日志 <span class="muted">（本地，不含密钥与报文）</span></h2>
+    <div class="logs" id="logs"><span class="muted">暂无</span></div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let toastTimer = null;
+function toast(msg, isErr) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.style.borderColor = isErr ? '#5a2226' : '#242c38';
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3400);
+}
+async function call(url, opts) {
+  const r = await fetch(url, Object.assign({headers: {'Content-Type': 'application/json'}}, opts || {}));
+  let j; try { j = await r.json(); } catch (e) { throw new Error('返回不是 JSON'); }
+  return j;
+}
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+let CURRENT = null;
+
+async function loadStatus() {
+  const s = await call('/api/open-platform/status');
+  if (!s.ok) { toast(s.error || '读取失败', true); return; }
+  CURRENT = s;
+  const chips = [
+    s.configured ? '<span class="pill on">已配置</span>' : '<span class="pill off">未配置</span>',
+    s.enabled ? '<span class="pill on">通道启用</span>' : '<span class="pill off">通道关闭</span>',
+    s.dry_run ? '<span class="pill dr">演练（禁写）</span>' : '<span class="pill on">允许写</span>',
+    `<span>AppKey ${esc(s.app_key_masked) || '<span class="muted">未填</span>'}</span>`,
+    `<span>只读 ${s.read_api_count} / 写 ${s.write_api_count}</span>`,
+  ];
+  if (s.note) chips.push(`<span class="warn">${esc(s.note)}</span>`);
+  $('kv').innerHTML = chips.join('');
+
+  $('fEnabled').value = s.enabled ? '1' : '0';
+  $('fDry').value = s.dry_run ? '1' : '0';
+  $('fQps').value = s.max_qps;
+  $('fSeller').value = s.seller_id || '';
+  // AppKey 已有时给出打码提示，输入框留空表示不改
+  const kEl = $('fKey');
+  kEl.placeholder = s.app_key_masked
+    ? `当前 ${s.app_key_masked}，留空表示不修改`
+    : '应用详情里的 AppKey';
+  if (!kEl.dataset.touched) kEl.value = '';
+
+  await loadLogs();
+}
+
+async function loadApis() {
+  const r = await call('/api/open-platform/apis');
+  if (!r.ok) return;
+  $('hRead').textContent = `只读（${r.read_count}）`;
+  $('hWrite').textContent = `写操作（${r.write_count}）`;
+  $('listRead').innerHTML = r.read.map(a =>
+    `<li>${esc(a.name)} <span class="muted">${esc(a.path)}</span></li>`).join('');
+  $('listWrite').innerHTML = r.write.map(a =>
+    `<li>${esc(a.name)} <span class="muted">${esc(a.path)}</span></li>`).join('');
+  $('limits').textContent =
+    `官方限流：单账号总和 ${r.limits.qps} 次/秒；单商家单接口 ${r.limits.daily_per_api} 次/天（可付费加购）。`;
+  $('apiSel').innerHTML = r.read.map(a =>
+    `<option value="${esc(a.name)}">${esc(a.name)}</option>`).join('');
+}
+
+const BODY_HINT = {
+  'product.list': {page_no: 1, page_size: 5, keyword: '', goods_type: 0},
+  'product.detail': {item_id: ''},
+  'product.sku.list': {product_id: ''},
+  'order.list': {page_no: 1, page_size: 5},
+  'order.detail': {order_id: ''},
+  'order.kam': {order_id: ''},
+  'aftersale.list': {page_no: 1, page_size: 5},
+  'aftersale.detail': {aftersale_id: ''},
+  'shop.list': {},
+  'express.list': {},
+  'wallet.balance': {},
+  'category.list': {parent_id: 0},
+  'attribute.list': {category_id: ''},
+};
+$('apiSel').onchange = () => {
+  const n = $('apiSel').value;
+  $('apiBody').value = JSON.stringify(BODY_HINT[n] || {}, null, 0);
+};
+
+async function loadLogs() {
+  const r = await call('/api/open-platform/calls?limit=40');
+  const items = r.items || [];
+  $('logs').innerHTML = items.length
+    ? items.map(l =>
+        `<div><span class="muted">${esc(l.t)}</span> `
+        + `<span class="${l.ok ? 'ok' : 'err'}">${l.ok ? 'OK' : 'ERR'}</span> `
+        + `${esc(l.api)} <span class="muted">${esc(l.ms)}ms</span>`
+        + (l.err ? ` <span class="err">${esc(l.err)}</span>` : '') + `</div>`).join('')
+    : '<span class="muted">暂无（还没调用过）</span>';
+}
+
+$('btnRefresh').onclick = async () => {
+  try { await loadStatus(); toast('已刷新'); } catch (e) { toast(e.message, true); }
+};
+
+$('fKey').addEventListener('input', e => { e.target.dataset.touched = '1'; });
+
+$('btnSave').onclick = async () => {
+  const body = {
+    enabled: $('fEnabled').value === '1',
+    dry_run: $('fDry').value === '1',
+    max_qps: Number($('fQps').value || 5),
+    seller_id: $('fSeller').value.trim(),
+  };
+  const k = $('fKey').value.trim();
+  const s = $('fSecret').value.trim();
+  if (k) body.app_key = k;
+  if (s) body.app_secret = s;
+  if (!k && !s && !CURRENT?.configured) { toast('请先填 AppKey 与 AppSecret', true); return; }
+  try {
+    const r = await call('/api/open-platform/config', {method: 'POST', body: JSON.stringify(body)});
+    if (!r.ok) throw new Error(r.error || '保存失败');
+    $('fKey').value = ''; $('fSecret').value = ''; $('fKey').dataset.touched = '';
+    toast('已保存（AppSecret 不再回显）');
+    await loadStatus();
+  } catch (e) { toast(e.message, true); }
+};
+
+$('btnSelfCheck').onclick = async () => {
+  try {
+    const r = await call('/api/open-platform/self-check', {method: 'POST'});
+    const probs = r.problems || [];
+    $('testOut').innerHTML = probs.length
+      ? `<div class="warn" style="margin-top:10px">还有 ${probs.length} 项没配好：${probs.map(esc).join('；')}</div>`
+      : `<div class="ok" style="margin-top:10px">配置齐全（接口 ${r.api_total} 个，签名稳定）。下一步点「测试连通性」。</div>`;
+  } catch (e) { toast(e.message, true); }
+};
+
+$('btnTest').onclick = async () => {
+  const b = $('btnTest');
+  b.disabled = true; b.textContent = '测试中…';
+  try {
+    const r = await call('/api/open-platform/test', {method: 'POST'});
+    if (r.ok) {
+      $('testOut').innerHTML =
+        `<div class="ok" style="margin-top:10px">连通成功，授权店铺 ${r.shop_count} 个。</div>`
+        + (r.shops?.length ? `<table style="margin-top:8px"><thead><tr>
+            <th>seller_id</th><th>店铺</th><th>授权到期</th></tr></thead><tbody>`
+            + r.shops.map(s => `<tr><td>${esc(s.seller_id)}</td><td>${esc(s.shop_name)}</td>
+                <td>${esc(s.expires)}</td></tr>`).join('')
+            + `</tbody></table>` : '')
+        + `<div class="hint">如果授权到期时间是空的或已过期，去闲管家重新授权（官方：每次授权有效期半年）。</div>`;
+    } else {
+      $('testOut').innerHTML =
+        `<div class="err" style="margin-top:10px">${esc(r.error)}</div>`
+        + (r.hint ? `<div class="hint">${esc(r.hint)}</div>` : '');
+    }
+  } catch (e) { toast(e.message, true); }
+  finally { b.disabled = false; b.textContent = '测试连通性（只读）'; await loadLogs(); }
+};
+
+$('btnCall').onclick = async () => {
+  let params;
+  try { params = JSON.parse($('apiBody').value || '{}'); }
+  catch (e) { toast('参数不是合法 JSON', true); return; }
+  const b = $('btnCall');
+  b.disabled = true; b.textContent = '调用中…';
+  try {
+    const r = await call('/api/open-platform/read', {method: 'POST',
+      body: JSON.stringify({api: $('apiSel').value, body: params})});
+    $('callOut').style.display = 'block';
+    $('callOut').textContent = JSON.stringify(r, null, 2);
+  } catch (e) { toast(e.message, true); }
+  finally { b.disabled = false; b.textContent = '调用'; await loadLogs(); }
+};
+
+(async () => {
+  try {
+    await loadApis();
+    await loadStatus();
+    $('apiBody').value = JSON.stringify(BODY_HINT[$('apiSel').value] || {}, null, 0);
+  } catch (e) { toast(e.message, true); }
+  setInterval(loadLogs, 20000);
+})();
+</script>
+</body>
+</html>

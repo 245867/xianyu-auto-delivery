@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>闲鱼自助提卡中心 - 快速安全提取</title>
+<style>
+  :root {
+    --bg-grad: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
+    --card-bg: rgba(22, 27, 34, 0.85);
+    --border: #30363d;
+    --text-main: #f0f6fc;
+    --text-muted: #8b949e;
+    --accent: #238636;
+    --accent-hover: #2ea043;
+    --primary: #1f6feb;
+    --primary-hover: #388bfd;
+    --warn: #d29922;
+    --danger: #f85149;
+    --card-box: #0d1117;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body {
+    background: var(--bg-grad);
+    color: var(--text-main);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 20px 16px;
+  }
+  .container {
+    max-width: 580px;
+    width: 100%;
+    margin: 20px auto 40px;
+  }
+  .header {
+    text-align: center;
+    margin-bottom: 24px;
+  }
+  .header .badge {
+    display: inline-block;
+    background: rgba(31, 111, 235, 0.15);
+    color: #58a6ff;
+    border: 1px solid rgba(56, 139, 253, 0.4);
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 500;
+    margin-bottom: 8px;
+  }
+  .header h1 {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    margin-bottom: 6px;
+  }
+  .header p {
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(12px);
+    border-radius: 14px;
+    padding: 24px 20px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    margin-bottom: 20px;
+  }
+  .form-group {
+    margin-bottom: 18px;
+  }
+  .form-group label {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-main);
+    margin-bottom: 8px;
+  }
+  .input-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+  .input-wrap input {
+    width: 100%;
+    background: var(--card-box);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 13px 14px;
+    font-size: 15px;
+    color: #fff;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .input-wrap input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(31, 111, 235, 0.25);
+  }
+  .btn {
+    width: 100%;
+    background: var(--primary);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 13px 20px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.1s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  .btn:hover { background: var(--primary-hover); }
+  .btn:active { transform: scale(0.98); }
+  .btn.btn-copy {
+    background: var(--accent);
+    padding: 10px 16px;
+    font-size: 13px;
+    width: auto;
+  }
+  .btn.btn-copy:hover { background: var(--accent-hover); }
+  .btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  /* 结果展示区块 */
+  .result-section {
+    display: none;
+    animation: fadeIn 0.3s ease;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .order-meta {
+    background: rgba(13, 17, 23, 0.6);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    border: 1px dashed var(--border);
+  }
+  .meta-item {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+    margin-bottom: 6px;
+  }
+  .meta-item:last-child { margin-bottom: 0; }
+  .meta-label { color: var(--text-muted); }
+  .meta-val { color: var(--text-main); font-weight: 500; }
+  .card-content-box {
+    background: #090d13;
+    border: 1px solid rgba(56, 139, 253, 0.3);
+    border-radius: 8px;
+    padding: 16px;
+    position: relative;
+    margin-bottom: 14px;
+  }
+  .card-content-box pre {
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 14px;
+    color: #7ee787;
+    white-space: pre-wrap;
+    word-break: break-all;
+    line-height: 1.6;
+    user-select: all;
+  }
+  .card-action-bar {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 10px;
+  }
+  .notice-box {
+    background: rgba(210, 153, 34, 0.1);
+    border-left: 3px solid var(--warn);
+    padding: 12px 14px;
+    border-radius: 0 8px 8px 0;
+    font-size: 12px;
+    color: #e3b341;
+    line-height: 1.6;
+    margin-top: 16px;
+  }
+  .notice-box b { color: #fff; }
+  .error-box {
+    background: rgba(248, 81, 73, 0.1);
+    border-left: 3px solid var(--danger);
+    padding: 12px 14px;
+    border-radius: 0 8px 8px 0;
+    font-size: 13px;
+    color: #ff7b72;
+    margin-bottom: 14px;
+    display: none;
+  }
+  .footer {
+    text-align: center;
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.6;
+  }
+  .footer a { color: #58a6ff; text-decoration: none; }
+  .watermark {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%) rotate(-30deg);
+    font-size: 38px;
+    color: rgba(255, 255, 255, 0.02);
+    pointer-events: none;
+    font-weight: 800;
+    white-space: nowrap;
+    z-index: 999;
+  }
+</style>
+</head>
+<body>
+<div class="watermark" id="watermark">闲鱼正品验证凭证</div>
+
+<div class="container">
+  <div class="header">
+    <div class="badge">🛡️ 官方订单云端自提</div>
+    <h1>闲鱼订单卡券自提中心</h1>
+    <p>凭闲鱼付款订单编号，快速提取您的卡密资料与发货凭证</p>
+  </div>
+
+  <div class="card">
+    <div class="error-box" id="errorBox" role="alert"></div>
+
+    <div class="form-group" id="queryGroup">
+      <label for="orderId">闲鱼订单编号</label>
+      <div class="input-wrap">
+        <input type="text" id="orderId" placeholder="例如：3316574319266035695" autocomplete="off" autocorrect="off" spellcheck="false">
+      </div>
+      <p style="font-size: 11px; color: var(--text-muted); margin-top: 6px;">
+        💡 提示：在闲鱼APP内点击【我的】→【我买到的】→ 打开对应订单即可复制订单编号
+      </p>
+    </div>
+
+    <div class="form-group">
+      <label for="pickupToken">订单专属提货凭证</label>
+      <div class="input-wrap">
+        <input type="password" id="pickupToken" maxlength="128" autocomplete="off" spellcheck="false">
+      </div>
+      <p>打开卖家在订单聊天中发送的专属链接即可自动填入。</p>
+    </div>
+
+    <button class="btn" id="queryBtn" type="button">
+      <span>⚡ 验证并立即提卡</span>
+    </button>
+
+    <!-- 结果展示 -->
+    <div class="result-section" id="resultSection">
+      <hr style="border: 0; border-top: 1px solid var(--border); margin: 20px 0;">
+
+      <div class="order-meta">
+        <div class="meta-item">
+          <span class="meta-label">商品名称</span>
+          <span class="meta-val" id="metaTitle">-</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">订单状态</span>
+          <span class="meta-val" id="metaStatus" style="color:#7ee787;">交易履约中</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">发货时间</span>
+          <span class="meta-val" id="metaTime">-</span>
+        </div>
+      </div>
+
+      <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; display:flex; justify-content:space-between; align-items:center;">
+        <span>📦 发货卡密 / 资源链接:</span>
+        <span style="font-size: 11px; color: var(--text-muted);">已安全加密验证</span>
+      </div>
+
+      <div class="card-content-box">
+        <pre id="cardContent">正在解析发货卡券内容...</pre>
+        <div class="card-action-bar">
+          <button class="btn btn-copy" id="copyBtn" type="button">📋 一键复制全部</button>
+          <button class="btn btn-copy" id="openLinkBtn" type="button" style="background:#1f6feb; display:none;">🌐 打开网盘/链接</button>
+        </div>
+      </div>
+
+      <div class="notice-box">
+        <b>💡 售后温馨指引：</b><br>
+        1. 虚拟商品提取后请尽快查验或兑换，避免遗忘导致失效；<br>
+        2. 如提示卡密异常或网盘链接失效，请直接返回闲鱼聊天窗口联系原卖家处理；<br>
+        3. 请谨防任何脱离闲鱼平台的私下加微信/转账欺诈要求。
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <p>闲鱼智控 Pro · 数字化无人值守云交付中心</p>
+    <p style="margin-top: 4px; font-size: 11px;">技术由自动化履约账本驱动 | 全程加密传输</p>
+  </div>
+</div>
+
+<script src="/static/pickup.js" defer></script>
+</body>
+</html>

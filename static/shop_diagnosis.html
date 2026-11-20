@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>店铺复盘 · 限流归因</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b23; --line:#242c38; --txt:#e6edf3;
+    --dim:#8b98a9; --acc:#3fb950; --warn:#d29922; --err:#f85149; --blue:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:24px 20px 60px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 12px;font-weight:600}
+  .row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+  label.f{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+  input[type=text],input[type=number],select{
+    background:#0d1117;border:1px solid var(--line);color:var(--txt);
+    border-radius:6px;padding:6px 9px;font:13px/1.5 inherit;min-width:120px}
+  input:focus,select:focus{outline:none;border-color:var(--blue)}
+  button{background:#21262d;color:var(--txt);border:1px solid var(--line);
+         border-radius:6px;padding:6px 13px;font:13px inherit;cursor:pointer}
+  button:hover{border-color:#3d4756;background:#262d36}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+  button.primary:hover{background:#388bfd}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
+        border:1px solid var(--line)}
+  .on{color:var(--acc);border-color:#1d4429;background:#0f2417}
+  .dr{color:var(--warn);border-color:#4a3a12;background:#241d09}
+  .bad{color:var(--err);border-color:#5a2226;background:#2a1618}
+  .bl{color:var(--blue);border-color:#1a3a5f;background:#0c1a29}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);
+        vertical-align:top}
+  th{color:var(--dim);font-weight:500;font-size:12px}
+  .muted{color:var(--dim)}
+  .err{color:var(--err)} .ok{color:var(--acc)} .warn{color:var(--warn)}
+  .num{font-variant-numeric:tabular-nums;text-align:right}
+  .note{background:#0c1a29;border:1px solid #1a3a5f;border-radius:8px;
+        padding:10px 14px;font-size:12.5px;color:#a8c7e8;margin-bottom:14px}
+  .note b{color:var(--blue)}
+  .note ul{margin:6px 0 0 18px;padding:0}
+  .note li{margin:3px 0}
+  .bar{height:6px;background:#0d1117;border-radius:3px;overflow:hidden;margin-top:4px}
+  .bar i{display:block;height:100%;background:var(--blue)}
+  .item-row{cursor:pointer}
+  .item-row:hover{background:#1a212b}
+  .detail{background:#0b0f14;border:1px solid var(--line);border-radius:8px;
+          padding:12px 14px;margin:8px 0}
+  .act{border-left:3px solid var(--line);padding:6px 0 6px 12px;margin-bottom:10px}
+  .act.high{border-left-color:var(--err)}
+  .act.mid{border-left-color:var(--warn)}
+  .act.low{border-left-color:var(--blue)}
+  .act.info{border-left-color:#30363d}
+  .act .t{font-weight:600;font-size:13.5px}
+  .act .e{color:var(--dim);font-size:12px;margin:2px 0}
+  .act .a{font-size:13px;color:#c9d6e4}
+  #toast{position:fixed;right:20px;bottom:20px;background:#21262d;border:1px solid var(--line);
+         border-radius:8px;padding:10px 16px;font-size:13px;opacity:0;transition:opacity .2s;
+         pointer-events:none;max-width:380px}
+  #toast.show{opacity:1}
+  .hint{color:var(--dim);font-size:12px;margin-top:8px;line-height:1.7}
+  .kv{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .kv span{background:#0d1117;border:1px solid var(--line);border-radius:6px;
+           padding:3px 10px;font-size:12px}
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid #2c3542;
+        border-top-color:var(--blue);border-radius:50%;animation:sp .7s linear infinite;
+        vertical-align:-2px;margin-right:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>店铺复盘 · 限流归因</h1>
+  <div class="sub">读平台真实计数 → 落每日快照 → 判漏斗断点 → 给带证据的候选原因。全程只读，不改价不下架。</div>
+
+  <div class="note">
+    <b>先说清楚这份报告的数据边界</b>
+    <ul>
+      <li><b>曝光数拿不到。</b>官方开放平台与 MTOP 都不提供曝光，所以这里用「浏览绝对值」代替「曝光/浏览比」，判据只严不松——只有浏览 &lt; 50 且已过观察期才判淘汰。</li>
+      <li><b>咨询数拿不到。</b>用「想要数」当意向代理，来自详情接口 <code>wantCnt</code>（列表接口的 wantNum 自 2026 起恒为 0）。</li>
+      <li><b>上架天数是我们第一次记录到它的时间</b>，不是平台发布时间。第一天跑，所有商品都会显示「观察中」——这是对的，不是坏了。</li>
+      <li><b>成交/成交额/退款/待发货来自卖家端订单接口</b>（近 7 天真实订单），不是商品卡上的「累计销量」——后者是历史累计，反映不了这一周卖得怎么样。接口拿不到时这几个数会整块消失，不会用累计销量顶替。</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>跑一轮</h2>
+    <div class="row">
+      <label class="f">账号<select id="acc"><option value="">自动选第一个</option></select></label>
+      <label class="f">补详情条数
+        <input type="number" id="budget" value="30" min="0" max="60" step="5">
+      </label>
+      <label class="f">补详情
+        <select id="withDetail">
+          <option value="1">要（准确，但慢，约 3 秒/条）</option>
+          <option value="0">不要（快，但只拿到列表里的数）</option>
+        </select>
+      </label>
+      <div style="align-self:flex-end">
+        <button class="primary" id="runBtn" onclick="runScan()">开始复盘</button>
+        <button onclick="loadLast()">看上次结果</button>
+      </div>
+    </div>
+    <div class="hint" id="runHint">还没跑过。</div>
+  </div>
+
+  <div class="card" id="ovCard" style="display:none">
+    <h2>总览</h2>
+    <div class="kv" id="ovKv"></div>
+    <div id="ovSignals"></div>
+  </div>
+
+  <div class="card" id="actCard" style="display:none">
+    <h2>该做的事（按影响排序）</h2>
+    <div id="actions"></div>
+  </div>
+
+  <div class="card" id="listCard" style="display:none">
+    <h2>逐件明细 <span class="muted" style="font-weight:400;font-size:12px">点一行看趋势和归因</span></h2>
+    <table>
+      <thead><tr>
+        <th>商品</th><th>分类</th><th class="num">浏览</th><th class="num">想要</th>
+        <th class="num">想要/浏览</th><th class="num">成交</th><th class="num">图</th>
+        <th class="num">价格</th><th class="num">记录天数</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <div class="card" id="confCard" style="display:none">
+    <h2>配置</h2>
+    <div class="row">
+      <label class="f">默认补详情条数<input type="number" id="cfgBudget" min="0" max="60" step="5"></label>
+      <label class="f">定时复盘<select id="cfgAuto"><option value="0">关</option><option value="1">开</option></select></label>
+      <label class="f">时<input type="number" id="cfgHour" min="0" max="23"></label>
+      <label class="f">分<input type="number" id="cfgMin" min="0" max="59"></label>
+      <label class="f">快照保留天数<input type="number" id="cfgKeep" min="7" max="730"></label>
+      <div style="align-self:flex-end"><button onclick="saveCfg()">保存</button></div>
+    </div>
+    <div class="hint" id="cfgHint"></div>
+  </div>
+
+  <div id="toast"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let LAST = null;
+
+function toast(msg, isErr){
+  const t = $('#toast');
+  t.textContent = msg;
+  t.style.borderColor = isErr ? 'var(--err)' : 'var(--line)';
+  t.classList.add('show');
+  clearTimeout(t._h);
+  t._h = setTimeout(()=>t.classList.remove('show'), 3200);
+}
+
+async function jget(url){
+  const r = await fetch(url);
+  return r.json();
+}
+async function jpost(url, body){
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                             body: JSON.stringify(body||{})});
+  return r.json();
+}
+
+async function boot(){
+  try{
+    const st = await jget('/api/shop-diagnosis/status');
+    if(!st.ok){ toast(st.error||'状态读取失败', true); return; }
+    const sel = $('#acc');
+    (st.accounts||[]).forEach(a=>{
+      const o = document.createElement('option');
+      o.value = a.cookie_id;
+      o.textContent = a.nick ? `${a.nick}（${a.cookie_id}）` : a.cookie_id;
+      sel.appendChild(o);
+    });
+    const c = st.config || {};
+    $('#budget').value = c.detail_budget ?? 30;
+    $('#cfgBudget').value = c.detail_budget ?? 30;
+    $('#cfgAuto').value = c.auto_scan ? '1' : '0';
+    $('#cfgHour').value = c.hour ?? 10;
+    $('#cfgMin').value = c.minute ?? 0;
+    $('#cfgKeep').value = c.keep_days ?? 180;
+    $('#confCard').style.display = 'block';
+    const days = st.days || [];
+    $('#runHint').textContent = days.length
+      ? `已跟踪 ${st.items_tracked} 件，共 ${st.snapshots} 条快照，最近有数据的日期：${days.slice(0,3).join('、')}`
+      : `还没有任何快照。已跟踪 ${st.items_tracked} 件。`;
+    if((st.accounts||[]).length === 0){
+      $('#runHint').textContent = '没有已登录账号，请先在主界面登录闲鱼。';
+    }
+    const circuit = st.circuit || {};
+    const paused = Object.entries(circuit.accounts || {})
+      .map(([account, seconds]) => account + '（约 ' + Math.ceil(seconds / 60) + ' 分钟）');
+    if (circuit.global_seconds > 0) paused.unshift('全局（约 ' + Math.ceil(circuit.global_seconds / 60) + ' 分钟）');
+    if (paused.length) {
+      $('#runHint').textContent += ' 当前暂停：' + paused.join('、') + '。';
+    }
+  }catch(e){ toast('初始化失败：'+e, true); }
+}
+
+async function runScan(){
+  const btn = $('#runBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>正在读店铺…';
+  $('#runHint').textContent = '正在拉列表并补详情，别关页面。补 30 条约需 2–3 分钟。';
+  try{
+    const body = {
+      cookie_id: $('#acc').value || '',
+      with_detail: $('#withDetail').value === '1',
+      detail_budget: parseInt($('#budget').value || '30', 10)
+    };
+    const rep = await jpost('/api/shop-diagnosis/run', body);
+    if(!rep.ok){ toast(rep.error || '复盘失败', true); $('#runHint').textContent = rep.error || '复盘失败'; return; }
+    render(rep);
+    const d = rep.detail_enrich || {};
+    $('#runHint').textContent =
+      `完成：${(rep.items||[]).length} 件商品，${rep.list_pages||1} 页列表；` +
+      `详情成功 ${d.success||0} / 请求 ${d.requested||0}（失败 ${d.failed||0}，跳过 ${d.skipped||0}）。`;
+  }catch(e){ toast('复盘异常：'+e, true); }
+  finally{
+    btn.disabled = false;
+    btn.textContent = '开始复盘';
+  }
+}
+
+async function loadLast(){
+  try{
+    const acc = $('#acc').value || '';
+    const rep = await jget('/api/shop-diagnosis/last' + (acc ? '?cookie_id='+encodeURIComponent(acc) : ''));
+    if(!rep.ok){ toast(rep.error || '没有历史', true); return; }
+    render(rep);
+    $('#runHint').textContent = '这是上次的结果（' + (rep.at || rep._at || '') + '），没有重新请求平台。';
+  }catch(e){ toast('读取失败：'+e, true); }
+}
+
+function clsPill(code, label){
+  const map = {
+    cull:['bad','该淘汰'], zombie:['dr','僵尸'], potential:['bl','有潜力'],
+    hot:['on','爆款'], normal:['','正常'], observe:['','观察中'], unknown:['','无数据']
+  };
+  const m = map[code] || ['', label || code];
+  return `<span class="pill ${m[0]}">${m[1]}</span>`;
+}
+
+function render(rep){
+  LAST = rep;
+  const items = rep.items || [];
+  const counts = rep.counts || {};
+
+  // 总览
+  const kv = $('#ovKv');
+  kv.innerHTML = '';
+  const chips = [
+    ['商品', items.length],
+    ['爆款', counts.hot||0],
+    ['有潜力', counts.potential||0],
+    ['僵尸', counts.zombie||0],
+    ['该淘汰', counts.cull||0],
+    ['观察中', counts.observe||0],
+    ['店内中位价', rep.median_price ? '¥'+rep.median_price : '—']
+  ];
+  // 真成交口径（来自卖家端订单接口；拿不到就不显示，绝不拿累计销量冒充）
+  const sales = rep.sales || {};
+  if (sales.ok) {
+    chips.push([`成交(近${sales.days||7}天)`, (sales.orders||0)+' 单']);
+    chips.push(['成交额', '¥'+(sales.amount||0)]);
+    if (sales.refund_orders) chips.push(['退款', sales.refund_orders+' 单']);
+    if (sales.pending_ship) chips.push(['待发货', sales.pending_ship+' 单']);
+  }
+  chips.push(['最近复盘', rep.at || rep._at || '—']);
+  chips.forEach(([k,v])=>{
+    const s = document.createElement('span');
+    s.textContent = `${k} ${v}`;
+    kv.appendChild(s);
+  });
+
+  const ov = $('#ovSignals');
+  const shopSigs = rep.shop_signals || [];
+  const ops = rep.ops || {};
+  let html = '';
+  if(shopSigs.length){
+    html += shopSigs.map(s=>actHtml(s, '账号')).join('');
+  }else{
+    html = `<div class="muted" style="font-size:13px">没有账号级异常。今天发布 ${ops.publish_today||0} 条、擦亮 ${ops.polish_today||0} 次、发布结果未知 ${ops.recent_unknown||0} 条。</div>`;
+  }
+  ov.innerHTML = html;
+  $('#ovCard').style.display = 'block';
+
+  // 该做的事
+  const acts = rep.actions || [];
+  $('#actions').innerHTML = acts.length
+    ? acts.map(a=>`
+        <div class="act ${a.level||''}">
+          <div class="t">${a.scope} · ${esc(a.title)}</div>
+          <div class="a">${esc(a.action)}</div>
+        </div>`).join('')
+    : '<div class="muted" style="font-size:13px">没有需要立刻做的事。</div>';
+  $('#actCard').style.display = 'block';
+
+  // 明细
+  const tb = $('#rows');
+  tb.innerHTML = '';
+  items.sort((a,b)=>(b.want||0)-(a.want||0));
+  items.forEach((it, i)=>{
+    const tr = document.createElement('tr');
+    tr.className = 'item-row';
+    tr.innerHTML = `
+      <td>${esc((it.title||'').slice(0,34) || it.item_id)}${it.stale?' <span class="pill">旧数据</span>':''}</td>
+      <td>${clsPill(it.classify, it.classify_label)}</td>
+      <td class="num">${fmt(it.browse)}</td>
+      <td class="num">${fmt(it.want)}</td>
+      <td class="num">${it.want_rate!=null ? (it.want_rate*100).toFixed(1)+'%' : '—'}</td>
+      <td class="num">${fmt(it.sold)}</td>
+      <td class="num">${fmt(it.images)}</td>
+      <td class="num">${it.price!=null ? '¥'+it.price : '—'}</td>
+      <td class="num">${it.days!=null ? it.days.toFixed(1) : '新'}</td>`;
+    tr.onclick = ()=>toggleDetail(tr, it);
+    tb.appendChild(tr);
+  });
+  $('#listCard').style.display = 'block';
+  $('#ovCard').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+function actHtml(s, scope){
+  return `<div class="act ${s.level||''}">
+    <div class="t">${scope} · ${esc(s.title)}</div>
+    <div class="e">${esc(s.evidence||'')} · 可能性 ${(s.weight*100).toFixed(0)}%</div>
+    <div class="a">${esc(s.action)}</div>
+  </div>`;
+}
+
+function toggleDetail(tr, it){
+  const next = tr.nextElementSibling;
+  if(next && next.classList.contains('detail-row')){ next.remove(); return; }
+  const td = document.createElement('tr');
+  td.className = 'detail-row';
+  const box = document.createElement('td');
+  box.colSpan = 9;
+  box.innerHTML = '<div class="detail"><span class="muted">读趋势…</span></div>';
+  td.appendChild(box);
+  tr.after(td);
+  const cid = it.cookie_id || ($('#acc').value || '');
+  jget(`/api/shop-diagnosis/history?cookie_id=${encodeURIComponent(cid)}&item_id=${encodeURIComponent(it.item_id)}&days=14`)
+    .then(r=>{
+      const rows = r.rows || [];
+      let h = '';
+      if(it.signals && it.signals.length){
+        h += it.signals.map(s=>`
+          <div class="act ${s.level||''}">
+            <div class="t">${esc(s.title)}</div>
+            <div class="e">${esc(s.evidence||'')}</div>
+            <div class="a">${esc(s.action)}</div>
+          </div>`).join('');
+      }else{
+        h += '<div class="muted" style="font-size:13px">这件没有触发任何归因信号。</div>';
+      }
+      if(rows.length){
+        h += '<table style="margin-top:10px"><thead><tr><th>日期</th><th class="num">浏览</th>'
+           + '<th class="num">想要</th><th class="num">收藏</th><th class="num">成交</th></tr></thead><tbody>'
+           + rows.map(r=>`<tr><td>${r.day}</td><td class="num">${fmt(r.browse)}</td>`
+               + `<td class="num">${fmt(r.want)}</td><td class="num">${fmt(r.collect)}</td>`
+               + `<td class="num">${fmt(r.sold)}</td></tr>`).join('')
+           + '</tbody></table>';
+      }else{
+        h += '<div class="muted" style="font-size:12px;margin-top:8px">还没有历史快照——第二天再跑才会有趋势。</div>';
+      }
+      box.innerHTML = '<div class="detail">'+h+'</div>';
+    })
+    .catch(()=>{ box.innerHTML = '<div class="detail err">趋势读取失败</div>'; });
+}
+
+async function saveCfg(){
+  const body = {
+    detail_budget: parseInt($('#cfgBudget').value||'30',10),
+    auto_scan: $('#cfgAuto').value === '1',
+    hour: parseInt($('#cfgHour').value||'10',10),
+    minute: parseInt($('#cfgMin').value||'0',10),
+    keep_days: parseInt($('#cfgKeep').value||'180',10)
+  };
+  const r = await jpost('/api/shop-diagnosis/config', body);
+  if(r.ok){ toast('已保存'); $('#cfgHint').textContent = '已保存。定时复盘需重启应用后生效。'; }
+  else toast(r.error||'保存失败', true);
+}
+
+function fmt(v){ return (v===null||v===undefined) ? '—' : v; }
+function esc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g, c=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+boot();
+</script>
+</body>
+</html>

@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>自动擦亮（移植自 zhinianboke polish_task）</title>
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --ink:#1f2329; --muted:#8a919f; --line:#e8eaed; --brand:#1f6feb; --ok:#1a7f37; --bad:#cf222e; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+.wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 80px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 15px; margin: 24px 0 10px; }
+.sub { color: var(--muted); margin-bottom: 18px; }
+button { padding: 8px 14px; border: 0; border-radius: 8px; background: var(--brand); color:#fff; cursor: pointer; font: inherit; }
+button.ghost { background: var(--card); color: var(--brand); border:1px solid var(--brand); }
+button:disabled { opacity:.5; cursor: default; }
+.card { background: var(--card); border:1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+.muted { color: var(--muted); }
+.ok { color: var(--ok); } .err { color: var(--bad); }
+pre { background:#f6f8fa; padding:10px; border-radius:8px; overflow:auto; max-height: 360px; }
+.tag { display:inline-block; padding: 2px 8px; border-radius: 999px; font-size:12px; border:1px solid var(--line); }
+.tag.on { background:#dafbe1; color:var(--ok); } .tag.off { background:#ffebe9; color:var(--bad); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>自动擦亮</h1>
+  <div class="sub">每天定时把账号下全部在售商品调一次擦亮接口（维持曝光）。逐商品随机间隔 8–15 秒防风控，令牌过期自动换新 Cookie 重试。</div>
+
+  <div class="card">
+    <div id="cfgLine">加载中…</div>
+    <div style="height:10px"></div>
+    <button id="btnRun">立即全量擦亮</button>
+    <input type="text" id="cookieId" placeholder="只擦指定账号：填 Cookie ID（可留空）" style="margin-left:8px;padding:8px;border:1px solid var(--line);border-radius:8px;width:280px">
+    <span id="runResult" class="muted" style="margin-left:8px"></span>
+  </div>
+
+  <h2>运行状态</h2>
+  <div class="card"><pre id="statusBox">（加载中…）</pre></div>
+  <button class="ghost" onclick="loadStatus()">刷新状态</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+async function loadStatus() {
+  const r = await fetch('/api/polish/status').then(r => r.json()).catch(() => null);
+  if (!r || !r.ok) { $('statusBox').textContent = '状态获取失败'; return; }
+  const s = r.settings;
+  $('cfgLine').innerHTML =
+    `每日计划：<b>${String(s.hour).padStart(2,'0')}:${String(s.minute).padStart(2,'0')}</b>` +
+    `　调度：${s.enabled ? '<span class="ok">开启</span>' : '<span class="err">关闭</span>'}` +
+    `　当前：${r.running ? '<span class="tag off">执行中</span>' : '空闲'}` +
+    `　今日已跑：${r.ran_today ? '是' : '否'}`;
+  $('statusBox').textContent = JSON.stringify({
+    上次运行: r.last_run || '从未',
+    上次摘要: r.last_summary || {},
+    最近日志: r.recent_logs || []
+  }, null, 2);
+}
+
+$('btnRun').onclick = async () => {
+  $('btnRun').disabled = true;
+  $('runResult').textContent = '启动中…';
+  try {
+    const cid = $('cookieId').value.trim();
+    const body = cid ? {cookie_id: cid} : {};
+    const r = await fetch('/api/polish/run', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    }).then(r => r.json());
+    $('runResult').innerHTML = r.ok ? `<span class="ok">已启动（批次 ${r.batch_id}），稍后刷新状态查看结果</span>`
+                                    : `<span class="err">${r.error||'启动失败'}</span>`;
+  } catch (e) {
+    $('runResult').innerHTML = `<span class="err">请求失败：${e}</span>`;
+  } finally {
+    $('btnRun').disabled = false;
+  }
+};
+
+loadStatus();
+</script>
+</body>
+</html>

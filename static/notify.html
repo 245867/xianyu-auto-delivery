@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>通知推送配置</title>
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --ink:#1f2329; --muted:#8a919f; --line:#e8eaed; --brand:#1f6feb; --ok:#1a7f37; --bad:#cf222e; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+.wrap { max-width: 760px; margin: 0 auto; padding: 24px 16px 80px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.sub { color: var(--muted); margin-bottom: 18px; }
+.card { background: var(--card); border:1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+label.row { display:flex; gap:10px; align-items:center; margin: 10px 0; }
+label.row span { width: 110px; flex: none; color:#3a4048; }
+input[type=text] { flex:1; padding: 8px 10px; border:1px solid var(--line); border-radius:8px; font:inherit; }
+input[type=text]:focus { outline:2px solid #dcebff; border-color: var(--brand); }
+button { padding: 8px 14px; border:0; border-radius:8px; background:var(--brand); color:#fff; cursor:pointer; font:inherit; }
+button.ghost { background: var(--card); color: var(--brand); border:1px solid var(--brand); }
+.muted { color: var(--muted); }
+.ok { color: var(--ok); } .err { color: var(--bad); }
+pre { background:#f6f8fa; padding:10px; border-radius:8px; overflow:auto; }
+.hint { font-size: 12px; color: var(--muted); margin-left: 120px; margin-top: -6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>通知推送</h1>
+  <div class="sub">风控熔断、发布异常、每日擦亮结果 → 直接推到手机/群里。只填要用的渠道，其余留空。地址只存本机，不外传。</div>
+
+  <div class="card">
+    <label class="row"><span>总开关</span><input type="checkbox" id="enabled" checked> 启用通知</label>
+    <label class="row"><span>企业微信</span><input type="text" id="wecom" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."></label>
+    <label class="row"><span>钉钉</span><input type="text" id="dingtalk" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..."></label>
+    <label class="row"><span>飞书</span><input type="text" id="feishu" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."></label>
+    <label class="row"><span>Bark(iOS)</span><input type="text" id="bark" placeholder="https://api.day.app/你的KEY"></label>
+    <label class="row"><span>自定义</span><input type="text" id="custom" placeholder="任意接收 POST JSON 的地址（可选）"></label>
+  </div>
+
+  <div class="card">
+    <div style="font-weight:600;margin-bottom:6px">哪些事件推给我</div>
+    <label class="row"><span>擦亮结果</span><input type="checkbox" id="ev-polish" checked> 每日擦亮批次摘要</label>
+    <label class="row"><span>风控告警</span><input type="checkbox" id="ev-risk" checked> 搜索/发布触发风控冷却</label>
+    <label class="row"><span>发布异常</span><input type="checkbox" id="ev-publish" checked> 发布失败或结果未知</label>
+    <label class="row"><span>账号状态</span><input type="checkbox" id="ev-account" checked> 账号掉线 / 恢复 / 暂停 / 启用</label>
+    <label class="row"><span>店铺诊断</span><input type="checkbox" id="ev-diagnosis" checked> 诊断出高危信号时推一条（中低信号不推）</label>
+  </div>
+
+  <div class="card">
+    <button id="btnSave">保存</button>
+    <button id="btnTest" class="ghost" style="margin-left:8px">发送测试消息</button>
+    <span id="msg" class="muted" style="margin-left:10px"></span>
+    <pre id="resultBox" class="muted" style="margin-top:10px;display:none"></pre>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;align-items:center;gap:8px">
+      <strong>最近发送失败</strong>
+      <span class="muted">只记事件、渠道和次数，不含地址与正文</span>
+      <button id="btnFailures" class="ghost" style="margin-left:auto">刷新</button>
+    </div>
+    <pre id="failureBox" class="muted" style="margin-top:10px">加载中…</pre>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;align-items:center;gap:8px">
+      <strong>后台任务心跳</strong>
+      <span class="muted">超过 2.5 倍节奏没动静会推一条账号通知</span>
+      <button id="btnWatchdog" class="ghost" style="margin-left:auto">刷新</button>
+    </div>
+    <pre id="watchBox" class="muted" style="margin-top:10px">加载中…</pre>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const FIELDS = ['wecom','dingtalk','feishu','bark','custom'];
+
+async function load() {
+  const r = await fetch('/api/notify/config').then(r => r.json()).catch(() => null);
+  if (!r || !r.ok) { $('msg').innerHTML = '<span class="err">读取配置失败</span>'; return; }
+  const c = r.config;
+  $('enabled').checked = !!c.enabled;
+  FIELDS.forEach(k => { $(k).value = c[k] || ''; });
+  const ev = c.events || {};
+  $('ev-polish').checked = ev.polish !== false;
+  $('ev-risk').checked = ev.risk !== false;
+  $('ev-publish').checked = ev.publish !== false;
+  $('ev-account').checked = ev.account !== false;
+  $('ev-diagnosis').checked = ev.diagnosis !== false;
+}
+
+function collect() {
+  const body = { enabled: $('enabled').checked,
+                 events: { polish: $('ev-polish').checked,
+                           risk: $('ev-risk').checked,
+                           publish: $('ev-publish').checked,
+                           account: $('ev-account').checked,
+                           diagnosis: $('ev-diagnosis').checked } };
+  FIELDS.forEach(k => body[k] = $(k).value.trim());
+  return body;
+}
+
+$('btnSave').onclick = async () => {
+  const r = await fetch('/api/notify/config', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(collect())
+  }).then(r => r.json());
+  $('msg').innerHTML = r.ok ? '<span class="ok">已保存</span>' : '<span class="err">保存失败</span>';
+};
+
+$('btnTest').onclick = async () => {
+  // 先保存再测试，避免测的是旧配置
+  await fetch('/api/notify/config', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(collect())
+  });
+  $('msg').innerHTML = '<span class="muted">发送中…</span>';
+  const r = await fetch('/api/notify/test', {method:'POST'}).then(r => r.json()).catch(() => null);
+  const box = $('resultBox');
+  box.style.display = '';
+  if (!r) { $('msg').innerHTML = '<span class="err">请求失败</span>'; return; }
+  box.textContent = JSON.stringify(r.results || {}, null, 2);
+  if (r.ok) $('msg').innerHTML = '<span class="ok">已发送，请查看手机/群消息</span>';
+  else if (r.skipped) $('msg').innerHTML = '<span class="err">没有可发送的渠道（检查上方地址是否填写）</span>';
+  else $('msg').innerHTML = '<span class="err">发送失败，见下方详情</span>';
+};
+
+async function loadFailures() {
+  const box = $('failureBox');
+  const r = await fetch('/api/notify/failures?limit=20').then(r => r.json()).catch(() => null);
+  if (!r || !r.ok) { box.textContent = '读取失败记录失败'; return; }
+  const items = r.failures || [];
+  if (!items.length) { box.textContent = '暂无失败记录'; return; }
+  box.textContent = items.map(it =>
+    `${it.time || ''}  ${it.event || ''}/${it.channel || ''}  尝试 ${it.attempts || 0} 次  ${it.error || ''}`
+  ).join('\n');
+}
+
+$('btnFailures').onclick = loadFailures;
+
+async function loadWatchdog() {
+  const box = $('watchBox');
+  const r = await fetch('/api/watchdog/status').then(r => r.json()).catch(() => null);
+  if (!r || !r.ok) { box.textContent = '读取后台任务状态失败'; return; }
+  const rows = r.tasks || [];
+  if (!rows.length) { box.textContent = '暂无已登记的后台任务'; return; }
+  box.textContent = rows.map(t => {
+    const every = t.interval >= 3600 ? `${Math.round(t.interval / 3600)} 小时`
+                                     : `${Math.max(1, Math.round(t.interval / 60))} 分钟`;
+    const state = t.state === 'stalled' ? '停滞' : '正常';
+    return `${state}  ${t.name}${t.note ? '（' + t.note + '）' : ''}  最后心跳 ${t.last_beat_text || '从未'}  约每 ${every}`;
+  }).join('\n');
+}
+
+$('btnWatchdog').onclick = loadWatchdog;
+
+load();
+loadFailures();
+loadWatchdog();
+</script>
+</body>
+</html>

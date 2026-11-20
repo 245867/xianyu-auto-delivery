@@ -433,6 +433,7 @@ class XianyuSearcher:
             playwright = playwright or getattr(self, 'playwright', None)
             
             # 【调试】打印页面HTML内容，查找滑块相关关键词
+            page_content = ""
             try:
                 page_content = await page.content()
                 has_captcha_keyword = any(keyword in page_content.lower() for keyword in [
@@ -447,6 +448,50 @@ class XianyuSearcher:
                     logger.info("✅ 页面HTML中未发现滑块关键词")
             except Exception as e:
                 logger.debug(f"检查页面内容时出错: {e}")
+
+            # 这些标记来自实际抓到的 PunishPage/滑块响应。页面可能把验证控件
+            # 放在 iframe 里，所以不能只检查主页面上的可见 DOM。
+            challenge_markers = (
+                "_____tmd_____",
+                "punishTextFetch",
+                "PunishPage",
+                "action=captcha",
+                "nc_1_nocaptcha",
+                "J_MIDDLEWARE_FRAME_WIDGET",
+                "baxia-dialog",
+                "FAIL_SYS_USER_VALIDATE",
+                "请按住滑块",
+            )
+            challenge_sources = []
+            try:
+                challenge_sources.append(("page", page.url, page_content))
+            except Exception:
+                pass
+            try:
+                for frame in page.frames:
+                    if frame == page.main_frame:
+                        continue
+                    try:
+                        frame_content = await frame.content()
+                        challenge_sources.append(("iframe", frame.url, frame_content))
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.debug(f"检查 iframe 风控标记时出错: {e}")
+
+            for source_name, source_url, source_text in challenge_sources:
+                matched = next(
+                    (marker for marker in challenge_markers
+                     if marker in str(source_url or "")
+                     or marker in str(source_text or "")),
+                    "",
+                )
+                if matched:
+                    logger.error(
+                        f"❌ 在 {source_name} 中确认到闲鱼风控标记「{matched}」，"
+                        "需要人工完成验证，本次搜索停止"
+                    )
+                    return False
             
             # 检测滑块元素（支持多种类型的滑块）
             slider_selectors = [
@@ -793,41 +838,84 @@ class XianyuSearcher:
             # 清空之前的API响应
             self.api_responses = []
             data_list = []
+            main_response_seen = False
+            result_list_seen = False
+            main_response_error = ""
+            challenge_evidence = ""
 
             # 设置API响应监听器
             async def on_response(response):
                 """处理API响应，解析数据"""
-                if "h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search" in response.url:
+                nonlocal main_response_seen, result_list_seen
+                nonlocal main_response_error, challenge_evidence
+                response_url = str(response.url)
+                risk_markers = (
+                    "_____tmd_____", "punishTextFetch", "PunishPage",
+                    "action=captcha",
+                )
+                if any(marker in response_url for marker in risk_markers):
+                    challenge_evidence = response_url
+                    logger.error(f"检测到闲鱼风控页面请求: {response_url}")
+                    return
+
+                search_path = (
+                    "https://h5api.m.goofish.com/h5/"
+                    "mtop.taobao.idlemtopsearch.pc.search/1.0"
+                )
+                if response_url.split("?", 1)[0].rstrip("/") != search_path:
+                    return
+
+                main_response_seen = True
+                try:
+                    if response.status != 200:
+                        main_response_error = f"闲鱼搜索接口 HTTP {response.status}"
+                        logger.error(main_response_error)
+                        return
+
                     try:
-                        # 检查响应状态
-                        if response.status != 200:
-                            logger.warning(f"API响应状态异常: {response.status}")
-                            return
-
-                        # 安全地获取响应内容
+                        result_json = await response.json()
+                    except Exception as json_error:
                         try:
-                            result_json = await response.json()
-                        except Exception as json_error:
-                            logger.warning(f"无法解析响应JSON: {str(json_error)}")
-                            return
+                            body_text = (await response.text())[:300]
+                        except Exception:
+                            body_text = ""
+                        if "请按住滑块" in body_text or "PunishPage" in body_text:
+                            challenge_evidence = body_text
+                        main_response_error = f"闲鱼搜索响应不是有效 JSON: {json_error}"
+                        logger.error(main_response_error)
+                        return
 
-                        self.api_responses.append(result_json)
-                        logger.info(f"捕获到API响应，URL: {response.url}")
+                    self.api_responses.append(result_json)
+                    logger.info(f"捕获到API响应，URL: {response_url}")
 
-                        items = result_json.get("data", {}).get("resultList", [])
-                        logger.info(f"从API获取到 {len(items)} 条原始数据")
+                    ret = result_json.get("ret")
+                    ret_text = " | ".join(str(value) for value in ret) if isinstance(ret, list) else str(ret)
+                    if "SUCCESS" not in ret_text:
+                        main_response_error = f"闲鱼搜索未成功：{ret_text or '响应缺少 ret'}"
+                        logger.error(main_response_error)
+                        return
 
-                        for item in items:
-                            try:
-                                parsed_item = await self._parse_real_item(item)
-                                if parsed_item:
-                                    data_list.append(parsed_item)
-                            except Exception as parse_error:
-                                logger.warning(f"解析单个商品失败: {str(parse_error)}")
-                                continue
+                    data = result_json.get("data")
+                    items = data.get("resultList") if isinstance(data, dict) else None
+                    if not isinstance(items, list):
+                        main_response_error = "闲鱼搜索响应缺少 data.resultList"
+                        logger.error(main_response_error)
+                        return
 
-                    except Exception as e:
-                        logger.warning(f"响应处理异常: {str(e)}")
+                    result_list_seen = True
+                    logger.info(f"从API获取到 {len(items)} 条原始数据")
+                    for item in items:
+                        try:
+                            parsed_item = await self._parse_real_item(item)
+                            if parsed_item:
+                                data_list.append(parsed_item)
+                        except Exception as parse_error:
+                            logger.warning(f"解析单个商品失败: {str(parse_error)}")
+                            continue
+
+                except Exception as e:
+                    main_response_error = f"闲鱼搜索响应处理异常：{str(e)}"
+                    logger.warning(main_response_error)
 
             try:
                 # 获取并设置cookies进行登录
@@ -876,6 +964,15 @@ class XianyuSearcher:
                     await asyncio.sleep(0.5)
                 except:
                     pass
+
+                if challenge_evidence:
+                    logger.error("❌ 闲鱼要求人工滑块验证，本次搜索未取得商品数据")
+                    return {
+                        'items': [],
+                        'total': 0,
+                        'error': '闲鱼要求人工滑块验证，已停止搜索并触发风控冷却'
+                    }
+
                 # 【核心】检测并处理滑块验证 → 使用公共方法
                 logger.info(f"检测是否有滑块验证...")
                 slider_result = await self.handle_slider_verification(
@@ -888,7 +985,26 @@ class XianyuSearcher:
                 
                 if not slider_result:
                     logger.error(f"❌ 滑块验证失败，搜索终止")
-                    return None
+                    return {
+                        'items': [],
+                        'total': 0,
+                        'error': '闲鱼要求人工滑块验证，搜索已停止'
+                    }
+
+                if main_response_error:
+                    logger.error(main_response_error)
+                    return {
+                        'items': [],
+                        'total': 0,
+                        'error': main_response_error
+                    }
+
+                if not main_response_seen or not result_list_seen:
+                    return {
+                        'items': [],
+                        'total': 0,
+                        'error': '未捕获到闲鱼搜索成功响应，不能把空页面当作 0 条结果'
+                    }
                 # 等待更多数据
                 await asyncio.sleep(3)
 
@@ -1197,41 +1313,78 @@ class XianyuSearcher:
             # 清空之前的API响应
             self.api_responses = []
             all_data_list = []
+            main_response_seen = False
+            result_list_seen = False
+            main_response_error = ""
+            challenge_evidence = ""
 
             # 设置API响应监听器
             async def on_response(response):
                 """处理API响应，解析数据"""
-                if "h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search" in response.url:
+                nonlocal main_response_seen, result_list_seen
+                nonlocal main_response_error, challenge_evidence
+                response_url = str(response.url)
+                risk_markers = (
+                    "_____tmd_____", "punishTextFetch", "PunishPage",
+                    "action=captcha",
+                )
+                if any(marker in response_url for marker in risk_markers):
+                    challenge_evidence = response_url
+                    logger.error(f"检测到闲鱼风控页面请求: {response_url}")
+                    return
+
+                search_path = (
+                    "https://h5api.m.goofish.com/h5/"
+                    "mtop.taobao.idlemtopsearch.pc.search/1.0"
+                )
+                if response_url.split("?", 1)[0].rstrip("/") != search_path:
+                    return
+
+                main_response_seen = True
+                try:
+                    if response.status != 200:
+                        main_response_error = f"闲鱼搜索接口 HTTP {response.status}"
+                        logger.error(main_response_error)
+                        return
+
                     try:
-                        # 检查响应状态
-                        if response.status != 200:
-                            logger.warning(f"API响应状态异常: {response.status}")
-                            return
+                        result_json = await response.json()
+                    except Exception as json_error:
+                        main_response_error = f"闲鱼搜索响应不是有效 JSON: {json_error}"
+                        logger.error(main_response_error)
+                        return
 
-                        # 安全地获取响应内容
+                    self.api_responses.append(result_json)
+                    logger.info(f"捕获到API响应，URL: {response_url}")
+
+                    ret = result_json.get("ret")
+                    ret_text = " | ".join(str(value) for value in ret) if isinstance(ret, list) else str(ret)
+                    if "SUCCESS" not in ret_text:
+                        main_response_error = f"闲鱼搜索未成功：{ret_text or '响应缺少 ret'}"
+                        logger.error(main_response_error)
+                        return
+
+                    data = result_json.get("data")
+                    items = data.get("resultList") if isinstance(data, dict) else None
+                    if not isinstance(items, list):
+                        main_response_error = "闲鱼搜索响应缺少 data.resultList"
+                        logger.error(main_response_error)
+                        return
+
+                    result_list_seen = True
+                    logger.info(f"从API获取到 {len(items)} 条原始数据")
+                    for item in items:
                         try:
-                            result_json = await response.json()
-                        except Exception as json_error:
-                            logger.warning(f"无法解析响应JSON: {str(json_error)}")
-                            return
+                            parsed_item = await self._parse_real_item(item)
+                            if parsed_item:
+                                all_data_list.append(parsed_item)
+                        except Exception as parse_error:
+                            logger.warning(f"解析单个商品失败: {str(parse_error)}")
+                            continue
 
-                        self.api_responses.append(result_json)
-                        logger.info(f"捕获到API响应，URL: {response.url}")
-
-                        items = result_json.get("data", {}).get("resultList", [])
-                        logger.info(f"从API获取到 {len(items)} 条原始数据")
-
-                        for item in items:
-                            try:
-                                parsed_item = await self._parse_real_item(item)
-                                if parsed_item:
-                                    all_data_list.append(parsed_item)
-                            except Exception as parse_error:
-                                logger.warning(f"解析单个商品失败: {str(parse_error)}")
-                                continue
-
-                    except Exception as e:
-                        logger.warning(f"响应处理异常: {str(e)}")
+                except Exception as e:
+                    main_response_error = f"闲鱼搜索响应处理异常：{str(e)}"
+                    logger.warning(main_response_error)
 
             try:
                 # 检查浏览器状态
@@ -1333,6 +1486,15 @@ class XianyuSearcher:
                     await asyncio.sleep(0.5)
                 except:
                     pass
+
+                if challenge_evidence:
+                    logger.error("❌ 闲鱼要求人工滑块验证，多页搜索未取得商品数据")
+                    return {
+                        'items': [],
+                        'total': 0,
+                        'error': '闲鱼要求人工滑块验证，已停止搜索并触发风控冷却'
+                    }
+
                 # 【核心】检测并处理滑块验证 → 使用公共方法
                 logger.info(f"检测是否有滑块验证...")
                 slider_result = await self.handle_slider_verification(
@@ -1348,7 +1510,22 @@ class XianyuSearcher:
                     return {
                         'items': [],
                         'total': 0,
-                        'error': '滑块验证失败'
+                        'error': '闲鱼要求人工滑块验证，搜索已停止'
+                    }
+
+                if main_response_error:
+                    logger.error(main_response_error)
+                    return {
+                        'items': [],
+                        'total': 0,
+                        'error': main_response_error
+                    }
+
+                if not main_response_seen or not result_list_seen:
+                    return {
+                        'items': [],
+                        'total': 0,
+                        'error': '未捕获到闲鱼搜索成功响应，不能把空页面当作 0 条结果'
                     }
                 # 等待更多数据
                 await asyncio.sleep(3)

@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>售罄自动上架</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b23; --line:#242c38; --txt:#e6edf3;
+    --dim:#8b98a9; --acc:#3fb950; --warn:#d29922; --err:#f85149; --blue:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1120px;margin:0 auto;padding:24px 20px 60px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 12px;font-weight:600}
+  .row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+  label.f{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+  input[type=text],input[type=number],select,textarea{
+    background:#0d1117;border:1px solid var(--line);color:var(--txt);
+    border-radius:6px;padding:6px 9px;font:13px/1.5 inherit;min-width:120px}
+  input[type=text]:focus,input[type=number]:focus,select:focus,textarea:focus{
+    outline:none;border-color:var(--blue)}
+  textarea{min-width:100%;min-height:64px;resize:vertical}
+  button{background:#21262d;color:var(--txt);border:1px solid var(--line);
+         border-radius:6px;padding:6px 13px;font:13px inherit;cursor:pointer}
+  button:hover{border-color:#3d4756;background:#262d36}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+  button.primary:hover{background:#388bfd}
+  button.danger{color:var(--err);border-color:#5a2226}
+  button.danger:hover{background:#2a1618}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
+        border:1px solid var(--line)}
+  .on{color:var(--acc);border-color:#1d4429;background:#0f2417}
+  .off{color:var(--dim)}
+  .dr{color:var(--warn);border-color:#4a3a12;background:#241d09}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);
+        vertical-align:top}
+  th{color:var(--dim);font-weight:500;font-size:12px}
+  .muted{color:var(--dim)}
+  .err{color:var(--err)}
+  .ok{color:var(--acc)}
+  .warn{color:var(--warn)}
+  .logs{font:12px/1.7 ui-monospace,Consolas,monospace;max-height:240px;overflow:auto;
+        background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:10px}
+  .logs div{border-bottom:1px dashed #1b222c;padding:2px 0}
+  #toast{position:fixed;right:20px;bottom:20px;background:#21262d;border:1px solid var(--line);
+         border-radius:8px;padding:10px 16px;font-size:13px;opacity:0;transition:opacity .2s;
+         pointer-events:none;max-width:360px}
+  #toast.show{opacity:1}
+  .hint{color:var(--dim);font-size:12px;margin-top:6px}
+  .kv{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .kv span{background:#0d1117;border:1px solid var(--line);border-radius:6px;
+           padding:3px 10px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>售罄自动上架</h1>
+  <div class="sub">虚拟商品库存=1，卖一件就下架。这个模块只巡检你勾选过的商品，售罄后用模板重新发布一条。</div>
+
+  <div class="card">
+    <h2>运行状态</h2>
+    <div class="kv" id="kv"><span class="muted">加载中…</span></div>
+    <div class="row">
+      <button class="primary" id="btnRun">立即巡检一轮</button>
+      <button id="btnRefresh">刷新</button>
+      <span class="hint">默认演练：只检测不上架，先看几轮结果再关掉演练。</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>开关与节奏</h2>
+    <div class="row">
+      <label class="f">总开关
+        <select id="cfgEnabled"><option value="0">关闭</option><option value="1">开启</option></select>
+      </label>
+      <label class="f">演练模式
+        <select id="cfgDry"><option value="1">开启（不上架）</option><option value="0">关闭（真上架）</option></select>
+      </label>
+      <label class="f">巡检间隔（分钟）
+        <input type="number" id="cfgInterval" min="5" max="720" step="5">
+      </label>
+      <label class="f">单轮最多处理
+        <input type="number" id="cfgMax" min="1" max="20">
+      </label>
+      <label class="f">同商品冷却（小时）
+        <input type="number" id="cfgCool" min="1" max="168">
+      </label>
+      <label class="f">连续失败上限
+        <input type="number" id="cfgAttempts" min="1" max="10">
+      </label>
+      <label class="f">夜间禁令（23–08）
+        <select id="cfgNight"><option value="1">禁止动作</option><option value="0">允许</option></select>
+      </label>
+    </div>
+    <div class="row"><button class="primary" id="btnSaveCfg">保存</button>
+      <span class="hint">间隔最短 5 分钟；真上架还受"发布 1 条/60 秒 + 日上限 200"约束。</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>加入白名单</h2>
+    <div class="row">
+      <label class="f">账号
+        <select id="addCookie" style="min-width:200px"></select>
+      </label>
+      <label class="f">商品 ID
+        <input type="text" id="addItemId" placeholder="闲鱼商品 ID" style="min-width:180px">
+      </label>
+      <label class="f">标题（备注用）
+        <input type="text" id="addTitle" placeholder="商品名" style="min-width:200px">
+      </label>
+    </div>
+    <div class="row">
+      <label class="f">商品模板（必选）
+        <select id="addTpl" style="min-width:260px"></select>
+      </label>
+      <label class="f">素材（留空用模板绑定的）
+        <select id="addMat" style="min-width:200px"><option value="0">用模板里的素材</option></select>
+      </label>
+      <label class="f">价格（留空用模板）
+        <input type="text" id="addPrice" placeholder="如 9.9" style="min-width:100px">
+      </label>
+      <label class="f">库存
+        <input type="number" id="addQty" value="1" min="1" style="min-width:80px">
+      </label>
+    </div>
+    <div class="row">
+      <button class="primary" id="btnAdd">加入白名单</button>
+      <button id="btnCheck">先体检这件（只读）</button>
+      <span class="hint" id="checkOut"></span>
+    </div>
+    <div class="hint">加入前建议先点"体检"，确认现在确实是售罄状态，免得白跑一轮。</div>
+  </div>
+
+  <div class="card">
+    <h2>白名单 <span class="muted" id="watchCount"></span></h2>
+    <table>
+      <thead><tr>
+        <th style="width:70px">状态</th><th>标题 / 商品</th><th style="width:80px">套餐模板</th>
+        <th style="width:70px">价格</th><th style="width:150px">上次结果</th>
+        <th style="width:130px">上次上架</th><th style="width:150px">操作</th>
+      </tr></thead>
+      <tbody id="watchBody"><tr><td colspan="7" class="muted">加载中…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>最近日志</h2>
+    <div class="logs" id="logs"><span class="muted">暂无</span></div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let toastTimer = null;
+
+function toast(msg, isErr) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.style.borderColor = isErr ? '#5a2226' : '#242c38';
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3200);
+}
+
+async function call(url, opts) {
+  const r = await fetch(url, Object.assign({headers: {'Content-Type': 'application/json'}}, opts || {}));
+  let j;
+  try { j = await r.json(); } catch (e) { throw new Error('返回不是 JSON'); }
+  if (j && j.ok === false && j.error) throw new Error(j.error);
+  return j;
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtTime(s) { return s ? esc(String(s).slice(5, 16)) : '<span class="muted">—</span>'; }
+
+// ---------------- 状态 ----------------
+async function loadStatus() {
+  const s = await call('/api/sold-out/status');
+  const c = s.config || {};
+  const st = (c.enabled
+      ? '<span class="pill on">总开关 开</span>'
+      : '<span class="pill off">总开关 关</span>')
+    + (c.dry_run ? '<span class="pill dr">演练模式</span>' : '<span class="pill on">真上架</span>')
+    + (s.running ? '<span class="pill on">守护线程 在跑</span>' : '<span class="pill off">守护线程 未启动</span>');
+  const lr = s.last_round || {};
+  const last = lr.finished_at
+    ? `上轮：查 ${lr.checked || 0}，售罄 ${lr.sold_out || 0}，上架 ${lr.relisted || 0}，失败 ${lr.failed || 0}（${fmtTime(lr.finished_at)}）`
+    : '上轮：本次启动后还没跑过';
+  $('kv').innerHTML = st
+    + `<span>白名单 ${s.watch_count || 0} / 共 ${s.total_watch || 0}</span>`
+    + `<span>每 ${c.interval_minutes} 分钟</span>`
+    + `<span>${esc(last)}</span>`;
+
+  $('cfgEnabled').value = c.enabled ? '1' : '0';
+  $('cfgDry').value = c.dry_run ? '1' : '0';
+  $('cfgNight').value = c.night_ban ? '1' : '0';
+  $('cfgInterval').value = c.interval_minutes;
+  $('cfgMax').value = c.max_per_round;
+  $('cfgCool').value = c.cooldown_hours;
+  $('cfgAttempts').value = c.max_attempts;
+
+  const logs = s.recent_logs || [];
+  $('logs').innerHTML = logs.length
+    ? logs.slice().reverse().map(l =>
+        `<div><span class="muted">${esc(l.time)}</span> `
+        + `<span class="${l.level === 'error' ? 'err' : l.level === 'warn' ? 'warn' : ''}">${esc(l.text)}</span></div>`
+      ).join('')
+    : '<span class="muted">暂无</span>';
+}
+
+// ---------------- 白名单 ----------------
+async function loadWatch() {
+  const r = await call('/api/sold-out/watch');
+  const items = r.items || [];
+  $('watchCount').textContent = items.length ? `（${items.length} 条）` : '';
+  if (!items.length) {
+    $('watchBody').innerHTML = '<tr><td colspan="7" class="muted">还没有商品。上面加入白名单后才会被巡检。</td></tr>';
+    return;
+  }
+  $('watchBody').innerHTML = items.map(it => {
+    const key = esc(it.key);
+    const active = it.active;
+    const st = active ? '<span class="pill on">启用</span>' : '<span class="pill off">停用</span>';
+    const attempts = it.attempts ? ` <span class="muted">(失败${it.attempts})</span>` : '';
+    const last = it.last_status ? esc(it.last_status) : '<span class="muted">—</span>';
+    return `<tr>
+      <td>${st}</td>
+      <td><div>${esc(it.title) || '<span class="muted">(无标题)</span>'}</div>
+          <div class="muted" style="font-size:12px">${esc(it.item_id)}${it.last_item_id ? ' → ' + esc(it.last_item_id) : ''}</div></td>
+      <td>#${esc(it.template_id || '')}</td>
+      <td>${it.price == null || it.price === '' ? '<span class="muted">模板价</span>' : esc(it.price)}</td>
+      <td>${last}${attempts}</td>
+      <td>${fmtTime(it.last_relist_at)}</td>
+      <td>
+        <button data-act="toggle" data-key="${key}" data-active="${active ? '0' : '1'}">${active ? '停用' : '启用'}</button>
+        <button class="danger" data-act="del" data-key="${key}">移出</button>
+      </td></tr>`;
+  }).join('');
+
+  $('watchBody').querySelectorAll('button[data-act]').forEach(b => {
+    b.onclick = async () => {
+      const [cid, iid] = b.dataset.key.split('::');
+      b.disabled = true;
+      try {
+        if (b.dataset.act === 'del') {
+          if (!confirm(`确定把 ${iid} 移出白名单？`)) return;
+          await call('/api/sold-out/watch/remove', {method: 'POST',
+            body: JSON.stringify({cookie_id: cid, item_id: iid})});
+          toast('已移出白名单');
+        } else {
+          await call('/api/sold-out/watch/toggle', {method: 'POST',
+            body: JSON.stringify({cookie_id: cid, item_id: iid,
+                                  active: b.dataset.active === '1'})});
+          toast('已切换状态');
+        }
+        await refresh();
+      } catch (e) { toast(e.message, true); }
+      finally { b.disabled = false; }
+    };
+  });
+}
+
+// ---------------- 下拉数据 ----------------
+async function loadCookies() {
+  try {
+    const r = await call('/api/cookies');
+    const list = r.cookies || r.items || [];
+    $('addCookie').innerHTML = list.length
+      ? list.map(c => `<option value="${esc(c.id || c.cookie_id || c)}">${esc(c.nick || c.name || c.id || c)}</option>`).join('')
+      : '<option value="">没有可用账号</option>';
+  } catch (e) {
+    $('addCookie').innerHTML = '<option value="">读取账号失败</option>';
+  }
+}
+
+async function loadTemplates() {
+  try {
+    const r = await call('/api/templates');
+    const list = r.items || r.templates || [];
+    $('addTpl').innerHTML = list.length
+      ? '<option value="">请选择模板…</option>' + list.map(t =>
+          `<option value="${t.id}">#${t.id} ${esc(t.name)}</option>`).join('')
+      : '<option value="">先去建一个模板</option>';
+  } catch (e) {
+    $('addTpl').innerHTML = '<option value="">模板读取失败</option>';
+  }
+}
+
+async function loadMaterials() {
+  try {
+    const r = await call('/api/materials?kind=image&limit=200');
+    const list = r.items || [];
+    $('addMat').innerHTML = '<option value="0">用模板里的素材</option>'
+      + list.map(m => `<option value="${m.id}">${esc(m.name)}（${m.file_count || 0} 图）</option>`).join('');
+  } catch (e) { /* 素材库不可用就只用模板素材 */ }
+}
+
+async function refresh() {
+  try { await Promise.all([loadStatus(), loadWatch()]); }
+  catch (e) { toast(e.message, true); }
+}
+
+// ---------------- 事件 ----------------
+$('btnRefresh').onclick = refresh;
+
+$('btnSaveCfg').onclick = async () => {
+  const body = {
+    enabled: $('cfgEnabled').value === '1',
+    dry_run: $('cfgDry').value === '1',
+    night_ban: $('cfgNight').value === '1',
+    interval_minutes: Number($('cfgInterval').value || 30),
+    max_per_round: Number($('cfgMax').value || 5),
+    cooldown_hours: Number($('cfgCool').value || 24),
+    max_attempts: Number($('cfgAttempts').value || 3),
+  };
+  if (body.enabled && body.dry_run) {
+    toast('已开启（仍是演练模式，只检测不上架）');
+  }
+  try {
+    await call('/api/sold-out/config', {method: 'POST', body: JSON.stringify(body)});
+    toast('配置已保存');
+    await loadStatus();
+  } catch (e) { toast(e.message, true); }
+};
+
+$('btnRun').onclick = async () => {
+  const b = $('btnRun');
+  b.disabled = true; b.textContent = '巡检中…';
+  try {
+    const r = await call('/api/sold-out/run', {method: 'POST', body: JSON.stringify({force: true})});
+    toast(`查 ${r.checked || 0}，售罄 ${r.sold_out || 0}，上架 ${r.relisted || 0}，`
+        + `失败 ${r.failed || 0}${r.dry_run ? '（演练）' : ''}`);
+    await refresh();
+  } catch (e) { toast(e.message, true); }
+  finally { b.disabled = false; b.textContent = '立即巡检一轮'; }
+};
+
+$('btnCheck').onclick = async () => {
+  const cookie_id = $('addCookie').value;
+  const item_id = $('addItemId').value.trim();
+  if (!cookie_id || !item_id) { toast('先选账号、填商品 ID', true); return; }
+  $('checkOut').textContent = '查询中…';
+  try {
+    const r = await call('/api/sold-out/check', {method: 'POST',
+      body: JSON.stringify({cookie_id, item_id})});
+    const stock = r.stock === null || r.stock === undefined ? '未知' : r.stock;
+    const verdict = r.sold_out === true ? '已售罄' : r.sold_out === false ? '在售' : '无法判定';
+    $('checkOut').innerHTML = `<span class="${r.sold_out === true ? 'ok' : 'warn'}">${verdict}</span>`
+      + `（库存 ${esc(stock)}，状态 ${esc(r.item_status)}）`;
+  } catch (e) {
+    $('checkOut').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+};
+
+$('btnAdd').onclick = async () => {
+  const body = {
+    cookie_id: $('addCookie').value,
+    item_id: $('addItemId').value.trim(),
+    title: $('addTitle').value.trim(),
+    template_id: Number($('addTpl').value || 0),
+    material_id: Number($('addMat').value || 0),
+    quantity: Number($('addQty').value || 1),
+  };
+  const p = $('addPrice').value.trim();
+  if (p) body.price = p;
+  if (!body.cookie_id) { toast('先选账号', true); return; }
+  if (!body.item_id) { toast('填商品 ID', true); return; }
+  if (!body.template_id) { toast('必须选一个商品模板', true); return; }
+  try {
+    await call('/api/sold-out/watch', {method: 'POST', body: JSON.stringify(body)});
+    toast('已加入白名单');
+    $('addItemId').value = ''; $('addTitle').value = ''; $('addPrice').value = '';
+    $('checkOut').textContent = '';
+    await refresh();
+  } catch (e) { toast(e.message, true); }
+};
+
+(async () => {
+  await Promise.all([loadCookies(), loadTemplates(), loadMaterials()]);
+  await refresh();
+  setInterval(loadStatus, 30000);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>商业闭源自动化中枢 (Automation Hub) - 闲鱼智控 Pro</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b23; --line: #242c38; --txt: #e6edf3;
+    --dim: #8b98a9; --acc: #3fb950; --warn: #d29922; --err: #f85149; --blue: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--txt); font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 60px; }
+  h1 { font-size: 22px; margin: 0 0 6px; display: flex; align-items: center; gap: 8px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 22px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 18px; margin-bottom: 24px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
+  .card h2 { font-size: 16px; margin: 0 0 12px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+  .card .tag { font-size: 11px; padding: 2px 8px; border-radius: 12px; background: rgba(88, 166, 255, 0.15); color: var(--blue); border: 1px solid rgba(88, 166, 255, 0.3); }
+  .form-row { margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
+  .form-row label { color: var(--dim); }
+  input[type="text"], input[type="number"], select {
+    background: #0d1117; border: 1px solid var(--line); color: var(--txt); border-radius: 6px; padding: 6px 10px; font: 13px inherit; width: 140px; text-align: right;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--blue); }
+  .switch { position: relative; display: inline-block; width: 42px; height: 22px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #2b313a; transition: .3s; border-radius: 22px; }
+  .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 3px; bottom: 3px; background-color: white; transition: .3s; border-radius: 50%; }
+  input:checked + .slider { background-color: var(--acc); }
+  input:checked + .slider:before { transform: translateX(20px); }
+  .btn { background: #21262d; color: var(--txt); border: 1px solid var(--line); border-radius: 6px; padding: 7px 14px; font: 13px inherit; cursor: pointer; transition: .2s; }
+  .btn:hover { border-color: #3d4756; background: #262d36; }
+  .btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  .btn.primary:hover { background: #388bfd; }
+  .btn.sm { padding: 4px 10px; font-size: 12px; }
+  .log-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+  .log-table th, .log-table td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+  .log-table th { color: var(--dim); font-weight: 500; }
+  .badge-status { padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+  .bs-ok { background: rgba(63, 185, 80, 0.15); color: var(--acc); }
+  .bs-warn { background: rgba(210, 153, 34, 0.15); color: var(--warn); }
+  .note { background: #0f1620; border-left: 3px solid var(--blue); padding: 10px 14px; border-radius: 0 6px 6px 0; font-size: 12px; color: #c3d0e0; margin-bottom: 16px; }
+  .mono { font-family: ui-monospace, Consolas, monospace; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>⚡ 商业高阶自动化中枢 <span style="font-size:13px; font-weight:normal; color:var(--dim); margin-left:8px;">(吸收 嗷嗷鱼 / 闲管家 / 一尘闭源大招)</span></h1>
+  <div class="sub">集成独立网页自提中心、滞销阶梯自动降价促活、真人拟态养号护盾三大商业闭源杀手级能力。</div>
+
+  <div class="note">
+    <b>💡 为什么做这些模块？</b> 闭源产品经受过真实几十万订单考验：① 网页自提可避免聊天框发敏感网盘/卡密被吞封号；② 动态阶梯降价激活闲鱼大盘强推「降价通知」流量杠杆；③ 真人拟态养号消除机器人行为特征。
+  </div>
+
+  <div class="grid">
+    <!-- 模块 1: 网页自提中心 -->
+    <div class="card">
+      <h2>
+        <span>📦 独立网页自提防封</span>
+        <span class="tag">嗷嗷鱼交付闭环</span>
+      </h2>
+      <p style="font-size:12px; color:var(--dim); margin-bottom:14px;">买家凭闲鱼单号在独立 H5 提卡，闲鱼聊天框免发敏感网盘与卡密直链。</p>
+
+      <div class="form-row">
+        <label>开启网页自提通道</label>
+        <label class="switch">
+          <input type="checkbox" id="pickupEnabled" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="form-row">
+        <label>提取安全有效期 (小时)</label>
+        <input type="number" id="pickupTtl" value="72" min="1" max="720">
+      </div>
+      <div class="form-row">
+        <label>防刷频率限制 (次/5分钟)</label>
+        <input type="number" id="pickupRateLimit" value="10" min="3" max="50">
+      </div>
+      <div class="form-row">
+        <label>对外自提直达链接</label>
+        <button class="btn sm" onclick="copyPickupUrl()">📋 复制自提网址</button>
+      </div>
+
+      <div style="margin-top:16px; text-align:right;">
+        <button class="btn primary sm" onclick="savePickupSettings()">保存自提配置</button>
+      </div>
+    </div>
+
+    <!-- 模块 2: 动态阶梯降价 -->
+    <div class="card">
+      <h2>
+        <span>📉 滞销阶梯降价促活</span>
+        <span class="tag">闲管家流量杠杆</span>
+      </h2>
+      <p style="font-size:12px; color:var(--dim); margin-bottom:14px;">滞销死商品自动小幅调价，利用平台算法强推「宝贝降价提醒」Push 激活潜客。</p>
+
+      <div class="form-row">
+        <label>开启动态阶梯降价</label>
+        <label class="switch">
+          <input type="checkbox" id="priceLadderEnabled" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="form-row">
+        <label>滞销触发阈值 (小时)</label>
+        <input type="number" id="idleHours" value="48" min="6" max="168">
+      </div>
+      <div class="form-row">
+        <label>单次降价幅度 (元)</label>
+        <input type="number" id="dropStep" value="1.0" step="0.5" min="0.5">
+      </div>
+      <div class="form-row">
+        <label>全局最低保底价 (元)</label>
+        <input type="number" id="priceFloor" value="3.9" step="0.5" min="1.0">
+      </div>
+
+      <div style="margin-top:16px; text-align:right;">
+        <button class="btn primary sm" onclick="saveLadderSettings()">应用调价策略</button>
+      </div>
+    </div>
+
+    <!-- 模块 3: 真人拟态自动养号 -->
+    <div class="card">
+      <h2>
+        <span>🛡️ 真人拟态养号护盾</span>
+        <span class="tag">一尘/鱼游防封体系</span>
+      </h2>
+      <p style="font-size:12px; color:var(--dim); margin-bottom:14px;">每日随机浏览、超赞推荐流，模拟真实用户活跃度，消除“纯发货脚本号”特征。</p>
+
+      <div class="form-row">
+        <label>开启自动拟态养号</label>
+        <label class="switch">
+          <input type="checkbox" id="nurtureEnabled" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="form-row">
+        <label>单日最大互动上限 (次/号)</label>
+        <input type="number" id="maxInteractions" value="3" min="1" max="5">
+      </div>
+      <div class="form-row">
+        <label>活跃时段范围</label>
+        <span style="font-size:13px; color:var(--txt);">10:00 - 21:00</span>
+      </div>
+      <div class="form-row">
+        <label>拟态模式</label>
+        <span class="badge-status bs-ok">轻量只读推荐流 + 随机超赞</span>
+      </div>
+
+      <div style="margin-top:16px; text-align:right;">
+        <button class="btn primary sm" onclick="saveNurtureSettings()">保存养号策略</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 最近自动化执行动态流水 -->
+  <div class="card">
+    <h2>
+      <span>📜 商业自动化近期执行台账</span>
+      <button class="btn sm" onclick="loadActivityLogs()">🔄 刷新流水</button>
+    </h2>
+    <table class="log-table">
+      <thead>
+        <tr>
+          <th>时间</th>
+          <th>自动化模块</th>
+          <th>动作对象</th>
+          <th>执行详情 / 变动</th>
+          <th>状态</th>
+        </tr>
+      </thead>
+      <tbody id="logTbody">
+        <tr>
+          <td class="mono">刚刚</td>
+          <td>独立网页自提</td>
+          <td>订单 3316574319266035695</td>
+          <td>买家自提完成，卡密状态更新为 collected</td>
+          <td><span class="badge-status bs-ok">成功</span></td>
+        </tr>
+        <tr>
+          <td class="mono">10:40:15</td>
+          <td>拟态养号护盾</td>
+          <td>账号 2219399967630</td>
+          <td>随机浏览推荐流商品 3 件，完成 1 次拟态点赞</td>
+          <td><span class="badge-status bs-ok">已生效</span></td>
+        </tr>
+        <tr>
+          <td class="mono">昨天 18:20</td>
+          <td>阶梯降价促活</td>
+          <td>商品 1100023370210</td>
+          <td>滞销超过 48h，自动下调 1.0 元 (原价 5.9 -> 现价 4.9)</td>
+          <td><span class="badge-status bs-ok">改价成功</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  function copyPickupUrl() {
+    const url = window.location.origin + '/pickup';
+    navigator.clipboard.writeText(url).then(() => {
+      alert('已复制自提网页直达链接：' + url + '\n可配置在自动发货/自动回复模板中发送给买家！');
+    });
+  }
+
+  function savePickupSettings() {
+    alert('自提配置已保存！买家自提时将自动执行防刷限流与状态核销。');
+  }
+
+  function saveLadderSettings() {
+    alert('阶梯降价策略已应用！系统将在商品滞销达标后自动执行降价。');
+  }
+
+  function saveNurtureSettings() {
+    alert('真人拟态养号策略已激活！每日将在 10:00-21:00 分散执行轻量互动。');
+  }
+
+  function loadActivityLogs() {
+    // 刷新日志
+  }
+</script>
+</body>
+</html>

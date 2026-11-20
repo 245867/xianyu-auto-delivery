@@ -7,13 +7,44 @@ import asyncio
 import time
 import sys
 import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from loguru import logger
 import re
 import json
+from datetime import datetime
 from threading import Lock
 from collections import defaultdict
+
+
+async def read_order_trade_fields(page: Page) -> Dict[str, str]:
+    """读取卖家订单页明确标注的成交价和下单时间。"""
+    rows = await page.get_by_role("listitem").all_text_contents()
+    amounts = set()
+    order_times = set()
+    for row in rows:
+        text = " ".join(row.split())
+        amount = re.fullmatch(
+            r"成交价\s*(?:（在支付宝担保账户中）)?\s*[:：]?\s*[¥￥]\s*"
+            r"([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
+            text,
+        )
+        if amount:
+            amounts.add(amount[1].replace(",", ""))
+        order_time = re.fullmatch(
+            r"下单时间\s*[:：]?\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", text
+        )
+        if order_time:
+            try:
+                order_times.add(datetime.fromisoformat(order_time[1]).isoformat(sep=" "))
+            except ValueError:
+                continue
+    result = {}
+    if len(amounts) == 1:
+        result["amount"] = amounts.pop()
+    if len(order_times) == 1:
+        result["order_time"] = order_times.pop()
+    return result
 
 # 修复Docker环境中的asyncio事件循环策略问题
 if sys.platform.startswith('linux') or os.getenv('DOCKER_ENV'):
@@ -45,23 +76,6 @@ class OrderDetailFetcher:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.headless = headless  # 保存headless设置
-
-        # 请求头配置
-        self.headers = {
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "accept-language": "en,zh-CN;q=0.9,zh;q=0.8,ru;q=0.7",
-            "cache-control": "no-cache",
-            "pragma": "no-cache",
-            "priority": "u=0, i",
-            "sec-ch-ua": "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "\"Windows\"",
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-user": "?1",
-            "upgrade-insecure-requests": "1"
-        }
 
         # Cookie配置 - 支持动态传入
         self.cookie = cookie_string
@@ -150,10 +164,7 @@ class OrderDetailFetcher:
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
             )
 
-            logger.info("浏览器上下文创建成功，设置HTTP头...")
-
-            # 设置额外的HTTP头
-            await self.context.set_extra_http_headers(self.headers)
+            # 保留 Chromium 为导航、脚本和样式分别生成的请求头。
 
             logger.info("创建页面...")
 
@@ -239,7 +250,7 @@ class OrderDetailFetcher:
                     receiver_address = existing_order.get('receiver_address', '')
 
                     # 只有金额有效时才使用缓存（不再检查收货人信息是否完整）
-                    if amount_valid:
+                    if amount_valid and existing_order.get('created_at'):
                         logger.info(f"[CLIPBOARD] 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
                         print(f"[OK] 订单 {order_id} 使用缓存数据，跳过浏览器获取")
 
@@ -387,41 +398,67 @@ class OrderDetailFetcher:
                 logger.error(f"获取订单详情失败: {e}")
                 return None
 
+    @staticmethod
+    def _parse_spec_pairs(sku_content: str) -> List[Tuple[str, str]]:
+        """把一个元素里的规格文本拆成 (名称, 值) 列表。
+
+        闲鱼订单页的规格有两种形态：
+        - 单个元素：``颜色:黑``
+        - 两组拼在同一个元素：``颜色:黑;尺码:L``（分号可能是全角）
+        最多返回 2 组；超过 2 组只保留前两组并由调用方告警。
+        """
+        if not sku_content:
+            return []
+
+        text = str(sku_content).replace('：', ':').replace('；', ';').strip()
+        if ':' not in text:
+            return []
+
+        pairs: List[Tuple[str, str]] = []
+        for segment in text.split(';'):
+            segment = segment.strip()
+            if not segment or ':' not in segment:
+                continue
+            name, _, value = segment.partition(':')
+            name = name.strip()
+            value = value.strip()
+            if not name or not value:
+                continue
+            # 纯数字的“规格名”几乎总是列表下标（1:xx），不是规格
+            if name.isdigit():
+                continue
+            pairs.append((name, value))
+        return pairs
+
     def _parse_sku_content(self, sku_content: str) -> Dict[str, str]:
         """
-        解析SKU内容，根据冒号分割规格名称和规格值
-
-        Args:
-            sku_content: 原始SKU内容字符串
+        解析SKU内容，按冒号分割规格名称和规格值；支持分号拼两组。
 
         Returns:
-            包含规格名称和规格值的字典，如果解析失败则返回空字典
+            单组：``{'spec_name': ..., 'spec_value': ...}``
+            两组：额外带 ``spec_name_2`` / ``spec_value_2``
+            解析失败返回空字典
         """
         try:
-            if not sku_content or ':' not in sku_content:
+            pairs = self._parse_spec_pairs(sku_content)
+            if not pairs:
                 logger.warning(f"SKU内容格式无效或不包含冒号: {sku_content}")
                 return {}
 
-            # 根据冒号分割
-            parts = sku_content.split(':', 1)  # 只分割第一个冒号
-
-            if len(parts) == 2:
-                spec_name = parts[0].strip()
-                spec_value = parts[1].strip()
-
-                if spec_name and spec_value:
-                    result = {
-                        'spec_name': spec_name,
-                        'spec_value': spec_value
-                    }
-                    logger.info(f"SKU解析成功 - 规格名称: {spec_name}, 规格值: {spec_value}")
-                    return result
-                else:
-                    logger.warning(f"SKU解析失败，规格名称或值为空: 名称='{spec_name}', 值='{spec_value}'")
-                    return {}
+            result = {
+                'spec_name': pairs[0][0],
+                'spec_value': pairs[0][1],
+            }
+            if len(pairs) >= 2:
+                result['spec_name_2'] = pairs[1][0]
+                result['spec_value_2'] = pairs[1][1]
+                logger.info(
+                    f"SKU解析成功（双规格）- {pairs[0][0]}:{pairs[0][1]}, "
+                    f"{pairs[1][0]}:{pairs[1][1]}"
+                )
             else:
-                logger.warning(f"SKU内容分割失败: {sku_content}")
-                return {}
+                logger.info(f"SKU解析成功 - 规格名称: {pairs[0][0]}, 规格值: {pairs[0][1]}")
+            return result
 
         except Exception as e:
             logger.error(f"解析SKU内容异常: {e}")
@@ -435,7 +472,7 @@ class OrderDetailFetcher:
                 logger.error("浏览器状态异常，无法获取SKU内容")
                 return {}
 
-            result = {}
+            result = await read_order_trade_fields(self.page)
 
             # 获取所有 sku--u_ddZval 元素
             sku_selector = '.sku--u_ddZval'
@@ -446,7 +483,9 @@ class OrderDetailFetcher:
 
             # 获取金额信息
             amount_selector = '.boldNum--JgEOXfA3'
-            amount_element = await self.page.query_selector(amount_selector)
+            amount_element = (
+                await self.page.query_selector(amount_selector) if 'amount' not in result else None
+            )
             amount = ''
             if amount_element:
                 amount_text = await amount_element.text_content()
@@ -455,119 +494,88 @@ class OrderDetailFetcher:
                     logger.info(f"找到金额: {amount}")
                     print(f"[MONEY] 金额: {amount}")
                     result['amount'] = amount
-            else:
+            elif 'amount' not in result:
                 logger.warning("未找到金额元素")
                 print("[WARNING]️ 未找到金额信息")
 
             # 获取订单创建时间
-            await self._get_order_time(result)
+            if 'order_time' not in result:
+                await self._get_order_time(result)
 
             # 获取收货人信息（姓名、手机号、地址）
             await self._get_receiver_info(result)
 
-            # 处理 sku--u_ddZval 元素
-            if len(sku_elements) == 2:
-                # 有两个元素：第一个是规格，第二个是数量
-                logger.info("检测到两个 sku--u_ddZval 元素，第一个为规格，第二个为数量")
-                print("[CLIPBOARD] 检测到两个元素：第一个为规格，第二个为数量")
+            # 处理 sku--u_ddZval 元素：按内容分类，不再用元素个数猜语义。
+            # 单组规格 + 数量 = 2 个元素；两组规格 + 数量 = 3 个元素。
+            # 用“元素个数==2”判断“第一个是规格、第二个是数量”会在双规格订单上
+            # 必然失败（3 个元素），见拆解 26。
+            contents: List[str] = []
+            for element in sku_elements:
+                text = await element.text_content()
+                if text and text.strip():
+                    contents.append(text.strip())
 
-                # 处理规格（第一个元素）
-                spec_content = await sku_elements[0].text_content()
-                if spec_content:
-                    spec_content = spec_content.strip()
-                    logger.info(f"规格原始内容: {spec_content}")
-                    print(f"[NOTEBOOK]️ 规格原始内容: {spec_content}")
+            spec_pairs: List[Tuple[str, str]] = []
+            quantity_content: Optional[str] = None
 
-                    # 解析规格内容
-                    parsed_spec = self._parse_sku_content(spec_content)
-                    if parsed_spec:
-                        result.update(parsed_spec)
-                        print(f"[CLIPBOARD] 规格名称: {parsed_spec['spec_name']}")
-                        print(f"[EDIT] 规格值: {parsed_spec['spec_value']}")
-
-                # 处理数量（第二个元素）
-                quantity_content = await sku_elements[1].text_content()
-                if quantity_content:
-                    quantity_content = quantity_content.strip()
-                    logger.info(f"数量原始内容: {quantity_content}")
-                    print(f"[BOX] 数量原始内容: {quantity_content}")
-
-                    # 从数量内容中提取数量值（使用冒号分割，取后面的值）
-                    if ':' in quantity_content:
-                        quantity_value = quantity_content.split(':', 1)[1].strip()
-                        # 去掉数量值前面的 'x' 符号（如 "x2" -> "2"）
-                        if quantity_value.startswith('x'):
-                            quantity_value = quantity_value[1:]
-                        result['quantity'] = quantity_value
-                        logger.info(f"提取到数量: {quantity_value}")
-                        print(f"[KEYPAD] 数量: {quantity_value}")
+            for content in contents:
+                logger.info(f"SKU元素原始内容: {content}")
+                if '数量' in content:
+                    quantity_content = content
+                elif ':' in content or '：' in content:
+                    pairs = self._parse_spec_pairs(content)
+                    if pairs:
+                        spec_pairs.extend(pairs)
                     else:
-                        # 去掉数量值前面的 'x' 符号（如 "x2" -> "2"）
-                        if quantity_content.startswith('x'):
-                            quantity_content = quantity_content[1:]
-                        result['quantity'] = quantity_content
-                        logger.info(f"数量内容无冒号，直接使用: {quantity_content}")
-                        print(f"[KEYPAD] 数量: {quantity_content}")
-
-            elif len(sku_elements) == 1:
-                # 只有一个元素：判断是否包含"数量"
-                logger.info("检测到一个 sku--u_ddZval 元素，判断是规格还是数量")
-                print("[CLIPBOARD] 检测到一个元素，判断是规格还是数量")
-
-                content = await sku_elements[0].text_content()
-                if content:
-                    content = content.strip()
-                    logger.info(f"元素原始内容: {content}")
-                    print(f"[NOTEBOOK]️ 元素原始内容: {content}")
-
-                    if '数量' in content:
-                        # 这是数量信息
-                        logger.info("判断为数量信息")
-                        print("[BOX] 判断为数量信息")
-
-                        if ':' in content:
-                            quantity_value = content.split(':', 1)[1].strip()
-                            # 去掉数量值前面的 'x' 符号（如 "x2" -> "2"）
-                            if quantity_value.startswith('x'):
-                                quantity_value = quantity_value[1:]
-                            result['quantity'] = quantity_value
-                            logger.info(f"提取到数量: {quantity_value}")
-                            print(f"[KEYPAD] 数量: {quantity_value}")
-                        else:
-                            # 去掉数量值前面的 'x' 符号（如 "x2" -> "2"）
-                            if content.startswith('x'):
-                                content = content[1:]
-                            result['quantity'] = content
-                            logger.info(f"数量内容无冒号，直接使用: {content}")
-                            print(f"[KEYPAD] 数量: {content}")
+                        logger.info(f"元素含冒号但未解析出规格，已忽略: {content}")
+                elif content.startswith('x') or content.isdigit():
+                    quantity_content = content
+                else:
+                    pairs = self._parse_spec_pairs(content)
+                    if pairs:
+                        spec_pairs.extend(pairs)
                     else:
-                        # 这是规格信息
-                        logger.info("判断为规格信息")
-                        print("[CLIPBOARD] 判断为规格信息")
+                        logger.info(f"忽略无法归类的 SKU 元素: {content}")
 
-                        parsed_spec = self._parse_sku_content(content)
-                        if parsed_spec:
-                            result.update(parsed_spec)
-                            print(f"[CLIPBOARD] 规格名称: {parsed_spec['spec_name']}")
-                            print(f"[EDIT] 规格值: {parsed_spec['spec_value']}")
+            if len(spec_pairs) > 2:
+                logger.warning(f"检测到 {len(spec_pairs)} 组规格，平台最多 2 组，仅保留前两组")
+                spec_pairs = spec_pairs[:2]
+
+            if spec_pairs:
+                result['spec_name'], result['spec_value'] = spec_pairs[0]
+                if len(spec_pairs) >= 2:
+                    result['spec_name_2'], result['spec_value_2'] = spec_pairs[1]
+                result['spec_group_count'] = len(spec_pairs)
+                result['spec_parse_mode'] = 'two_spec' if len(spec_pairs) >= 2 else 'one_spec'
+                logger.info(
+                    f"规格解析模式: {result['spec_parse_mode']} ({result['spec_group_count']} 组)"
+                )
             else:
-                logger.warning(f"未找到或找到异常数量的 sku--u_ddZval 元素: {len(sku_elements)}")
-                print(f"[WARNING]️ 未找到或找到异常数量的元素: {len(sku_elements)}")
+                result['spec_group_count'] = 0
+                result['spec_parse_mode'] = 'no_spec'
+                logger.warning("未解析到任何规格信息")
 
-                # 如果没有找到sku--u_ddZval元素，设置默认数量为1
-                if len(sku_elements) == 0:
-                    result['quantity'] = '1'
-                    logger.info("未找到sku--u_ddZval元素，数量默认设置为1")
-                    print("[BOX] 数量默认设置为: 1")
+            # 数量：可能是“数量:x1”“数量 1”“x1”“1”
+            if quantity_content:
+                quantity_value = quantity_content
+                if ':' in quantity_value or '：' in quantity_value:
+                    quantity_value = quantity_value.replace('：', ':').split(':', 1)[1].strip()
+                quantity_value = quantity_value.lstrip('xX').strip()
+                if quantity_value:
+                    result['quantity'] = quantity_value
+                    logger.info(f"提取到数量: {quantity_value}")
 
-                # 尝试获取页面的所有class包含sku的元素进行调试
+            # 0 个元素时打一次调试日志，便于定位选择器失效
+            if not sku_elements:
+                result['quantity'] = result.get('quantity') or '1'
+                logger.warning("未找到 sku--u_ddZval 元素，数量默认 1；以下为含 sku 的调试元素")
                 all_sku_elements = await self.page.query_selector_all('[class*="sku"]')
                 if all_sku_elements:
                     logger.info(f"找到 {len(all_sku_elements)} 个包含'sku'的元素")
                     for i, element in enumerate(all_sku_elements):
                         class_name = await element.get_attribute('class')
                         text_content = await element.text_content()
-                        logger.info(f"SKU元素 {i+1}: class='{class_name}', text='{text_content}'")
+                        logger.info(f"SKU调试元素 {i+1}: class='{class_name}', text='{text_content}'")
 
             # 确保数量字段存在，如果不存在则设置为1
             if 'quantity' not in result:
@@ -1033,8 +1041,8 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
             receiver_phone = existing_order.get('receiver_phone', '')
             receiver_address = existing_order.get('receiver_address', '')
 
-            # 只有金额有效时才使用缓存（不再检查收货人信息是否完整）
-            if amount_valid:
+            # 金额和下单时间都齐全时才使用缓存。
+            if amount_valid and existing_order.get('created_at'):
                 logger.info(f"[CLIPBOARD] 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
                 print(f"[OK] 订单 {order_id} 使用缓存数据（金额:{amount}）")
 

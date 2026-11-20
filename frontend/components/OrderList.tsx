@@ -1,7 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Order, OrderStatus, Item } from '../types';
-import { getOrders, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems } from '../services/api';
+import {
+  getOrders, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrdersExcel, getItems,
+  type OrderImportResponse,
+} from '../services/api';
 import { Search, MoreHorizontal, Truck, RefreshCw, Copy, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, User as UserIcon, Phone, MapPin, Upload, ExternalLink, Trash2 } from 'lucide-react';
 
 const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => {
@@ -46,23 +49,16 @@ const OrderList: React.FC = () => {
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [editingOrder, setEditingOrder] = useState<Partial<Order> | null>(null);
   const [editForm, setEditForm] = useState<Partial<Order>>({});
-  const [importText, setImportText] = useState('');
   const [showShipModal, setShowShipModal] = useState(false);
   const [shipOrderId, setShipOrderId] = useState<string>('');
   const [shipLoading, setShipLoading] = useState(false);
   const [shipResult, setShipResult] = useState<{success: boolean; message: string} | null>(null);
   const [importFile, setImportFile] = useState<File | null>(null);
-  const [importFormData, setImportFormData] = useState({
-    order_id: '',
-    item_id: '',
-    buyer_id: '',
-    receiver_name: '',
-    receiver_phone: '',
-    receiver_address: '',
-    status: 'pending_ship' as OrderStatus,
-    quantity: 1,
-    amount: ''
-  });
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<OrderImportResponse | null>(null);
+  const [importError, setImportError] = useState('');
+  const [syncing, setSyncing] = useState(false);
+  const [orderNotice, setOrderNotice] = useState<{ success: boolean; message: string } | null>(null);
   const [syncingOrderId, setSyncingOrderId] = useState<string | null>(null);
   const [deletingOrderId, setDeletingOrderId] = useState<string | null>(null);
 
@@ -178,9 +174,17 @@ const OrderList: React.FC = () => {
   }, [filter, page, searchText]);
 
   const handleSync = async () => {
-      setLoading(true);
-      await syncOrders();
-      loadOrders();
+    setSyncing(true);
+    setOrderNotice(null);
+    try {
+      const result = await syncOrders();
+      setOrderNotice({ success: result.success, message: result.message });
+      await loadOrders();
+    } catch (error) {
+      setOrderNotice({ success: false, message: error instanceof Error ? error.message : '暂时无法同步订单' });
+    } finally {
+      setSyncing(false);
+    }
   };
 
   const handleShip = (id: string) => {
@@ -260,16 +264,26 @@ const OrderList: React.FC = () => {
   };
 
   const handleImportOrders = async () => {
+    if (!importFile) return;
+    setImporting(true);
+    setImportResult(null);
+    setImportError('');
     try {
-      const orders = JSON.parse(importText);
-      await importOrders(Array.isArray(orders) ? orders : [orders]);
-      setShowImportModal(false);
-      setImportText('');
-      loadOrders();
-      alert('订单导入成功');
+      const result = await importOrdersExcel(importFile);
+      setImportResult(result);
+      if (result.success_count > 0) await loadOrders();
     } catch (error) {
-      alert('导入失败，请检查JSON格式');
+      setImportError(error instanceof Error ? error.message : '暂时无法导入订单');
+    } finally {
+      setImporting(false);
     }
+  };
+
+  const closeImportModal = () => {
+    setShowImportModal(false);
+    setImportFile(null);
+    setImportResult(null);
+    setImportError('');
   };
 
   const handleSyncSingle = async (orderId: string) => {
@@ -322,12 +336,19 @@ const OrderList: React.FC = () => {
               <Plus className="w-4 h-4" />
               插入订单
             </button>
-            <button onClick={handleSync} className="h-10 px-4 rounded-lg font-bold bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 hover:bg-black dark:hover:bg-white text-sm flex items-center gap-2 transition-colors">
+            <button onClick={handleSync} disabled={syncing} className="h-10 px-4 rounded-lg font-bold bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 hover:bg-black dark:hover:bg-white text-sm flex items-center gap-2 transition-colors disabled:opacity-50">
                 <Truck className="w-4 h-4" />
-                一键同步订单
+                {syncing ? '同步中…' : '一键同步订单'}
             </button>
         </div>
       </div>
+      {orderNotice && (
+        <p role="status" className={`rounded-lg border px-4 py-3 text-sm ${orderNotice.success
+          ? 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950 dark:text-emerald-200'
+          : 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200'}`}>
+          {orderNotice.message}
+        </p>
+      )}
 
       <div className="bg-white dark:bg-[#1B1E22] rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
         {/* Toolbar */}
@@ -610,10 +631,12 @@ const OrderList: React.FC = () => {
           <div className="modal-container">
             <div className="modal-header">
               <div className="flex items-center justify-between w-full">
-                <h3 className="text-2xl font-extrabold text-gray-900">插入订单</h3>
+                <h3 className="text-2xl font-extrabold text-gray-900">导入订单</h3>
                 <button
-                  onClick={() => setShowImportModal(false)}
-                  className="p-2 bg-gray-100 rounded-full hover:bg-gray-200 transition-colors"
+                  onClick={closeImportModal}
+                  disabled={importing}
+                  aria-label="关闭导入"
+                  className="p-2 bg-gray-100 rounded-full hover:bg-gray-200 transition-colors disabled:opacity-50"
                 >
                   <X className="w-5 h-5 text-gray-600" />
                 </button>
@@ -622,14 +645,23 @@ const OrderList: React.FC = () => {
 
             <div className="modal-body space-y-5">
               <div>
-                <label className="block text-sm font-bold text-gray-700 mb-2">选择Excel文件</label>
+                <label htmlFor="order-import-file" className="block text-sm font-bold text-gray-700 mb-2">选择 Excel 文件</label>
                 <input
+                  id="order-import-file"
                   type="file"
-                  accept=".xlsx,.xls"
-                  onChange={(e) => setImportFile(e.target.files?.[0] || null)}
+                  accept=".xlsx"
+                  disabled={importing}
+                  aria-describedby="order-import-column-help"
+                  onChange={(e) => {
+                    setImportFile(e.target.files?.[0] || null);
+                    setImportResult(null);
+                    setImportError('');
+                  }}
                   className="w-full ios-input px-4 py-3 rounded-xl text-sm"
                 />
-                <p className="text-xs text-gray-500 mt-2">支持 .xlsx 和 .xls 格式</p>
+                <p id="order-import-column-help" className="text-xs text-gray-600 mt-2">
+                  支持 .xlsx，最大 10 MB。首行须包含 order_id（订单号）和 cookie_id（账号 ID）。长订单号请使用文本格式。
+                </p>
               </div>
 
               {importFile && (
@@ -640,22 +672,36 @@ const OrderList: React.FC = () => {
                   </div>
                 </div>
               )}
+              {importError && <p role="alert" className="rounded-lg bg-amber-50 p-3 text-sm text-amber-900">{importError}</p>}
+              {importResult && (
+                <div role="status" className="space-y-2 rounded-lg bg-gray-100 p-3 text-sm text-gray-800">
+                  <p>{importResult.message}</p>
+                  {importResult.failed_count > 0 && (
+                    <ul className="max-h-40 space-y-1 overflow-y-auto">
+                      {importResult.results.filter(row => !row.success).map(row => (
+                        <li key={row.row}>第 {row.row + 1} 行 · {row.message}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="modal-footer">
               <div className="flex gap-3 w-full">
                 <button
-                  onClick={() => setShowImportModal(false)}
-                  className="flex-1 px-6 py-3 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-800 font-bold transition-colors"
+                  onClick={closeImportModal}
+                  disabled={importing}
+                  className="flex-1 px-6 py-3 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-800 font-bold transition-colors disabled:opacity-50"
                 >
-                  取消
+                  {importResult ? '关闭' : '取消'}
                 </button>
                 <button
                   onClick={handleImportOrders}
-                  disabled={!importFile}
+                  disabled={!importFile || importing || importResult?.success}
                   className="flex-1 px-6 py-3 rounded-xl ios-btn-primary font-bold shadow-lg shadow-yellow-200 disabled:opacity-50"
                 >
-                  导入订单
+                  {importing ? '导入中…' : '导入订单'}
                 </button>
               </div>
             </div>
@@ -811,7 +857,7 @@ const OrderList: React.FC = () => {
                   <input
                     type="number"
                     value={editingOrder.amount}
-                    onChange={(e) => setEditingOrder({ ...editingOrder, amount: parseFloat(e.target.value) })}
+                    onChange={(e) => setEditingOrder({ ...editingOrder, amount: e.target.value })}
                     className="w-full ios-input px-4 py-3 rounded-xl"
                   />
                 </div>

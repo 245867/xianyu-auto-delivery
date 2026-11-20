@@ -7,6 +7,7 @@ import re
 import json
 import time
 import uuid
+import random
 import threading
 import asyncio
 from loguru import logger
@@ -340,10 +341,47 @@ class OrderStatusHandler:
                 if success:
                     # 记录状态历史（用于退款撤销时回退）
                     self._record_status_history(order_id, current_status, new_status, context)
-                    
+
                     status_text = self.status_mapping.get(new_status, new_status)
                     if self.config.get('enable_status_logging', True):
                         logger.info(f"✅ 订单状态更新成功: {order_id} -> {status_text} ({context})")
+
+                    # C1：真正"变成已完成"的那一次才触发交易后动作。
+                    # 这里必须判断 current_status != new_status —— update_order_status
+                    # 在"状态无变化"时也返回 True（早退分支），只判 success 会重复触发。
+                    # 幂等键是第二道保险，两层都留着。
+                    # 用规则模块判"是不是真完成"，不写字面量：
+                    # 状态可能是 "4"/11/"交易成功" 等形态，硬比 'completed' 会漏。
+                    # is_completed 还保证**退款/关闭不算完成**（那会误发好评）。
+                    try:
+                        from order_status_rules import is_completed
+                        _is_done = is_completed(new_status)
+                        _was_done = is_completed(current_status)
+                    except Exception:
+                        _is_done = (new_status == 'completed')
+                        _was_done = (current_status == 'completed')
+
+                    if _is_done and not _was_done:
+                        try:
+                            self._run_care_actions(
+                                order_id=order_id,
+                                cookie_id=cookie_id,
+                                buyer_id=(current_order or {}).get('buyer_id') or '',
+                                item_id=(current_order or {}).get('item_id') or '',
+                            )
+                        except Exception as care_e:
+                            # 关怀消息失败绝不能影响订单状态写入
+                            logger.warning(f"收货关怀触发失败（不影响订单状态）: {care_e}")
+
+                    # 方向一：退款处置账本。只记账 —— 不改发货、不自动拉黑。
+                    # 放在状态写入之后，覆盖所有来源（系统消息/扫码/人工改状态），
+                    # 而不是只挂在某一个发货入口上。
+                    try:
+                        import refund_aftercare
+                        refund_aftercare.on_status(order_id, cookie_id, str(new_status),
+                                                   context or "")
+                    except Exception as _ra_e:
+                        logger.warning(f"退款记账失败（不影响订单状态）: {_ra_e}")
                 else:
                     logger.error(f"❌ 订单状态更新失败: {order_id} -> {new_status} ({context})")
                 
@@ -355,6 +393,80 @@ class OrderStatusHandler:
                 logger.error(f"详细错误信息: {traceback.format_exc()}")
                 return False
     
+    def _run_care_actions(self, order_id: str, cookie_id: str,
+                          buyer_id: str = "", item_id: str = "") -> None:
+        """订单刚变成"已完成"时，触发这一单的交易后动作（C1）。
+
+        为什么要单独开一个线程：
+        - 评价（`rate.list` + `rate.create`）和小红花都是**同步 HTTP**，
+          会给这一单做"先查列表再提交"，网络往返至少几百毫秒；
+        - 感谢消息走的是 `send_msg_once`，要建一条 WebSocket 连接。
+        这两件事都绝不能挂在订单状态写入的调用栈上，否则一次确认收货会卡住
+        整条消息处理循环。所以这里只做"起线程 + 交出去"，立刻返回。
+
+        注意异步桥：
+        `_one_message` 里的 sender 是同步签名，而 `send_msg_once` 是 async。
+        这里用 `asyncio.run` 在**当前这个后台线程里**建一个临时循环来跑它——
+        不复用主循环（那需要跨线程投递，还要持有 loop 引用），
+        `send_msg_once` 内部是 `websockets.connect` 新连接，不依赖主连接。
+        """
+        try:
+            import care_message
+            cfg = care_message.get_config()
+        except Exception:
+            return
+        if not cfg.get("enabled"):
+            return
+        if not (cfg.get("auto_rate") or cfg.get("ask_flower") or cfg.get("thanks_message")):
+            return
+
+        # 账号不在线时：评价/小红花走的仍是纯 HTTP，照样能跑；
+        # 只有感谢消息必须要有在线实例（要建 WS 会话）。
+        inst = None
+        if cfg.get("thanks_message"):
+            try:
+                from XianyuAutoAsync import XianyuLive
+                inst = XianyuLive.get_instance(cookie_id)
+            except Exception:
+                inst = None
+            if inst is None or not buyer_id:
+                logger.info(f"【{cookie_id}】订单 {order_id}：账号不在线或缺买家 ID，"
+                            f"本轮跳过感谢消息（评价/小红花照常尝试）")
+
+        sender = None
+        if inst is not None and buyer_id:
+            def sender(tid, text):  # noqa: F811  同步签名，内部起临时循环
+                try:
+                    asyncio.run(inst.send_msg_once(buyer_id, item_id, text))
+                    return True
+                except Exception as e:
+                    logger.warning(f"【{cookie_id}】订单 {order_id} 感谢消息发送失败: {e}")
+                    return False
+
+        def _bg():
+            try:
+                # 确认收货后不要立刻评价：真实买家不会在 1 秒内评完。
+                # 用一个粗抖动（默认 36–90 秒）避开"秒评"的机器特征。
+                span = max(0, int(cfg.get("on_complete_delay_seconds") or 0))
+                if span > 0:
+                    time.sleep(random.uniform(span * 0.4, span))
+                r = care_message.run_once(cookie_id, "", order_ids=[order_id],
+                                          sender=sender)
+                acts = r.get("actions") or []
+                done = [a for a in acts if a.get("status") == "sent"]
+                logger.info(f"【{cookie_id}】订单 {order_id} 交易后动作："
+                            f"{r.get('counts') or {}} stopped={r.get('stopped') or '无'}")
+                for a in acts:
+                    if a.get("status") not in ("sent", "dry_run", "duplicate"):
+                        logger.warning(f"【{cookie_id}】{a.get('action')} 未成功: "
+                                       f"{a.get('status')} {a.get('note') or ''}")
+                if done:
+                    logger.info(f"【{cookie_id}】订单 {order_id} 完成 {len(done)} 个动作")
+            except Exception as e:
+                logger.warning(f"【{cookie_id}】订单 {order_id} 交易后动作异常: {e}")
+
+        threading.Thread(target=_bg, name=f"care-{order_id}", daemon=True).start()
+
     def _is_valid_status_transition(self, current_status: str, new_status: str) -> bool:
         """检查状态转换是否合理
         

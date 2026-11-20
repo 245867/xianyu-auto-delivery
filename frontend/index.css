@@ -56,12 +56,18 @@ html.dark .ios-input:focus {
 }
 
 html.dark .ios-btn-primary {
-  background: #E5E7EB;
-  color: #111827;
+  background: #FFE815;
+  color: #111111;
 }
 
 html.dark .ios-btn-primary:hover:not(:disabled) {
-  background: #F9FAFB;
+  background: #FFD600;
+  box-shadow: 0 8px 20px rgba(255, 214, 0, 0.18);
+}
+
+html.dark .ios-btn-primary:disabled {
+  background: #343941;
+  color: #AEB4BD;
   box-shadow: none;
 }
 

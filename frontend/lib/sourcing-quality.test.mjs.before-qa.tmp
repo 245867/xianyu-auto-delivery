@@ -1,0 +1,151 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import {
+  assessListing,
+  durationDays,
+  hasComparableProductIdentity,
+  selectMarketEvidence,
+} from './sourcing-quality.ts';
+
+const quote = {
+  title: '【账号直充】哔哩哔哩会员月卡+优酷会员月卡',
+  price: 26.62,
+};
+
+function listing(overrides = {}) {
+  return {
+    itemId: '9001',
+    itemUrl: 'https://www.goofish.com/item?id=9001',
+    title: '【账号直充】哔哩哔哩会员月卡+优酷会员月卡',
+    price: 31,
+    ...overrides,
+  };
+}
+
+test('month and day durations are different specifications', () => {
+  assert.deepEqual(durationDays('月卡'), [30]);
+  assert.deepEqual(durationDays('1天体验卡'), [1]);
+  const result = assessListing(quote, listing({
+    title: `${quote.title} 1天体验`,
+  }));
+  assert.equal(result.comparable, false);
+  assert.match(result.reasons.join(' '), /时长不一致/);
+});
+
+test('one yuan month-card claim is rejected by price sanity', () => {
+  const result = assessListing(quote, listing({ price: 1 }));
+  assert.equal(result.priceSane, false);
+  assert.match(result.reasons.join(' '), /异常低价/);
+});
+
+test('direct recharge and card code listings are not mixed', () => {
+  const result = assessListing(quote, listing({
+    title: '哔哩哔哩会员月卡+优酷会员月卡 卡密兑换码',
+  }));
+  assert.equal(result.comparable, false);
+  assert.match(result.reasons.join(' '), /交付方式不一致/);
+});
+
+test('brand aliases can appear in a different order without adding another brand', () => {
+  assert.equal(
+    hasComparableProductIdentity(
+      '【账号直充】哔哩哔哩会员月卡+优酷会员月卡',
+      '现货 账号直充 优酷会员月卡 / B站会员月卡',
+    ),
+    true,
+  );
+  assert.equal(
+    hasComparableProductIdentity(
+      '哔哩哔哩会员月卡',
+      '哔哩哔哩会员月卡+优酷会员月卡',
+    ),
+    false,
+  );
+});
+
+test('choice relationship wording cannot prove a joint membership', () => {
+  const result = assessListing(quote, listing({
+    title: '【账号直充】哔哩哔哩一天会员登录，或者优酷',
+  }));
+  assert.equal(result.comparable, false);
+  assert.match(result.reasons.join(' '), /或者\/任选/);
+});
+
+test('higher sales listing is used ahead of a cheaper zero-sales listing', () => {
+  const evidence = selectMarketEvidence(quote, [
+    listing({ itemId: '1', price: 27, detail_sold_count: 0, want_count: 0 }),
+    listing({ itemId: '2', price: 33, detail_sold_count: 18, want_count: 22 }),
+  ]);
+  assert.equal(evidence.confidence, 'high');
+  assert.equal(evidence.eligibleForProfit, true);
+  assert.equal(evidence.benchmark.itemId, '2');
+  assert.equal(evidence.benchmarkBasis, 'activity');
+});
+
+test('verified zero sales remain distinct from missing sales', () => {
+  const evidence = selectMarketEvidence(quote, [
+    listing({
+      itemId: 'zero',
+      price: 28,
+      detail_sold_count: 0,
+      want_count: 0,
+      browse_count: 0,
+    }),
+    listing({
+      itemId: 'unknown',
+      price: 29,
+      sold_count: 0,
+      want_count: 0,
+      browse_count: 0,
+    }),
+  ]);
+  const zero = evidence.assessments.find(item => item.listing.itemId === 'zero');
+  const unknown = evidence.assessments.find(item => item.listing.itemId === 'unknown');
+  assert.equal(zero?.sold, 0);
+  assert.equal(unknown?.sold, null);
+});
+
+test('sold-out listings are excluded from the benchmark', () => {
+  const evidence = selectMarketEvidence(quote, [
+    listing({ itemId: 'stockout', price: 30, detail_stock: 0, sold_out: true }),
+    listing({ itemId: 'available', price: 31, detail_stock: 2, sold_out: false }),
+    listing({ itemId: 'available-2', price: 32, detail_stock: 2, sold_out: false }),
+  ]);
+  assert.ok(evidence.assessments.find(item => item.listing.itemId === 'stockout')?.reasons.some(
+    reason => reason.includes('售罄'),
+  ));
+  assert.notEqual(evidence.benchmark?.itemId, 'stockout');
+});
+
+test('single zero-activity listing cannot establish profit', () => {
+  const evidence = selectMarketEvidence(quote, [
+    listing({ detail_sold_count: 0, want_count: 0, browse_count: 0 }),
+  ]);
+  assert.equal(evidence.confidence, 'low');
+  assert.equal(evidence.eligibleForProfit, false);
+});
+
+test('multiple zero-activity listings use the median-priced real link', () => {
+  const evidence = selectMarketEvidence(quote, [
+    listing({ itemId: '1', price: 27 }),
+    listing({ itemId: '2', price: 31 }),
+    listing({ itemId: '3', price: 35 }),
+  ]);
+  assert.equal(evidence.confidence, 'medium');
+  assert.equal(evidence.benchmark.itemId, '2');
+  assert.equal(evidence.benchmarkBasis, 'median');
+});
+
+test('the suspicious one yuan listing is excluded even beside valid links', () => {
+  const evidence = selectMarketEvidence(quote, [
+    listing({ itemId: 'bait', price: 1, detail_sold_count: 500 }),
+    listing({ itemId: 'valid-a', price: 30 }),
+    listing({ itemId: 'valid-b', price: 31 }),
+  ]);
+  assert.equal(evidence.eligibleForProfit, true);
+  assert.ok(evidence.assessments.find(item => item.listing.itemId === 'bait')?.reasons.some(
+    reason => reason.includes('异常低价'),
+  ));
+  assert.notEqual(evidence.benchmark.itemId, 'bait');
+});

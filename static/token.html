@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>登录态保活</title>
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --ink:#1f2329; --muted:#8a919f; --line:#e8eaed; --brand:#1f6feb; --ok:#1a7f37; --bad:#cf222e; --warn:#9a6700; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+.wrap { max-width: 820px; margin: 0 auto; padding: 24px 16px 80px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.sub { color: var(--muted); margin-bottom: 18px; }
+.card { background: var(--card); border:1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+label.row { display:flex; gap:10px; align-items:center; margin: 10px 0; }
+label.row span.n { width: 130px; flex: none; color:#3a4048; }
+input[type=number] { width: 90px; padding: 6px 8px; border:1px solid var(--line); border-radius:8px; font:inherit; }
+button { padding: 8px 14px; border:0; border-radius:8px; background:var(--brand); color:#fff; cursor:pointer; font:inherit; }
+button.ghost { background: var(--card); color: var(--brand); border:1px solid var(--brand); }
+.muted { color: var(--muted); } .ok { color: var(--ok); } .err { color: var(--bad); } .warn { color: var(--warn); }
+table { width:100%; border-collapse: collapse; }
+th, td { text-align:left; padding: 8px 6px; border-bottom:1px solid var(--line); font-size:13px; }
+th { color: var(--muted); font-weight:500; }
+pre { background:#f6f8fa; padding:10px; border-radius:8px; overflow:auto; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>登录态保活</h1>
+  <div class="sub">每 10 分钟对只读接口打一次心跳（确认登录态没掉），每 1.5–2.5 小时随机换一次 token。只读，不会动商品、不会发货。</div>
+
+  <div class="card">
+    <label class="row"><span class="n">总开关</span><input type="checkbox" id="enabled" checked> 启用保活</label>
+    <label class="row"><span class="n">心跳间隔</span><input type="number" id="ping" min="1" max="120"> 分钟
+      <span class="muted">（默认 10）</span></label>
+    <label class="row"><span class="n">换 token 间隔</span>
+      <input type="number" id="rmin" min="0.5" max="12" step="0.5"> ～ <input type="number" id="rmax" min="0.5" max="24" step="0.5"> 小时
+      <span class="muted">（在这个区间里随机，默认 1.5–2.5）</span></label>
+    <div style="margin-top:10px">
+      <button id="btnSave">保存</button>
+      <button id="btnCheck" class="ghost" style="margin-left:8px">立即检查一次</button>
+      <span id="msg" class="muted" style="margin-left:10px"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="font-weight:600;margin-bottom:8px">账号状态</div>
+    <table>
+      <thead><tr><th>账号</th><th>最近心跳</th><th>状态</th><th>最近换 token</th><th>失败次数</th></tr></thead>
+      <tbody id="acctBody"><tr><td colspan="5" class="muted">读取中…</td></tr></tbody>
+    </table>
+    <div id="lastErr" class="warn" style="margin-top:8px;font-size:13px"></div>
+  </div>
+
+  <div class="card">
+    <div style="font-weight:600;margin-bottom:6px">最近日志</div>
+    <pre id="logs" class="muted">—</pre>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function load() {
+  const r = await fetch('/api/token/status').then(r => r.json()).catch(() => null);
+  if (!r || !r.ok) { $('msg').innerHTML = '<span class="err">读取状态失败</span>'; return; }
+  const c = r.config || {};
+  $('enabled').checked = !!c.enabled;
+  $('ping').value = c.ping_minutes || 10;
+  $('rmin').value = c.refresh_min_hours || 1.5;
+  $('rmax').value = c.refresh_max_hours || 2.5;
+
+  const accts = r.accounts || [];
+  if (!accts.length) {
+    $('acctBody').innerHTML = '<tr><td colspan="5" class="muted">还没有跑过心跳（需要先在应用里登录账号）</td></tr>';
+  } else {
+    $('acctBody').innerHTML = accts.map(a => `<tr>
+      <td>${esc(a.cookie_id)}</td>
+      <td>${esc(a.last_ping || '—')}</td>
+      <td>${a.last_ok === false ? '<span class="err">登录态异常</span>' : '<span class="ok">正常</span>'}</td>
+      <td>${esc(a.last_refresh || '—')}</td>
+      <td>${a.fail_count ? `<span class="warn">${a.fail_count}</span>` : '0'}</td>
+    </tr>`).join('');
+    const err = accts.map(a => a.last_error).filter(Boolean)[0];
+    $('lastErr').textContent = err ? '最近错误：' + err : '';
+  }
+
+  const logs = (r.logs || []).slice().reverse();
+  $('logs').textContent = logs.length
+    ? logs.map(l => `[${l.time}] ${l.text}`).join('\n')
+    : '—';
+}
+
+$('btnSave').onclick = async () => {
+  const body = { enabled: $('enabled').checked,
+                 ping_minutes: Number($('ping').value) || 10,
+                 refresh_min_hours: Number($('rmin').value) || 1.5,
+                 refresh_max_hours: Number($('rmax').value) || 2.5 };
+  const r = await fetch('/api/token/config', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+  }).then(r => r.json()).catch(() => null);
+  $('msg').innerHTML = (r && r.ok) ? '<span class="ok">已保存</span>' : '<span class="err">保存失败</span>';
+  load();
+};
+
+$('btnCheck').onclick = async () => {
+  $('msg').innerHTML = '<span class="muted">检查中…</span>';
+  const r = await fetch('/api/token/check', {method:'POST'}).then(r => r.json()).catch(() => null);
+  $('msg').innerHTML = (r && r.ok) ? '<span class="muted">已开始检查，几秒后刷新</span>' : '<span class="err">触发失败</span>';
+  setTimeout(load, 4000);
+};
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>

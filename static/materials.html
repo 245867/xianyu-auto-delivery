@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>素材库</title>
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --ink:#1f2329; --muted:#8a919f; --line:#e8eaed; --brand:#1f6feb; --ok:#1a7f37; --bad:#cf222e; --warn:#9a6700; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+.wrap { max-width: 1100px; margin:0 auto; padding:24px 16px 90px; }
+h1 { font-size:20px; margin:0 0 4px; }
+h2 { font-size:15px; margin:0 0 10px; }
+.sub { color:var(--muted); margin-bottom:18px; }
+input, textarea, select, button { font:inherit; }
+input[type=text], input[type=search], textarea, select { padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+textarea { width:100%; }
+button { padding:8px 14px; border:0; border-radius:8px; background:var(--brand); color:#fff; cursor:pointer; }
+button.ghost { background:#fff; color:var(--brand); border:1px solid var(--brand); }
+button.mini { padding:3px 8px; font-size:12px; }
+button.danger { background:#fff; color:var(--bad); border:1px solid #ffc9c7; }
+button:disabled { opacity:.5; cursor:default; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
+.row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+.muted { color:var(--muted); } .err { color:var(--bad); } .ok-msg { color:var(--ok); }
+.tag { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); background:#fff; cursor:pointer; }
+.tag.on { background:#ddf4ff; border-color:#b6e3ff; color:#0969da; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:10px; }
+.tile { border:1px solid var(--line); border-radius:10px; overflow:hidden; background:#fff; cursor:pointer; transition:border-color .15s; }
+.tile:hover { border-color:var(--brand); }
+.tile .cover { width:100%; aspect-ratio:1/1; object-fit:cover; background:#f2f3f5; display:block; }
+.tile .tbox { padding:8px; }
+.tile .tname { font-weight:600; font-size:13px; word-break:break-all; }
+.tile .tmeta { color:var(--muted); font-size:12px; }
+.thumbs { display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:10px; }
+.thumb { border:1px solid var(--line); border-radius:10px; overflow:hidden; background:#fff; position:relative; }
+.thumb img { width:100%; aspect-ratio:1/1; object-fit:cover; display:block; background:#f2f3f5; }
+.thumb .ops { display:flex; gap:4px; padding:5px; justify-content:space-between; align-items:center; }
+.thumb .idx { position:absolute; left:6px; top:6px; background:rgba(0,0,0,.6); color:#fff; font-size:11px; padding:1px 6px; border-radius:6px; }
+.thumb .idx.main { background:var(--brand); }
+.drop { border:2px dashed var(--line); border-radius:12px; padding:22px; text-align:center; color:var(--muted); cursor:pointer; }
+.drop.hover { border-color:var(--brand); background:#f5f9ff; color:var(--brand); }
+.hidden { display:none !important; }
+.bar { height:6px; background:#eaecef; border-radius:6px; overflow:hidden; margin-top:6px; }
+.bar > i { display:block; height:100%; background:var(--brand); width:0; }
+pre { background:#f6f8fa; padding:10px; border-radius:8px; overflow:auto; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>素材库 <span class="tag" style="cursor:default">本地 · 不上传第三方</span></h1>
+  <div class="sub">同一套图反复上架时不用再找文件。素材收进本机 <code>data/materials/</code>，发布时直接取绝对路径交给发布引擎传 CDN。</div>
+
+  <div class="card">
+    <div class="row">
+      <input type="search" id="kw" placeholder="搜索名称 / 标签 / 备注" style="flex:1;min-width:200px">
+      <select id="kindSel">
+        <option value="">全部类型</option>
+        <option value="image">图片素材</option>
+        <option value="text">文案素材</option>
+      </select>
+      <button id="btnNew">＋ 新建素材</button>
+      <button class="ghost" id="btnRefresh">刷新</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <span class="muted" style="font-size:13px">标签：</span>
+      <span id="tagBar" class="row" style="gap:6px"></span>
+    </div>
+    <div id="statLine" class="muted" style="margin-top:8px;font-size:13px"></div>
+    <div class="bar"><i id="barFill"></i></div>
+  </div>
+
+  <div id="listView">
+    <div id="tiles" class="grid"><div class="muted">读取中…</div></div>
+  </div>
+
+  <div id="detailView" class="hidden">
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <button class="ghost mini" id="btnBack">← 返回列表</button>
+        <div class="row" style="gap:8px">
+          <button class="ghost mini" id="btnCopyPaths">复制发布路径</button>
+          <button class="danger mini" id="btnDelMaterial">删除素材</button>
+        </div>
+      </div>
+      <div style="height:12px"></div>
+      <div class="row">
+        <input type="text" id="dName" placeholder="素材名称" style="flex:1;min-width:200px">
+        <input type="text" id="dTags" placeholder="标签，逗号分隔" style="width:220px">
+      </div>
+      <div style="height:8px"></div>
+      <textarea id="dNote" rows="2" placeholder="备注：适合哪类商品、来源、注意事项"></textarea>
+      <div id="textBox" class="hidden" style="margin-top:8px">
+        <textarea id="dContent" rows="6" placeholder="文案内容（商品描述模板）"></textarea>
+      </div>
+      <div style="height:10px"></div>
+      <div class="row">
+        <button id="btnSaveMeta">保存信息</button>
+        <span id="metaMsg" class="muted"></span>
+      </div>
+    </div>
+
+    <div class="card" id="imageBox">
+      <h2>图片（<span id="fileCount">0</span>/9）</h2>
+      <div class="drop" id="drop">
+        点击选择图片，或把图片拖进来 · 支持 jpg/png/webp/gif/bmp · 单张 ≤10MB · 自动去重
+        <input type="file" id="fileInput" multiple accept="image/*" class="hidden">
+      </div>
+      <div style="height:10px"></div>
+      <div class="row">
+        <input type="text" id="urlInput" placeholder="或粘贴图片 URL（多个用逗号/换行分隔）" style="flex:1;min-width:220px">
+        <button class="ghost" id="btnImportUrl">从 URL 导入</button>
+      </div>
+      <div id="upMsg" class="muted" style="margin-top:8px;font-size:13px"></div>
+      <div style="height:12px"></div>
+      <div id="thumbs" class="thumbs"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let curTag = '', curId = 0, curMaterial = null, isText = false;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts || {});
+  try { return await r.json(); } catch (e) { return {ok:false, error:'响应解析失败'}; }
+}
+
+async function loadList() {
+  const q = new URLSearchParams();
+  if ($('kw').value.trim()) q.set('keyword', $('kw').value.trim());
+  if (curTag) q.set('tag', curTag);
+  if ($('kindSel').value) q.set('kind', $('kindSel').value);
+  const r = await api('/api/materials?' + q.toString());
+  if (!r.ok) { $('tiles').innerHTML = `<div class="err">${esc(r.error||'读取失败')}</div>`; return; }
+
+  $('tagBar').innerHTML = (!r.tags || !r.tags.length)
+    ? '<span class="muted">暂无标签</span>'
+    : r.tags.map(t => `<span class="tag ${curTag===t.tag?'on':''}" onclick="pickTag('${esc(t.tag)}')">${esc(t.tag)} ${t.count}</span>`).join('');
+
+  const s = r.stats || {};
+  $('statLine').textContent = `素材 ${s.materials||0} 组 · 图片 ${s.files||0} 个 · 占用 ${s.bytes_text||'0B'} · 上限 ${s.max_files||2000} 个文件`;
+  const pct = s.max_files ? Math.min(100, Math.round((s.files||0) / s.max_files * 100)) : 0;
+  $('barFill').style.width = pct + '%';
+
+  if (!r.items.length) {
+    $('tiles').innerHTML = '<div class="muted">还没有素材。点右上「＋ 新建素材」建一组，再把图片拖进去。</div>';
+    return;
+  }
+  $('tiles').innerHTML = r.items.map(m => `<div class="tile" onclick="openMaterial(${m.id})">
+    ${m.cover_url ? `<img class="cover" src="${m.cover_url}" alt="">`
+                  : `<div class="cover" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px">${m.kind==='text'?'文案素材':'空素材'}</div>`}
+    <div class="tbox">
+      <div class="tname">${esc(m.name)}</div>
+      <div class="tmeta">${m.kind==='text'?'文案':'图片'} · ${m.file_count} 个文件</div>
+      <div class="tmeta">${(m.tags||[]).map(t=>`<span class="tag" style="font-size:11px;padding:0 6px">${esc(t)}</span>`).join(' ')}</div>
+    </div>
+  </div>`).join('');
+}
+
+function pickTag(t) { curTag = (curTag === t ? '' : t); loadList(); }
+
+$('btnRefresh').onclick = loadList;
+$('kindSel').onchange = loadList;
+$('kw').oninput = () => { clearTimeout(window._kwT); window._kwT = setTimeout(loadList, 300); };
+
+$('btnNew').onclick = async () => {
+  const name = prompt('新素材名称（例如：PPT 模板-封面图）');
+  if (!name) return;
+  const kind = confirm('这是图片素材吗？\n\n确定 = 图片素材（可上传图片）\n取消 = 文案素材（只存文案）') ? 'image' : 'text';
+  if (kind === 'text') {
+    const content = prompt('文案内容：');
+    if (!content) return;
+    const r = await api('/api/materials', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, kind:'text', content})});
+    if (!r.ok) { alert(r.error||'创建失败'); return; }
+    openMaterial(r.id);
+  } else {
+    const r = await api('/api/materials', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, kind:'image'})});
+    if (!r.ok) { alert(r.error||'创建失败'); return; }
+    openMaterial(r.id);
+  }
+};
+
+async function openMaterial(id) {
+  const r = await api('/api/materials/' + id);
+  if (!r.ok) { alert(r.error||'读取失败'); return; }
+  curId = id; curMaterial = r.material; isText = curMaterial.kind === 'text';
+  $('listView').classList.add('hidden');
+  $('detailView').classList.remove('hidden');
+  $('dName').value = curMaterial.name;
+  $('dTags').value = curMaterial.tags_text || '';
+  $('dNote').value = curMaterial.note || '';
+  $('dContent').value = curMaterial.content || '';
+  $('textBox').classList.toggle('hidden', !isText);
+  $('imageBox').classList.toggle('hidden', isText);
+  $('metaMsg').textContent = '';
+  renderFiles(curMaterial.files || []);
+  window.scrollTo(0, 0);
+}
+
+function renderFiles(files) {
+  $('fileCount').textContent = files.length;
+  if (!files.length) {
+    $('thumbs').innerHTML = '<div class="muted">还没有图片，先上传或从 URL 导入。</div>';
+    return;
+  }
+  $('thumbs').innerHTML = files.map((f, i) => `<div class="thumb">
+    <span class="idx ${i===0?'main':''}">${i===0?'主图':('第'+(i+1)+'张')}</span>
+    <img src="${f.thumb_url}" alt="" loading="lazy">
+    <div class="ops">
+      <span class="muted" style="font-size:11px">${f.width}×${f.height} · ${f.size_text}</span>
+      <span class="row" style="gap:3px">
+        <button class="ghost mini" onclick="moveFile(${f.id},'up')" ${i===0?'disabled':''}>↑</button>
+        <button class="ghost mini" onclick="moveFile(${f.id},'down')" ${i===files.length-1?'disabled':''}>↓</button>
+        <button class="danger mini" onclick="delFile(${f.id})">删</button>
+      </span>
+    </div>
+  </div>`).join('');
+}
+
+$('btnBack').onclick = () => {
+  $('detailView').classList.add('hidden');
+  $('listView').classList.remove('hidden');
+  curId = 0; curMaterial = null;
+  loadList();
+};
+
+$('btnSaveMeta').onclick = async () => {
+  const body = {name: $('dName').value.trim(), tags: $('dTags').value.trim(), note: $('dNote').value.trim()};
+  if (isText) body.content = $('dContent').value;
+  const r = await api('/api/materials/' + curId, {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  $('metaMsg').innerHTML = r.ok ? '<span class="ok-msg">已保存</span>' : `<span class="err">${esc(r.error||'保存失败')}</span>`;
+};
+
+$('btnDelMaterial').onclick = async () => {
+  if (!confirm('删除这个素材？图片会移到 data/materials/.trash（可手工找回）。')) return;
+  const r = await api('/api/materials/' + curId, {method:'DELETE'});
+  if (!r.ok) { alert(r.error||'删除失败'); return; }
+  $('btnBack').onclick();
+};
+
+$('btnCopyPaths').onclick = async () => {
+  const r = await api('/api/materials/' + curId + '/paths');
+  if (!r.ok) { alert(r.error||'取不到路径'); return; }
+  const text = r.paths.join('\n');
+  try { await navigator.clipboard.writeText(text); $('upMsg').innerHTML = '<span class="ok-msg">已复制 ' + r.count + ' 条发布路径，可直接粘到发布页「图片」框</span>'; }
+  catch (e) { $('upMsg').innerHTML = `<span class="muted">复制失败，请手动复制：</span><pre>${esc(text)}</pre>`; }
+};
+
+// ---- 上传
+$('drop').onclick = () => $('fileInput').click();
+$('fileInput').onchange = () => { if ($('fileInput').files.length) uploadFiles($('fileInput').files); };
+['dragenter','dragover'].forEach(ev => $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.add('hover'); }));
+['dragleave','drop'].forEach(ev => $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.remove('hover'); }));
+$('drop').addEventListener('drop', e => { if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files); });
+
+async function uploadFiles(fileList) {
+  const fd = new FormData();
+  for (const f of fileList) fd.append('files', f, f.name);
+  $('upMsg').innerHTML = `<span class="muted">上传中（${fileList.length} 个）…</span>`;
+  const r = await api('/api/materials/' + curId + '/upload', {method:'POST', body: fd});
+  const parts = [];
+  if (r.uploaded) parts.push(`<span class="ok-msg">成功 ${r.uploaded} 张</span>`);
+  const dups = (r.results||[]).filter(x => x.dup).length;
+  if (dups) parts.push(`<span class="muted">${dups} 张已存在跳过</span>`);
+  const fails = (r.results||[]).filter(x => !x.ok && !x.dup);
+  if (fails.length) parts.push(`<span class="err">${fails.map(x => esc(x.name + '：' + (x.error||''))).join('；')}</span>`);
+  $('upMsg').innerHTML = parts.join('　') || `<span class="err">${esc(r.error||'上传失败')}</span>`;
+  $('fileInput').value = '';
+  const d = await api('/api/materials/' + curId);
+  if (d.ok) renderFiles(d.material.files || []);
+}
+
+$('btnImportUrl').onclick = async () => {
+  const raw = $('urlInput').value.trim();
+  if (!raw) return;
+  $('upMsg').innerHTML = '<span class="muted">下载中…</span>';
+  const r = await api('/api/materials/' + curId + '/import-url', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({urls: raw})});
+  if (!r.ok) { $('upMsg').innerHTML = `<span class="err">${esc(r.error||'导入失败')}</span>`; return; }
+  const parts = [`<span class="ok-msg">新增 ${r.added} 张</span>`];
+  if (r.dup) parts.push(`<span class="muted">${r.dup} 张重复跳过</span>`);
+  if (r.failed && r.failed.length) parts.push(`<span class="err">${r.failed.length} 个失败：${r.failed.map(f=>esc(f.error)).join('；')}</span>`);
+  $('upMsg').innerHTML = parts.join('　');
+  $('urlInput').value = '';
+  const d = await api('/api/materials/' + curId);
+  if (d.ok) renderFiles(d.material.files || []);
+};
+
+async function moveFile(fid, dir) {
+  await api(`/api/materials/${curId}/files/${fid}/move?dir=${dir}`, {method:'POST'});
+  const d = await api('/api/materials/' + curId);
+  if (d.ok) renderFiles(d.material.files || []);
+}
+
+async function delFile(fid) {
+  if (!confirm('删除这张图？')) return;
+  await api('/api/materials/files/' + fid, {method:'DELETE'});
+  const d = await api('/api/materials/' + curId);
+  if (d.ok) renderFiles(d.material.files || []);
+}
+
+loadList();
+</script>
+</body>
+</html>

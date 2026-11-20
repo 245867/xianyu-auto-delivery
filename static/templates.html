@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>商品模板与批量发布</title>
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --ink:#1f2329; --muted:#8a919f; --line:#e8eaed; --brand:#1f6feb; --ok:#1a7f37; --bad:#cf222e; --warn:#9a6700; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+.wrap { max-width: 1100px; margin:0 auto; padding:24px 16px 90px; }
+h1 { font-size:20px; margin:0 0 4px; }
+h2 { font-size:15px; margin:0 0 10px; }
+.sub { color:var(--muted); margin-bottom:18px; }
+input, textarea, select, button { font:inherit; }
+input[type=text], input[type=number], textarea, select { padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+textarea { width:100%; font-family:ui-monospace,Consolas,monospace; font-size:13px; }
+button { padding:8px 14px; border:0; border-radius:8px; background:var(--brand); color:#fff; cursor:pointer; }
+button.ghost { background:#fff; color:var(--brand); border:1px solid var(--brand); }
+button.mini { padding:3px 8px; font-size:12px; }
+button.danger { background:#fff; color:var(--bad); border:1px solid #ffc9c7; }
+button:disabled { opacity:.5; cursor:default; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
+.row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+.muted { color:var(--muted); } .err { color:var(--bad); } .ok-msg { color:var(--ok); } .warn { color:var(--warn); }
+.tag { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); background:#fff; }
+.tag.ok { background:#dafbe1; border-color:#a7f3b6; color:var(--ok); }
+.tag.bad { background:#ffebe9; border-color:#ffc9c7; color:var(--bad); }
+.tag.warn { background:#fff8c5; border-color:#f0e6a0; color:var(--warn); }
+table { width:100%; border-collapse:collapse; }
+th,td { text-align:left; padding:7px 6px; border-bottom:1px solid var(--line); vertical-align:top; font-size:13px; }
+th { color:var(--muted); font-weight:500; }
+.hidden { display:none !important; }
+.banner { background:#fff8c5; border:1px solid #f0e6a0; color:#7a5c00; padding:10px 12px; border-radius:10px; margin-bottom:12px; font-size:13px; }
+.banner.info { background:#ddf4ff; border-color:#b6e3ff; color:#0a4f8a; }
+.ph { display:inline-block; background:#eef3ff; color:#1f6feb; border-radius:6px; padding:0 6px; font-family:ui-monospace,monospace; font-size:12px; margin-right:4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>商品模板与批量发布 <span class="tag">A5</span></h1>
+  <div class="sub">把固定内容做成模板，变量用 <span class="ph">{{学校}}</span> 这类占位符；一次填几十行，按 1 次/分钟逐条发。默认演练，不会真发。</div>
+
+  <div class="banner">三条硬边界：① 每账号 1 次/60 秒、日上限 200；② 23:00–08:00 不发布；③ 任何一条"结果未知"立刻整批暂停，必须人工回读「我发布的」后再恢复。</div>
+
+  <div class="card">
+    <div class="row">
+      <button id="btnNewTpl">＋ 新建模板</button>
+      <button class="ghost" id="btnReload">刷新</button>
+      <input type="text" id="kw" placeholder="搜索模板" style="flex:1;min-width:160px">
+      <span id="statLine" class="muted" style="font-size:13px"></span>
+    </div>
+  </div>
+
+  <div id="listView">
+    <div class="card">
+      <h2>模板</h2>
+      <table>
+        <thead><tr><th>名称</th><th>标题模板</th><th>变量</th><th>价格</th><th>图片</th><th></th></tr></thead>
+        <tbody id="tplBody"><tr><td colspan="6" class="muted">读取中…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>批次记录</h2>
+      <table>
+        <thead><tr><th>批次</th><th>模板</th><th>状态</th><th>进度</th><th>类型</th><th>时间</th><th></th></tr></thead>
+        <tbody id="jobBody"><tr><td colspan="7" class="muted">读取中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="editView" class="hidden">
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <button class="ghost mini" id="btnBack">← 返回</button>
+        <span id="editTitle" class="muted"></span>
+      </div>
+      <div style="height:10px"></div>
+      <div class="row">
+        <input type="text" id="fName" placeholder="模板名称（如：考研资料-通用）" style="flex:1;min-width:200px">
+        <input type="text" id="fTags" placeholder="标签" style="width:180px">
+      </div>
+      <div style="height:8px"></div>
+      <div class="row">
+        <span class="muted" style="width:70px">标题</span>
+        <input type="text" id="fTitle" placeholder="如：{{学校}}{{专业}}考研全套资料 真题+笔记" style="flex:1;min-width:260px">
+      </div>
+      <div style="height:8px"></div>
+      <div class="row" style="align-items:flex-start">
+        <span class="muted" style="width:70px;padding-top:8px">描述</span>
+        <textarea id="fDesc" rows="6" placeholder="商品描述；同样可用占位符"></textarea>
+      </div>
+      <div style="height:8px"></div>
+      <div class="row">
+        <span class="muted">价格</span><input type="number" id="fPrice" step="0.01" style="width:100px">
+        <span class="muted">数量</span><input type="number" id="fQty" style="width:80px">
+        <select id="fDelivery">
+          <option value="无需邮寄">无需邮寄（虚拟）</option>
+          <option value="包邮">包邮</option>
+          <option value="按距离计费">按距离计费</option>
+          <option value="一口价">一口价运费</option>
+        </select>
+        <span class="muted">运费</span><input type="number" id="fPost" step="0.01" style="width:90px">
+      </div>
+      <div style="height:8px"></div>
+      <div class="row">
+        <span class="muted">绑定素材</span>
+        <select id="fMaterial" style="min-width:240px"><option value="0">（未绑定，发布时会失败）</option></select>
+        <a href="/materials" target="_blank" class="muted" style="font-size:12px">去素材库</a>
+      </div>
+      <div id="phHint" class="muted" style="margin-top:10px;font-size:13px"></div>
+      <div style="height:10px"></div>
+      <div class="row">
+        <button id="btnSaveTpl">保存模板</button>
+        <button class="danger mini" id="btnDelTpl">删除</button>
+        <span id="saveMsg" class="muted"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>批量填写</h2>
+      <div class="row">
+        <span class="muted">列名（逗号分隔，与占位符同名）</span>
+        <input type="text" id="hdrInput" placeholder="学校, 专业" style="flex:1;min-width:200px">
+        <button class="ghost mini" id="btnUsePh">用模板变量填列名</button>
+      </div>
+      <div style="height:8px"></div>
+      <textarea id="rowsText" rows="8" placeholder="每行一条，列用 Tab / 逗号 / 竖线分隔：&#10;华南理工大学, 计算机&#10;中山大学, 法学"></textarea>
+      <div style="height:8px"></div>
+      <div class="row">
+        <button class="ghost" id="btnParse">解析并预览</button>
+        <input type="text" id="fCookie" placeholder="账号 Cookie ID（真实发布必填）" style="width:240px">
+        <label class="muted"><input type="checkbox" id="fDry" checked> 演练模式（不真发）</label>
+        <label class="muted" style="margin-left:8px;display:inline-flex;align-items:center;gap:4px">
+          <span>失败策略：</span>
+          <select id="fPolicy" style="padding:4px 8px;border-radius:6px;border:1px solid #ccc;font-size:13px">
+            <option value="skip" selected>跳过继续发下一个 (skip)</option>
+            <option value="pause">遇错暂停整队待审 (pause)</option>
+          </select>
+        </label>
+      </div>
+      <div id="previewOut" style="margin-top:12px"></div>
+    </div>
+  </div>
+
+  <div id="jobView" class="hidden">
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <button class="ghost mini" id="btnJobBack">← 返回</button>
+        <span id="jobHead" class="muted"></span>
+      </div>
+      <div id="jobBanner" style="margin-top:10px"></div>
+      <table style="margin-top:10px">
+        <thead><tr><th>#</th><th>标题</th><th>价格</th><th>状态</th><th>itemId / 错误</th></tr></thead>
+        <tbody id="jobItems"><tr><td colspan="5" class="muted">—</td></tr></tbody>
+      </table>
+      <div class="row" style="margin-top:12px">
+        <button id="btnJobRun">开始 / 继续</button>
+        <button class="ghost mini" id="btnJobResume">已人工核对，允许继续</button>
+        <button class="danger mini" id="btnJobCancel">取消剩余</button>
+        <span id="jobMsg" class="muted"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let curTpl = null, parsedRows = [], curJob = '';
+
+async function api(path, opts) {
+  const r = await fetch(path, opts || {});
+  try { return await r.json(); } catch (e) { return {ok:false, error:'响应解析失败'}; }
+}
+const post = (p, b) => api(p, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(b||{})});
+const del = p => api(p, {method:'DELETE'});
+
+const STATUS_TEXT = {pending:'待执行', running:'执行中', done:'完成', paused:'已暂停', cancelled:'已取消',
+  failed:'失败', skipped:'跳过'};
+const STATUS_CLS = {done:'ok', failed:'bad', paused:'warn', pending:'', running:'', skipped:'', cancelled:''};
+
+async function loadAll() {
+  const t = await api('/api/templates' + ($('kw').value.trim() ? '?keyword=' + encodeURIComponent($('kw').value.trim()) : ''));
+  const st = await api('/api/templates/stats');
+  if (st.ok) $('statLine').textContent = `模板 ${st.templates} 个 · 批次 ${st.jobs} 个 · 单批上限 ${st.max_batch_rows} 行`;
+  const tb = $('tplBody');
+  if (!t.ok || !t.items.length) {
+    tb.innerHTML = '<tr><td colspan="6" class="muted">还没有模板，点左上「＋ 新建模板」。</td></tr>';
+  } else {
+    tb.innerHTML = t.items.map(x => `<tr>
+      <td><b>${esc(x.name)}</b>${x.tags ? `<div class="muted" style="font-size:12px">${esc(x.tags)}</div>` : ''}</td>
+      <td style="max-width:280px">${esc(x.title_tpl)}</td>
+      <td>${x.placeholders.length ? x.placeholders.map(p=>`<span class="ph">${esc(p)}</span>`).join('') : '<span class="muted">无</span>'}</td>
+      <td>¥${x.price || 0}</td>
+      <td>${x.material_id ? `<span class="tag ok">已绑 #${x.material_id}</span>` : '<span class="tag bad">未绑定</span>'}</td>
+      <td><button class="ghost mini" onclick="openEdit(${x.id})">编辑</button></td>
+    </tr>`).join('');
+  }
+
+  const j = await api('/api/templates/jobs?limit=20');
+  const jb = $('jobBody');
+  if (!j.ok || !j.items.length) {
+    jb.innerHTML = '<tr><td colspan="7" class="muted">还没有批次。</td></tr>';
+  } else {
+    jb.innerHTML = j.items.map(x => `<tr>
+      <td><code>${esc(x.id)}</code></td>
+      <td>#${x.template_id}</td>
+      <td><span class="tag ${STATUS_CLS[x.status]||''}">${STATUS_TEXT[x.status]||x.status}</span></td>
+      <td>${x.done} 成功 / ${x.failed} 失败 / ${x.skipped} 跳过 / ${x.total} 总</td>
+      <td>${x.dry_run ? '<span class="tag">演练</span>' : '<span class="tag warn">真实</span>'}</td>
+      <td class="muted" style="font-size:12px">${esc(x.created_at)}</td>
+      <td><button class="ghost mini" onclick="openJob('${esc(x.id)}')">查看</button></td>
+    </tr>`).join('');
+  }
+}
+
+$('btnReload').onclick = loadAll;
+$('kw').oninput = () => { clearTimeout(window._k); window._k = setTimeout(loadAll, 300); };
+
+// ---- 模板编辑
+$('btnNewTpl').onclick = () => {
+  curTpl = null;
+  $('editTitle').textContent = '新建模板';
+  ['fName','fTags','fTitle','fDesc','hdrInput','rowsText'].forEach(id => $(id).value = '');
+  $('fPrice').value = 9.9; $('fQty').value = 1; $('fPost').value = 0;
+  $('fDelivery').value = '无需邮寄'; $('fMaterial').value = '0';
+  $('phHint').textContent = ''; $('previewOut').innerHTML = ''; $('saveMsg').textContent = '';
+  parsedRows = [];
+  $('listView').classList.add('hidden'); $('jobView').classList.add('hidden');
+  $('editView').classList.remove('hidden');
+  loadMaterials();
+  window.scrollTo(0,0);
+};
+
+async function openEdit(id) {
+  const r = await api('/api/templates/' + id);
+  if (!r.ok) { alert(r.error || '读取失败'); return; }
+  const t = r.template; curTpl = t;
+  $('editTitle').textContent = '编辑：# ' + t.id;
+  $('fName').value = t.name; $('fTags').value = t.tags || '';
+  $('fTitle').value = t.title_tpl; $('fDesc').value = t.desc_tpl;
+  $('fPrice').value = t.price; $('fQty').value = t.quantity;
+  $('fDelivery').value = t.delivery; $('fPost').value = t.post_price;
+  $('saveMsg').textContent = '';
+  $('hdrInput').value = (t.placeholders || []).join(', ');
+  $('rowsText').value = ''; $('previewOut').innerHTML = ''; parsedRows = [];
+  await loadMaterials();
+  $('fMaterial').value = String(t.material_id || 0);
+  renderPhHint((t.placeholders||[]).join(', '));
+  $('listView').classList.add('hidden'); $('jobView').classList.add('hidden');
+  $('editView').classList.remove('hidden');
+  window.scrollTo(0,0);
+}
+
+function renderPhHint(text) {
+  const list = String(text||'').split(/[,，\s]+/).filter(Boolean);
+  $('phHint').innerHTML = list.length
+    ? '本模板变量：' + list.map(p => `<span class="ph">{{${esc(p)}}}</span>`).join('')
+    : '<span class="muted">标题/描述里用 {{变量名}} 声明变量，例如 {{学校}}{{专业}}</span>';
+}
+
+async function loadMaterials() {
+  try {
+    const r = await api('/api/materials?kind=image&limit=200');
+    const sel = $('fMaterial');
+    const keep = sel.value;
+    if (!r.ok || !r.items.length) { sel.innerHTML = '<option value="0">（素材库为空）</option>'; return; }
+    sel.innerHTML = '<option value="0">（未绑定，发布时会失败）</option>' + r.items.map(m =>
+      `<option value="${m.id}">${esc(m.name)}（${m.file_count} 张）</option>`).join('');
+    if (keep) sel.value = keep;
+  } catch (e) {}
+}
+
+$('btnUsePh').onclick = () => {
+  const ph = collectPh();
+  if (!ph.length) { alert('模板里没有 {{变量}}，先在上面标题/描述里写'); return; }
+  $('hdrInput').value = ph.join(', ');
+};
+
+function collectPh() {
+  const txt = ($('fTitle').value || '') + '\n' + ($('fDesc').value || '');
+  const out = []; const seen = new Set();
+  for (const m of txt.matchAll(/\{\{\s*([A-Za-z0-9_一-龥]{1,24})\s*\}\}/g)) {
+    const k = m[1].trim();
+    if (!seen.has(k)) { seen.add(k); out.push(k); }
+  }
+  return out;
+}
+
+$('btnSaveTpl').onclick = async () => {
+  const body = {name: $('fName').value.trim(), title_tpl: $('fTitle').value.trim(),
+    desc_tpl: $('fDesc').value, price: Number($('fPrice').value||0),
+    quantity: Number($('fQty').value||1), delivery: $('fDelivery').value,
+    post_price: Number($('fPost').value||0), material_id: Number($('fMaterial').value||0),
+    tags: $('fTags').value.trim()};
+  const r = curTpl ? await post('/api/templates/' + curTpl.id, body) : await post('/api/templates', body);
+  if (!r.ok) { $('saveMsg').innerHTML = `<span class="err">${esc(r.error||'保存失败')}</span>`; return; }
+  $('saveMsg').innerHTML = '<span class="ok-msg">已保存</span>';
+  if (!curTpl && r.id) curTpl = {id: r.id};
+  renderPhHint(collectPh().join(','));
+  loadAll();
+};
+
+$('btnDelTpl').onclick = async () => {
+  if (!curTpl) return;
+  if (!confirm('删除这个模板？已建的批次记录不受影响。')) return;
+  const r = await del('/api/templates/' + curTpl.id);
+  if (!r.ok) { alert(r.error||'删除失败'); return; }
+  $('btnBack').onclick();
+};
+
+$('btnBack').onclick = () => {
+  $('editView').classList.add('hidden');
+  $('jobView').classList.add('hidden');
+  $('listView').classList.remove('hidden');
+  curTpl = null; loadAll();
+};
+
+// ---- 解析 / 预览
+$('btnParse').onclick = async () => {
+  if (!curTpl || !curTpl.id) { alert('先把模板保存一次'); return; }
+  const headers = $('hdrInput').value.split(/[,，]/).map(s=>s.trim()).filter(Boolean);
+  if (!headers.length) { alert('先填列名'); return; }
+  const p = await post('/api/templates/parse-rows', {text: $('rowsText').value, headers});
+  if (!p.ok) { alert(p.error||'解析失败'); return; }
+  if (!p.rows.length) { $('previewOut').innerHTML = '<span class="err">没有解析出有效行（列数不足？）</span>'; return; }
+  parsedRows = p.rows;
+  const pv = await post(`/api/templates/${curTpl.id}/preview`, {rows: parsedRows});
+  if (!pv.ok) { alert(pv.error||'预览失败'); return; }
+  renderPreview(pv, p);
+};
+
+function renderPreview(pv, p) {
+  const bad = pv.problems || [];
+  const head = `<div class="row" style="justify-content:space-between">
+    <div>共 <b>${pv.row_count}</b> 行，可用 <b class="ok-msg">${pv.valid}</b> 行${bad.length?`，有问题 <b class="err">${bad.length}</b> 行`:''}</div>
+    <button id="btnCreateJob" ${bad.length?'disabled':''}>建批次（${$('fDry').checked?'演练':'真实发布'}）</button>
+  </div>`;
+  const rows = pv.rows.map(r => `<tr>
+    <td>${r.seq}</td>
+    <td>${esc(r.title)}</td>
+    <td>¥${r.price}</td>
+    <td>${r.issues.length ? `<span class="err">${esc(r.issues.join('；'))}</span>` : '<span class="ok-msg">可发</span>'}</td>
+  </tr>`).join('');
+  const badLines = (p.bad||[]).length ? `<div class="warn" style="margin-top:8px;font-size:13px">跳过 ${p.bad.length} 行：${p.bad.map(b=>`第${b.line}行 ${esc(b.error)}`).join('；')}</div>` : '';
+  $('previewOut').innerHTML = head + badLines + `<table style="margin-top:10px">
+    <thead><tr><th>#</th><th>渲染后标题</th><th>价格</th><th>校验</th></tr></thead><tbody>${rows}</tbody></table>`;
+  const btn = $('btnCreateJob');
+  if (btn) btn.onclick = createJob;
+}
+
+async function createJob() {
+  if (!curTpl || !curTpl.id) return;
+  const dry = $('fDry').checked;
+  const cid = $('fCookie').value.trim();
+  const policy = $('fPolicy') ? $('fPolicy').value : 'skip';
+  if (!dry && !cid) { alert('真实发布必须填 Cookie ID'); return; }
+  if (!dry && !confirm(`将真实发布 ${parsedRows.length} 条到闲鱼账号 ${cid}。\n每条间隔 60 秒，失败策略：${policy==='pause'?'遇错暂停整队待审':'普通失败自动跳过继续'}。确定？`)) return;
+  const r = await post(`/api/templates/${curTpl.id}/jobs`,
+    {rows: parsedRows, cookie_id: cid, dry_run: dry, failurePolicy: policy});
+  if (!r.ok) {
+    const p = (r.problems||[]).slice(0,3).map(x=>`第${x.seq}行：${x.issues.join('、')}`).join('\n');
+    alert((r.error||'建批次失败') + (p ? '\n' + p : ''));
+    return;
+  }
+  await openJob(r.job_id);
+}
+
+// ---- 批次
+async function openJob(id) {
+  curJob = id;
+  const r = await api('/api/templates/jobs/' + id);
+  if (!r.ok) { alert(r.error||'读取失败'); return; }
+  const j = r.job;
+  const policyLabel = (j.failure_policy || j.failurePolicy) === 'pause' ? '遇错暂停 (pause)' : '失败跳过 (skip)';
+  $('jobHead').innerHTML = `批次 <code>${esc(j.id)}</code> · 模板 #${j.template_id} · ${j.dry_run?'<span class="tag">演练</span>':'<span class="tag warn">真实发布</span>'} · <span class="tag">策略: ${policyLabel}</span>`;
+  const banner = [];
+  if (j.status === 'paused' && j.error) {
+    banner.push(`<div class="banner">已暂停：${esc(j.error)}<br>确认平台侧没有重复上架后，点下方「已人工核对，允许继续」。</div>`);
+  }
+  if (j.dry_run) banner.push('<div class="banner info">这是演练批次：只校验参数，不会真的发到闲鱼。</div>');
+  if (!j.dry_run && j.cookie_id) banner.push(`<div class="banner info">账号：${esc(j.cookie_id)} · 每 60 秒发 1 条，请保持应用在前台运行。</div>`);
+  $('jobBanner').innerHTML = banner.join('');
+  $('jobItems').innerHTML = j.items.length ? j.items.map(it => `<tr>
+    <td>${it.seq}</td>
+    <td>${esc(it.title)}</td>
+    <td>¥${it.price}</td>
+    <td><span class="tag ${STATUS_CLS[it.status]||''}">${STATUS_TEXT[it.status]||it.status}</span></td>
+    <td style="font-size:12px">${it.item_id ? `<code>${esc(it.item_id)}</code>` : ''}${it.error?`<span class="err">${esc(it.error)}</span>`:''}</td>
+  </tr>`).join('') : '<tr><td colspan="5" class="muted">—</td></tr>';
+  $('listView').classList.add('hidden'); $('editView').classList.add('hidden');
+  $('jobView').classList.remove('hidden');
+  window.scrollTo(0,0);
+}
+
+$('btnJobBack').onclick = () => { $('jobView').classList.add('hidden'); $('listView').classList.remove('hidden'); loadAll(); };
+$('btnJobRun').onclick = async () => {
+  const r = await post(`/api/templates/jobs/${curJob}/run`, {});
+  $('jobMsg').innerHTML = r.ok ? '<span class="muted">已启动，2 秒后自动刷新</span>' : `<span class="err">${esc(r.error||'')}</span>`;
+  setTimeout(() => openJob(curJob), 2000);
+};
+$('btnJobResume').onclick = async () => {
+  if (!confirm('确认已到闲鱼「我发布的」核对过，没有重复上架？')) return;
+  const r = await post(`/api/templates/jobs/${curJob}/resume`, {});
+  $('jobMsg').innerHTML = r.ok ? '<span class="ok-msg">已恢复，可以点开始</span>' : `<span class="err">${esc(r.error||'')}</span>`;
+  openJob(curJob);
+};
+$('btnJobCancel').onclick = async () => {
+  if (!confirm('取消剩余未发的行？')) return;
+  await post(`/api/templates/jobs/${curJob}/cancel`, {});
+  openJob(curJob);
+};
+
+$('fTitle').oninput = () => renderPhHint(collectPh().join(', '));
+$('fDesc').oninput = () => renderPhHint(collectPh().join(', '));
+
+loadAll();
+</script>
+</body>
+</html>

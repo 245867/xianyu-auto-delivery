@@ -1,8 +1,23 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Card } from '../types';
-import { getCards, createCard, updateCard, deleteCard } from '../services/api';
+import { getCards, createCard, updateCard, deleteCard, appendCardInventory } from '../services/api';
 import { Plus, CreditCard, Clock, FileText, Image as ImageIcon, Code, Edit, Trash2, Save, X, Eye, EyeOff, Package } from 'lucide-react';
+
+type CardEditForm = Partial<Card> & {
+  api_url?: string;
+  api_method?: NonNullable<Card['api_config']>['method'];
+  api_timeout?: number;
+  api_headers?: string;
+  api_params?: string;
+};
+
+const cardTypeLabels: Record<Card['type'], string> = {
+  text: '固定文本',
+  image: '图片',
+  api: 'API',
+  data: '批量卡密',
+};
 
 const CardList: React.FC = () => {
   const [cards, setCards] = useState<Card[]>([]);
@@ -10,22 +25,16 @@ const CardList: React.FC = () => {
   const [showAddModal, setShowAddModal] = useState(false);
   const [showCreateGroupModal, setShowCreateGroupModal] = useState(false);
   const [selectedCard, setSelectedCard] = useState<Card | null>(null);
-  const [editForm, setEditForm] = useState<Partial<Card>>({});
+  const [editForm, setEditForm] = useState<CardEditForm>({});
   const [groupForm, setGroupForm] = useState({
     name: '',
     type: 'data' as 'text' | 'image' | 'api' | 'data',
     description: ''
   });
-  const [addForm, setAddForm] = useState({
-    name: '',
-    type: 'text' as 'text' | 'image' | 'api' | 'data',
-    content: '',
-    description: '',
-    enabled: true,
-    delay_seconds: 0,
-    after_delivery_enabled: true,
-    after_delivery_message: '感谢购买，卡密已发送，请查收。'
-  });
+  const [addCardId, setAddCardId] = useState('');
+  const [addContent, setAddContent] = useState('');
+  const [addingInventory, setAddingInventory] = useState(false);
+  const addGroup = cards.find(card => String(card.id) === addCardId);
 
   useEffect(() => {
     getCards().then(setCards);
@@ -117,7 +126,7 @@ const CardList: React.FC = () => {
     try {
       const updateData: Partial<Card> = {
         name: editForm.name.trim(),
-        type: editForm.type as any,
+        type: editForm.type,
         description: editForm.description?.trim(),
         delay_seconds: editForm.delay_seconds || 0,
         enabled: editForm.enabled ?? true,
@@ -131,8 +140,8 @@ const CardList: React.FC = () => {
       // 根据类型设置内容
       if (editForm.type === 'api') {
         updateData.api_config = {
-          url: editForm.api_url?.trim(),
-          method: editForm.api_method as 'GET' | 'POST',
+          url: editForm.api_url?.trim() || '',
+          method: editForm.api_method || 'GET',
           timeout: editForm.api_timeout || 10,
           headers: editForm.api_headers?.trim() || undefined,
           params: editForm.api_params?.trim() || undefined
@@ -140,12 +149,14 @@ const CardList: React.FC = () => {
       } else if (editForm.type === 'text') {
         updateData.text_content = editForm.text_content?.trim() || '';
       } else if (editForm.type === 'data') {
-        updateData.data_content = editForm.data_content?.trim() || '';
+        if (editForm.data_content !== (selectedCard.data_content || '') || selectedCard.type !== 'data') {
+          updateData.data_content = editForm.data_content?.trim() || '';
+        }
       } else if (editForm.type === 'image') {
         updateData.image_url = editForm.image_url?.trim() || '';
       }
 
-      await updateCard(selectedCard.id, updateData);
+      await updateCard(String(selectedCard.id), updateData);
       setShowEditModal(false);
       getCards().then(setCards);
     } catch (error) {
@@ -154,10 +165,10 @@ const CardList: React.FC = () => {
     }
   };
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (id: number) => {
     if (confirm('确认删除该卡密吗？')) {
       try {
-        await deleteCard(id);
+        await deleteCard(String(id));
         getCards().then(setCards);
       } catch (error) {
         console.error('删除卡密失败:', error);
@@ -167,72 +178,26 @@ const CardList: React.FC = () => {
   };
 
   const handleAddCard = async () => {
+    if (addingInventory || !addGroup || !addContent.trim()) return;
+    setAddingInventory(true);
     try {
-      const content = addForm.content.trim();
-      if (!addForm.name.trim()) {
-        alert('请选择或输入卡密分组');
-        return;
-      }
-      if (!content && addForm.type !== 'api') {
-        alert('请输入卡密内容');
-        return;
-      }
-
-      const existing = cards.find(card => card.name === addForm.name && card.type === addForm.type);
-      if (existing) {
-        // 选择已有分组时追加库存，避免重复创建同名分组。
-        const field = addForm.type === 'text' ? 'text_content'
-          : addForm.type === 'data' ? 'data_content'
-            : addForm.type === 'image' ? 'image_url' : null;
-        if (field) {
-          const previous = String((existing as any)[field] || '').trim();
-          await updateCard(String(existing.id), {
-            [field]: [previous, content].filter(Boolean).join('\n'),
-            description: addForm.description,
-            after_delivery_enabled: addForm.after_delivery_enabled,
-            after_delivery_message: addForm.after_delivery_message,
-          });
-        } else {
-          alert('API 分组请直接编辑接口配置，不能追加文本库存');
-          return;
-        }
-      } else {
-        const payload: Partial<Card> = {
-          name: addForm.name.trim(),
-          type: addForm.type,
-          description: addForm.description,
-          enabled: addForm.enabled,
-          delay_seconds: addForm.delay_seconds,
-          after_delivery_enabled: addForm.after_delivery_enabled,
-          after_delivery_message: addForm.after_delivery_message,
-          ...(addForm.type === 'text' ? { text_content: content } : {}),
-          ...(addForm.type === 'data' ? { data_content: content } : {}),
-          ...(addForm.type === 'image' ? { image_url: content } : {}),
-          ...(addForm.type === 'api' ? { api_config: { url: content, method: 'GET' } } : {}),
-        };
-        await createCard(payload);
-      }
+      await appendCardInventory(addGroup.id, addContent.trim());
       setShowAddModal(false);
-      setAddForm({
-        name: '',
-        type: 'text',
-        content: '',
-        description: '',
-        enabled: true,
-        delay_seconds: 0,
-        after_delivery_enabled: true,
-        after_delivery_message: '感谢购买，卡密已发送，请查收。'
-      });
-      getCards().then(setCards);
+      setAddCardId('');
+      setAddContent('');
     } catch (error) {
       console.error('添加卡密失败:', error);
-      alert('添加失败，请重试');
+      alert(error instanceof Error ? error.message : '添加失败，请重试');
+      return;
+    } finally {
+      setAddingInventory(false);
     }
+    getCards().then(setCards).catch(error => console.error('刷新卡密库存失败:', error));
   };
 
   const toggleCardStatus = async (card: Card) => {
     try {
-      await updateCard(String(card.id), { ...card, enabled: !card.enabled });
+      await updateCard(String(card.id), { enabled: !card.enabled });
       getCards().then(setCards);
     } catch (error) {
       console.error('切换状态失败:', error);
@@ -766,18 +731,20 @@ const CardList: React.FC = () => {
             <div className="flex-1 overflow-y-auto -mr-2 pr-2">
               <div className="space-y-4">
                 <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">卡密分组</label>
+                  <label htmlFor="inventory-card-group" className="block text-sm font-bold text-gray-700 mb-2">卡密分组</label>
                   <select
-                    value={addForm.name}
-                    onChange={e => {
-                      const selected = cards.find(card => card.name === e.target.value);
-                      setAddForm({ ...addForm, name: e.target.value, type: selected?.type || addForm.type });
-                    }}
+                    id="inventory-card-group"
+                    value={addCardId}
+                    onChange={e => setAddCardId(e.target.value)}
+                    disabled={addingInventory}
                     className="w-full ios-input px-4 py-3 rounded-xl"
                   >
                     <option value="">请选择已有分组</option>
-                    {Array.from(new Map<string, Card>(cards.map(card => [card.name, card] as [string, Card])).values()).map(card => (
-                      <option key={card.id} value={card.name}>{card.name}（追加库存）</option>
+                    {cards.map(card => (
+                      <option key={card.id} value={String(card.id)} disabled={card.type === 'api'}>
+                        {[card.name, card.spec_value, card.spec_value_2, cardTypeLabels[card.type], `#${card.id}`,
+                          card.enabled ? '' : '已停用', card.type === 'api' ? '请编辑接口' : ''].filter(Boolean).join(' · ')}
+                      </option>
                     ))}
                   </select>
                   {cards.length === 0 && (
@@ -786,112 +753,17 @@ const CardList: React.FC = () => {
                 </div>
 
                 <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">类型</label>
-                  <div className="grid grid-cols-4 gap-2">
-                    <button
-                      type="button"
-                      disabled={Boolean(addForm.name)}
-                      onClick={() => setAddForm({ ...addForm, type: 'text' })}
-                      className={`p-3 rounded-xl font-bold transition-all ${addForm.type === 'text' ? 'bg-[#FFE815] text-black' : 'bg-gray-100 text-gray-600'}`}
-                    >
-                      <FileText className="w-5 h-5 mx-auto mb-1" />
-                      文本
-                    </button>
-                    <button
-                      type="button"
-                      disabled={Boolean(addForm.name)}
-                      onClick={() => setAddForm({ ...addForm, type: 'image' })}
-                      className={`p-3 rounded-xl font-bold transition-all ${addForm.type === 'image' ? 'bg-[#FFE815] text-black' : 'bg-gray-100 text-gray-600'}`}
-                    >
-                      <ImageIcon className="w-5 h-5 mx-auto mb-1" />
-                      图片
-                    </button>
-                    <button
-                      type="button"
-                      disabled={Boolean(addForm.name)}
-                      onClick={() => setAddForm({ ...addForm, type: 'api' })}
-                      className={`p-3 rounded-xl font-bold transition-all ${addForm.type === 'api' ? 'bg-[#FFE815] text-black' : 'bg-gray-100 text-gray-600'}`}
-                    >
-                      <Code className="w-5 h-5 mx-auto mb-1" />
-                      API
-                    </button>
-                    <button
-                      type="button"
-                      disabled={Boolean(addForm.name)}
-                      onClick={() => setAddForm({ ...addForm, type: 'data' })}
-                      className={`p-3 rounded-xl font-bold transition-all ${addForm.type === 'data' ? 'bg-[#FFE815] text-black' : 'bg-gray-100 text-gray-600'}`}
-                    >
-                      <Package className="w-5 h-5 mx-auto mb-1" />
-                      批量
-                    </button>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">
-                    {addForm.type === 'text' || addForm.type === 'data' ? '卡密内容（一行一个）' : addForm.type === 'image' ? '图片URL（一行一个）' : 'API地址'}
+                  <label htmlFor="inventory-card-content" className="block text-sm font-bold text-gray-700 mb-2">
+                    {addGroup?.type === 'image' ? '图片地址' : '新增内容'}
                   </label>
-                  {addForm.type === 'api' ? (
-                    <input
-                      type="text"
-                      value={addForm.content}
-                      onChange={(e) => setAddForm({ ...addForm, content: e.target.value })}
-                      placeholder="https://api.example.com/get-code"
-                      className="w-full ios-input px-4 py-3 rounded-xl"
-                    />
-                  ) : (
-                    <textarea
-                      value={addForm.content}
-                      onChange={(e) => setAddForm({ ...addForm, content: e.target.value })}
-                      className="w-full ios-input px-4 py-3 rounded-xl h-40 resize-none font-mono text-sm"
-                      placeholder={addForm.type === 'text' || addForm.type === 'data' ? 'CODE-123456\nCODE-789012\n...' : 'https://example.com/image1.jpg\nhttps://example.com/image2.jpg\n...'}
-                    />
-                  )}
-                </div>
-
-                <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">描述</label>
                   <textarea
-                    value={addForm.description}
-                    onChange={(e) => setAddForm({ ...addForm, description: e.target.value })}
-                    placeholder="卡密用途描述"
-                    className="w-full ios-input px-4 py-3 rounded-xl h-20 resize-none"
+                    id="inventory-card-content"
+                    value={addContent}
+                    onChange={e => setAddContent(e.target.value)}
+                    disabled={addingInventory}
+                    className="w-full ios-input px-4 py-3 rounded-xl h-40 resize-none font-mono text-sm"
+                    placeholder={addGroup?.type === 'data' ? '每行输入一张新卡密' : '输入要追加的内容'}
                   />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">延时发货（秒）</label>
-                  <input
-                    type="number"
-                    value={addForm.delay_seconds}
-                    onChange={(e) => setAddForm({ ...addForm, delay_seconds: parseInt(e.target.value) || 0 })}
-                    className="w-full ios-input px-4 py-3 rounded-xl"
-                    min="0"
-                    placeholder="0"
-                  />
-                </div>
-
-                <div className="border border-gray-200 rounded-xl p-4 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <p className="font-bold text-gray-900">发货后自动发消息</p>
-                      <p className="text-xs text-gray-500 mt-1">给买家发送一条后续消息</p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setAddForm({ ...addForm, after_delivery_enabled: !addForm.after_delivery_enabled })}
-                      className={`w-14 h-8 rounded-full transition-colors relative ${addForm.after_delivery_enabled ? 'bg-green-500' : 'bg-gray-300'}`}
-                    >
-                      <span className={`absolute top-1 w-6 h-6 bg-white rounded-full shadow transition-transform ${addForm.after_delivery_enabled ? 'translate-x-7' : 'translate-x-1'}`} />
-                    </button>
-                  </div>
-                  <textarea
-                    value={addForm.after_delivery_message}
-                    onChange={e => setAddForm({ ...addForm, after_delivery_message: e.target.value })}
-                    className="w-full ios-input px-4 py-3 rounded-xl h-20 resize-none"
-                    placeholder="例如：卡密已发送，请查收。"
-                  />
-                  <p className="text-xs text-gray-500">可用变量：{'{ITEM_ID}'}、{'{COUNT}'}、{'{CARD_GROUP}'}</p>
                 </div>
               </div>
             </div>
@@ -906,10 +778,11 @@ const CardList: React.FC = () => {
                 </button>
                 <button
                   onClick={handleAddCard}
-                  className="flex-1 ios-btn-primary px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2"
+                  disabled={addingInventory || !addGroup || addGroup.type === 'api' || !addContent.trim()}
+                  className="flex-1 ios-btn-primary px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2 disabled:opacity-50"
                 >
                   <Plus className="w-4 h-4" />
-                  添加卡密
+                  {addingInventory ? '正在添加' : '添加卡密'}
                 </button>
               </div>
             </div>

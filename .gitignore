@@ -98,6 +98,8 @@ global_config.yml
 # 测试文件
 test_*.py
 *_test.py
+!backend/tests/test_*.py
+!backend/tests/*.py
 keywords_sample.xlsx
 
 # 备份文件
@@ -399,6 +401,7 @@ personal_configs/
 *.runtime
 *.session
 session_*
+!backend/session_renewal.py
 runtime_*
 
 # 第三方服务配置
@@ -548,6 +551,8 @@ debug_*.py
 
 # 例外：tools/ 下的校验脚本是项目资产（如乱码检查、接口路径检查），需要入库
 !tools/check_*.py
+!backend/tests/test_*.py
+!backend/tests/*.py
 
 # 数据导出文件（避免提交用户数据）
 export_*.xlsx
@@ -842,3 +847,10 @@ browser_data/
 # 源码映射体积大且会泄露前端源码，构建产物不入库（前端源码已在 frontend/ 提供）
 static/assets/*.map
 *.js.map
+
+# 运行时独立捆绑环境与浏览器用户数据目录（体积大且为本地环境）
+runtime/
+desktop/browser-profile/
+desktop/*.log
+desktop/state.json
+desktop/.ready

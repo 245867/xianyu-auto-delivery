@@ -23,6 +23,15 @@ import sys
 import aiohttp
 from collections import defaultdict
 from db_manager import db_manager
+from spec_gate import (
+    REASON_GROUP_MISMATCH,
+    REASON_PARSE_FAILED,
+    card_spec_key,
+    check_spec_shape,
+    needs_detail_fetch,
+    order_spec_key,
+    spec_desc,
+)
 
 # 滑块验证补丁已废弃，使用集成的 Playwright 登录方法
 # 不再需要猴子补丁，所有功能已集成到 XianyuSliderStealth 类中
@@ -138,7 +147,10 @@ def log_captcha_event(cookie_id: str, event_type: str, success: bool = None, det
 log_dir = 'logs'
 os.makedirs(log_dir, exist_ok=True)
 log_path = os.path.join(log_dir, f"xianyu_{time.strftime('%Y-%m-%d')}.log")
-logger.remove()
+try:
+    logger.remove(0)
+except ValueError:
+    pass
 logger.add(
     log_path,
     rotation=LOG_CONFIG.get('rotation', '1 day'),
@@ -215,6 +227,18 @@ class XianyuLive:
             else:
                 logger.info(state_msg)
 
+            # 诊断通知（覆盖）：掉线推一次，恢复补一条；重连风暴由 notify_service 去重。
+            # 只在**状态真的变了**的时候走到这里，所以不会每几秒刷一次。
+            try:
+                import notify_service as _notify
+                if new_state == ConnectionState.FAILED:
+                    _notify.notify_account_state(self.cookie_id, "failed", reason)
+                elif new_state == ConnectionState.CONNECTED and old_state in (
+                        ConnectionState.FAILED, ConnectionState.RECONNECTING):
+                    _notify.notify_account_state(self.cookie_id, "recovered", reason)
+            except Exception:
+                pass
+
     async def _interruptible_sleep(self, duration: float):
         """可中断的sleep，将长时间sleep拆分成多个短时间sleep，以便及时响应取消信号
         
@@ -234,52 +258,23 @@ class XianyuLive:
                 # 如果收到取消信号，立即抛出
                 raise
 
-    def _reset_background_tasks(self):
-        """直接重置后台任务引用，不等待取消（用于快速重连）
-        
-        注意：只重置心跳任务，因为只有心跳任务依赖WebSocket连接。
-        其他任务（Token刷新、清理、Cookie刷新）不依赖WebSocket，可以继续运行。
-        """
-        logger.info(f"【{self.cookie_id}】准备重置后台任务引用（仅重置依赖WebSocket的任务）...")
-        
-        # 只处理心跳任务（依赖WebSocket，需要重启）
-        if self.heartbeat_task:
-            status = "已完成" if self.heartbeat_task.done() else "运行中"
-            logger.info(f"【{self.cookie_id}】发现心跳任务（状态: {status}），需要重置（因为依赖WebSocket连接）")
-            # 尝试取消心跳任务（但不等待）
-            if not self.heartbeat_task.done():
-                try:
-                    self.heartbeat_task.cancel()
-                    logger.debug(f"【{self.cookie_id}】已发送取消信号给心跳任务（不等待响应）")
-                except Exception as e:
-                    logger.warning(f"【{self.cookie_id}】取消心跳任务失败: {e}")
-            # 重置心跳任务引用
-            self.heartbeat_task = None
-            logger.info(f"【{self.cookie_id}】心跳任务引用已重置")
-        else:
-            logger.info(f"【{self.cookie_id}】没有心跳任务需要重置")
-        
-        # 检查其他任务的状态（这些任务不依赖WebSocket，不需要重启）
-        other_tasks_status = []
-        if self.token_refresh_task:
-            status = "已完成" if self.token_refresh_task.done() else "运行中"
-            other_tasks_status.append(f"Token刷新任务({status})")
-        if self.cleanup_task:
-            status = "已完成" if self.cleanup_task.done() else "运行中"
-            other_tasks_status.append(f"清理任务({status})")
-        if self.cookie_refresh_task:
-            status = "已完成" if self.cookie_refresh_task.done() else "运行中"
-            other_tasks_status.append(f"Cookie刷新任务({status})")
-        if self.item_sync_task:
-            status = "已完成" if self.item_sync_task.done() else "运行中"
-            other_tasks_status.append(f"商品同步任务({status})")
+    def _start_heartbeat(self):
+        if self.connection_state != ConnectionState.CONNECTED or not self.ws or self.ws.closed:
+            return
+        if self.heartbeat_task and not self.heartbeat_task.done():
+            return
+        self._heartbeat_stop.clear()
+        self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
+        logger.info(f"【{self.cookie_id}】启动心跳任务")
 
-        if other_tasks_status:
-            logger.info(f"【{self.cookie_id}】其他任务继续运行（不依赖WebSocket）: {', '.join(other_tasks_status)}")
-        else:
-            logger.info(f"【{self.cookie_id}】没有其他任务在运行")
-        
-        logger.info(f"【{self.cookie_id}】任务重置完成，可以立即创建新的心跳任务")
+    async def _stop_heartbeat(self):
+        task = self.heartbeat_task
+        if task is None:
+            return
+        self._heartbeat_stop.set()
+        await asyncio.wait({task})
+        if self.heartbeat_task is task:
+            self.heartbeat_task = None
 
     async def _cancel_background_tasks(self):
         """取消并清理所有后台任务（保留此方法用于程序退出时的完整清理）"""
@@ -668,6 +663,7 @@ class XianyuLive:
         self.last_heartbeat_time = 0
         self.last_heartbeat_response = 0
         self.heartbeat_task = None
+        self._heartbeat_stop = asyncio.Event()
         self.ws = None
 
         # Token刷新相关配置
@@ -827,7 +823,14 @@ class XianyuLive:
 
 
     def can_auto_delivery(self, order_id: str) -> bool:
-        """检查是否可以进行自动发货（防重复发货）- 基于订单ID"""
+        """检查是否可以进行自动发货（防重复发货）- 基于订单ID
+
+        两层判重，缺一不可：
+        1. 内存冷却（600s）：挡住同一进程内的高频重复触发；
+        2. 数据库 system_shipped：**重启后内存清空，这层才是真正的兜底**。
+           原来只有第 1 层，而且 last_delivery_time 从来没有被写入过（永远读到 0），
+           等于判重完全没生效——重启一次就可能对同一订单重发卡密。
+        """
         if not order_id:
             # 如果没有订单ID，则不进行冷却检查，允许发货
             return True
@@ -839,11 +842,29 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】订单 {order_id} 在冷却期内，跳过自动发货")
             return False
 
+        # 数据库兜底：这个订单本机已经发过货，就不再发第二次
+        try:
+            from db_manager import db_manager
+            order = db_manager.get_order_by_id(order_id)
+            if order and order.get("dropship_status"):
+                return False
+            if db_manager.is_voucher_async_order(order_id, self.cookie_id):
+                return False
+            if db_manager.is_order_system_shipped(order_id):
+                logger.warning(f"【{self.cookie_id}】订单 {order_id} 数据库中已标记为已发货，跳过重复发货")
+                return False
+        except Exception as e:
+            # 查不到就按"没发过"处理？不行——宁可漏发让人工补，也不能重复发卡密。
+            logger.error(f"【{self.cookie_id}】检查订单 {order_id} 发货记录失败，保守跳过: {self._safe_str(e)}")
+            return False
+
         return True
 
     def mark_delivery_sent(self, order_id: str):
         """标记订单已发货"""
         self.delivery_sent_orders.add(order_id)
+        # 关键：冷却时间必须在这里落笔，否则 can_auto_delivery 永远读到 0
+        self.last_delivery_time[order_id] = time.time()
         logger.info(f"【{self.cookie_id}】订单 {order_id} 已标记为发货")
         
         # 更新订单状态为已发货
@@ -971,25 +992,40 @@ class XianyuLive:
 
     
 
-    def _is_auto_delivery_trigger(self, message: str) -> bool:
-        """检查消息是否为自动发货触发关键字"""
-        # 定义所有自动发货触发关键字
+    def _is_auto_delivery_trigger(self, message: str,
+                                  raw_message: dict | None = None) -> bool:
+        """
+        检查消息是否为真实交易卡触发的自动发货。
+
+        只看文本等于关键字不够：普通聊天也能发出同样的文字。这里还要求消息
+        使用交易卡结构（实测为 message["1"]["6"]["1"]=101，
+        message["1"]["6"]["3"]["4"]=26），否则买家拼一段文字就能伪造付款通知。
+        """
         auto_delivery_keywords = [
-            # 系统消息
             '[我已付款，等待你发货]',
             '[已付款，待发货]',
             '我已付款，等待你发货',
             '[记得及时发货]',
         ]
+        if str(message or "").strip() not in auto_delivery_keywords:
+            return False
+        if not isinstance(raw_message, dict):
+            return False
+        message_1 = raw_message.get("1")
+        if not isinstance(message_1, dict):
+            return False
+        message_1_6 = message_1.get("6")
+        if not isinstance(message_1_6, dict):
+            return False
+        message_1_6_3 = message_1_6.get("3")
+        if not isinstance(message_1_6_3, dict):
+            return False
+        return (
+            str(message_1_6.get("1", "")).strip() == "101"
+            and str(message_1_6_3.get("4", "")).strip() == "26"
+        )
 
-        # 检查消息是否包含任何触发关键字
-        for keyword in auto_delivery_keywords:
-            if keyword in message:
-                return True
-
-        return False
-
-    def _extract_order_id(self, message: dict) -> str:
+    def _extract_order_id(self, message: dict, strict: bool = False) -> str:
         """从消息中提取订单ID"""
         try:
             order_id = None
@@ -1064,8 +1100,10 @@ class XianyuLive:
                 except Exception as parse_e:
                     logger.warning(f"解析dynamicOperation JSON失败: {parse_e}")
 
-            # 方法3: 如果前面的方法都失败，尝试在整个消息中搜索订单ID模式
-            if not order_id:
+            # 方法3: 普通消息解析允许全消息兜底；自动发货发送路径必须传
+            # strict=True，只接受交易卡里的结构化订单号，避免把普通聊天中
+            # 拼进来的 orderId 当成当前买家的订单。
+            if not order_id and not strict:
                 try:
                     # 将整个消息转换为字符串进行搜索
                     message_str = str(message)
@@ -1100,10 +1138,858 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】提取订单ID失败: {self._safe_str(e)}")
             return None
 
+    async def _send_delivery_card(self, websocket, chat_id: str, send_user_id: str,
+                                  delivery_content: str, index: int, total: int,
+                                  user_url: str, msg_time: str):
+        """
+        发出**一张**卡（文本或图片）。失败就抛异常，由调用方记账。
+
+        抽出来是为了让"发第几张、发失败了怎么办"这件事在调用处可读：
+        发送本身无状态，状态全在 delivery_reliability 的账本里。
+        """
+        import delivery_reliability as dr
+
+        try:
+            if delivery_content.startswith("__IMAGE_SEND__"):
+                image_data = delivery_content.replace("__IMAGE_SEND__", "", 1)
+                if "|" in image_data:
+                    card_id_str, image_url = image_data.split("|", 1)
+                    try:
+                        card_id = int(card_id_str)
+                    except ValueError:
+                        logger.error(f"无效的卡券ID: {card_id_str}")
+                        card_id = None
+                else:
+                    card_id = None
+                    image_url = image_data
+                await self.send_image_msg(websocket, chat_id, send_user_id, image_url, card_id=card_id)
+                if total > 1:
+                    logger.info(f'[{msg_time}] 【多数量自动发货图片】第 {index+1}/{total} 张已提交到连接: {image_url}')
+                else:
+                    logger.info(f'[{msg_time}] 【自动发货图片】已提交到连接: {image_url}')
+            else:
+                await self.send_msg(websocket, chat_id, send_user_id, delivery_content)
+                if total > 1:
+                    logger.info(f'[{msg_time}] 【多数量自动发货】第 {index+1}/{total} 条已提交到连接')
+                else:
+                    logger.info(f'[{msg_time}] 【自动发货】已提交到连接')
+        except (dr.DeliverySubmissionNotAttempted, dr.DeliverySubmissionUnknown):
+            raise
+        except Exception as exc:
+            # 进入这里说明消息尚未拼装完成或发送前校验失败。websocket.send
+            # 自身的异常已由 send_msg/send_image_msg 标成结果未知。
+            raise dr.DeliverySubmissionNotAttempted(
+                f"发货内容准备失败：{self._safe_str(exc)}"
+            ) from exc
+
+    async def _handle_self_service_resend(self, websocket, message_data: dict,
+                                          send_user_name: str, send_user_id: str,
+                                          send_message: str, chat_id: str, msg_time: str,
+                                          session_type: str | None = None):
+        """
+        买家回复“1/提取”时，重发当前买家两小时内最近一单的已发卡密。
+
+        这里只读原 delivery_cards，并另外登记一次请求。原卡已是 sent，
+        绝不能调用 claim_card()/mark_sent()，否则会把“补发”误记成首次发送。
+        """
+        import delivery_reliability as dr
+
+        effective_session_type = str(session_type or "").strip()
+        if not effective_session_type:
+            try:
+                effective_session_type = str(
+                    message_data["1"]["10"].get("sessionType", "1")
+                ).strip()
+            except (KeyError, TypeError):
+                effective_session_type = "1"
+        if effective_session_type == "30":
+            logger.warning(
+                f"【{self.cookie_id}】检测到群聊消息，自助补发已跳过"
+            )
+            return
+
+        buyer_id = str(send_user_id or "").strip()
+        own_user_id = str(getattr(self, "myid", "") or "").strip()
+        if not buyer_id or buyer_id in ("unknown", "unknown_user") or buyer_id == own_user_id:
+            logger.warning(f"【{self.cookie_id}】自助补发缺少有效买家 ID，已跳过")
+            return
+
+        request_key = self._reply_outbox_key(message_data, chat_id, send_message)
+        try:
+            acquired = dr.begin_self_service_request(
+                request_key, self.cookie_id, buyer_id, chat_id=chat_id,
+            )
+        except Exception as exc:
+            logger.error(f"【{self.cookie_id}】登记自助补发请求失败: {self._safe_str(exc)}")
+            return
+
+        if not acquired.get("allowed"):
+            logger.info(
+                f"【{self.cookie_id}】自助补发未重复执行: "
+                f"reason={acquired.get('reason')} buyer={buyer_id}"
+            )
+            return
+
+        delivery = None
+        try:
+            delivery = dr.latest_sent_delivery(self.cookie_id, buyer_id, within_hours=2)
+            if not delivery or not delivery.get("cards"):
+                finished = dr.finish_self_service_request(
+                    request_key, self.cookie_id, "no_delivery", last_error="两小时内没有可补发的已发卡密",
+                )
+                if not finished:
+                    raise RuntimeError("自助补发请求账本已不存在")
+                logger.info(f"【{self.cookie_id}】自助补发未找到买家 {buyer_id} 的两小时已发订单")
+                return
+
+            order_id = str(delivery.get("order_id") or "")
+            item_id = str(delivery.get("item_id") or "")
+            cards = delivery.get("cards") or []
+            ledger_chat_id = str(delivery.get("chat_id") or "").strip()
+            current_chat_id = str(chat_id or "").strip()
+            if not ledger_chat_id or ledger_chat_id != current_chat_id:
+                reason = (
+                    "当前消息会话与已发卡密订单会话不一致，已停止自助补发"
+                )
+                dr.finish_self_service_request(
+                    request_key,
+                    self.cookie_id,
+                    "failed",
+                    order_id=order_id,
+                    last_error=reason,
+                )
+                logger.warning(f"【{self.cookie_id}】订单 {order_id} {reason}")
+                return
+            target_chat_id = ledger_chat_id
+            target_ws = websocket if websocket is not None else getattr(self, "ws", None)
+            if target_ws is None:
+                raise RuntimeError("当前账号 WebSocket 连接不可用")
+
+            from db_manager import db_manager
+            from order_status_rules import delivery_check
+            from rate_limiter import gate_write
+            from ship_verify import verify
+
+            order = db_manager.get_order_by_id(order_id)
+            if not order:
+                reason = f"订单 {order_id} 不在本地订单账本，已停止自助补发"
+                dr.finish_self_service_request(
+                    request_key,
+                    self.cookie_id,
+                    "failed",
+                    order_id=order_id,
+                    last_error=reason,
+                )
+                logger.warning(f"【{self.cookie_id}】{reason}")
+                return
+
+            order_identity = (
+                str(order.get("cookie_id") or ""),
+                str(order.get("item_id") or ""),
+                str(order.get("buyer_id") or ""),
+            )
+            if (
+                not all(order_identity)
+                or order_identity[0] != self.cookie_id
+                or not item_id
+                or order_identity[1] != item_id
+                or order_identity[2] != buyer_id
+            ):
+                reason = "本地订单的账号、商品或买家与已发卡密账本不一致，已停止自助补发"
+                dr.finish_self_service_request(
+                    request_key,
+                    self.cookie_id,
+                    "failed",
+                    order_id=order_id,
+                    last_error=reason,
+                )
+                logger.error(f"【{self.cookie_id}】订单 {order_id} {reason}")
+                return
+
+            if order.get("dropship_status"):
+                dr.finish_self_service_request(
+                    request_key, self.cookie_id, "failed",
+                    order_id=order_id, last_error="实物代拍订单不允许补发卡密",
+                )
+                return
+            if db_manager.is_voucher_async_order(order_id, self.cookie_id):
+                dr.finish_self_service_request(
+                    request_key, self.cookie_id, "failed",
+                    order_id=order_id, last_error="异步充值订单由充值渠道履约",
+                )
+                return
+
+            from order_status_rules import cross_shop_block_reason
+            blocked = cross_shop_block_reason(db_manager, buyer_id)
+            if blocked:
+                dr.finish_self_service_request(
+                    request_key, self.cookie_id, "failed", order_id=order_id, last_error=blocked,
+                )
+                return
+
+            status_check = delivery_check(
+                order.get("order_status") or order.get("status")
+            )
+            blocked_statuses = {"cancelled", "refund_cancelled", "refunding", "completed"}
+            if (
+                status_check["status"] in blocked_statuses
+                or (not status_check["ok"] and status_check["status"] != "shipped")
+            ):
+                reason = (
+                    f"订单状态为 {status_check['status']}，不允许自助补发："
+                    f"{status_check['reason']}"
+                )
+                dr.finish_self_service_request(
+                    request_key,
+                    self.cookie_id,
+                    "failed",
+                    order_id=order_id,
+                    last_error=reason,
+                )
+                logger.warning(f"【{self.cookie_id}】{reason}")
+                return
+
+            platform_check = await asyncio.to_thread(
+                verify,
+                order_id,
+                self.cookies_str,
+                self.cookie_id,
+                expect_buyer=buyer_id,
+                expect_item=item_id,
+                max_age=0,
+                allow_already_shipped=True,
+            )
+            if not platform_check.get("ok"):
+                reason = (
+                    "平台订单复核未通过，已停止自助补发："
+                    f"{platform_check.get('reason') or '平台明确拒绝'}"
+                )
+                dr.finish_self_service_request(
+                    request_key,
+                    self.cookie_id,
+                    "failed",
+                    order_id=order_id,
+                    last_error=reason,
+                )
+                logger.warning(f"【{self.cookie_id}】订单 {order_id} {reason}")
+                return
+
+            user_url = f"https://www.goofish.com/personal?userId={buyer_id}"
+            sent_count = 0
+            skipped_reasons = []
+            for index, card in enumerate(cards):
+                blocked = cross_shop_block_reason(db_manager, buyer_id)
+                if blocked:
+                    raise RuntimeError(blocked)
+                claimed = dr.claim_self_service_card(
+                    self.cookie_id,
+                    buyer_id,
+                    order_id,
+                    int(card.get("idx", index)),
+                    owner=f"self-service-{os.getpid()}",
+                )
+                if not claimed.get("claimed"):
+                    skipped_reasons.append(str(claimed.get("reason") or "unknown"))
+                    continue
+                lease_token = str(
+                    (claimed.get("card") or {}).get("lease_token") or ""
+                )
+                prefix = "__IMAGE_SEND__" if card.get("kind") == "image" else ""
+                content = prefix + str(card.get("payload") or "")
+                allowed, retry_after = gate_write(self.cookie_id)
+                if not allowed:
+                    limit_reason = (
+                        f"账号写入限流，建议 {int(retry_after)} 秒后重试；"
+                        f"本次已补发 {sent_count}/{len(cards)} 张"
+                    )
+                    dr.finish_self_service_card(
+                        self.cookie_id,
+                        buyer_id,
+                        order_id,
+                        int(card.get("idx", index)),
+                        "failed",
+                        token=lease_token,
+                        last_error=limit_reason,
+                    )
+                    if sent_count == 0:
+                        dr.finish_self_service_request(
+                            request_key,
+                            self.cookie_id,
+                            "failed",
+                            order_id=order_id,
+                            last_error=limit_reason,
+                        )
+                        logger.warning(
+                            f"【{self.cookie_id}】订单 {order_id} 自助补发未开始："
+                            f"{limit_reason}"
+                        )
+                        return
+                    raise RuntimeError(limit_reason)
+                try:
+                    await self._send_delivery_card(
+                        target_ws,
+                        target_chat_id,
+                        buyer_id,
+                        content,
+                        index,
+                        len(cards),
+                        user_url,
+                        f"{msg_time}[自助补发]",
+                    )
+                except dr.DeliverySubmissionNotAttempted as exc:
+                    dr.finish_self_service_card(
+                        self.cookie_id,
+                        buyer_id,
+                        order_id,
+                        int(card.get("idx", index)),
+                        "failed",
+                        token=lease_token,
+                        last_error=self._safe_str(exc),
+                    )
+                    raise
+                except Exception as exc:
+                    uncertain = not isinstance(exc, dr.DeliverySubmissionUnknown)
+                    dr.finish_self_service_card(
+                        self.cookie_id,
+                        buyer_id,
+                        order_id,
+                        int(card.get("idx", index)),
+                        "unknown",
+                        token=lease_token,
+                        last_error=(
+                            self._safe_str(exc)
+                            if uncertain
+                            else self._safe_str(exc)
+                        ),
+                    )
+                    raise
+                if not dr.finish_self_service_card(
+                    self.cookie_id,
+                    buyer_id,
+                    order_id,
+                    int(card.get("idx", index)),
+                    "sent",
+                    token=lease_token,
+                ):
+                    raise RuntimeError(
+                        f"自助补发第 {index + 1} 张已写出，但逐卡租约已失效"
+                    )
+                sent_count += 1
+                if index < len(cards) - 1:
+                    await asyncio.sleep(1)
+
+            unresolved = [reason for reason in skipped_reasons if reason != "sent"]
+            if unresolved:
+                raise RuntimeError(
+                    "自助补发存在未决卡位，已停止继续发送："
+                    f"reasons={','.join(sorted(set(unresolved)))}；"
+                    f"本次已补发 {sent_count}/{len(cards)} 张"
+                )
+            finished = dr.finish_self_service_request(
+                request_key,
+                self.cookie_id,
+                "sent",
+                order_id=order_id,
+                card_count=sent_count,
+            )
+            if not finished:
+                raise RuntimeError("自助补发请求账本已不存在")
+            logger.info(
+                f"【{self.cookie_id}】买家 {buyer_id} 自助补发完成: "
+                f"订单 {order_id}，本次 {sent_count} 张"
+            )
+        except Exception as exc:
+            error = f"自助补发失败: {self._safe_str(exc)}"
+            order_id = str((delivery or {}).get("order_id") or "")
+            item_id = str((delivery or {}).get("item_id") or "")
+            try:
+                dr.finish_self_service_request(
+                    request_key, self.cookie_id, "unknown",
+                    order_id=order_id, last_error=error,
+                )
+            except Exception as ledger_exc:
+                logger.critical(
+                    f"【{self.cookie_id}】自助补发结果未知，请求账本结算也失败: "
+                    f"{self._safe_str(ledger_exc)}"
+                )
+            logger.error(
+                f"【{self.cookie_id}】买家 {buyer_id} 自助补发异常: {self._safe_str(exc)}"
+            )
+            try:
+                from notify_service import send_event
+                send_event(
+                    "risk",
+                    "闲鱼自助补发失败",
+                    f"账号 {self.cookie_id}，买家 {buyer_id}，订单 {order_id or '未知'}：{error}",
+                    level="err",
+                )
+            except Exception:
+                pass
+            try:
+                await self.send_delivery_failure_notification(
+                    send_user_name, buyer_id, item_id, error, chat_id,
+                )
+            except Exception as notify_exc:
+                logger.error(f"【{self.cookie_id}】发送自助补发失败通知失败: {self._safe_str(notify_exc)}")
+
+    async def _prepare_delivery_contents(self, item_id, item_title, order_id, buyer_id, quantity, ctx,
+                                         chat_id: str = ""):
+        """按账本中的位置沿用已取出的卡密，只为无内容的位置取货。"""
+        import delivery_reliability as dr
+        from db_manager import db_manager
+
+        if db_manager.is_voucher_async_order(order_id, self.cookie_id):
+            raise ValueError("异步充值订单由充值渠道履约")
+
+        contents = [""] * quantity
+        for row in dr.cards(order_id, self.cookie_id):
+            idx = row["idx"]
+            if not 0 <= idx < quantity or row["item_id"] not in ("", item_id):
+                raise ValueError("订单数量或商品与已有发货记录不一致，请核对")
+            if row["payload"]:
+                prefix = "__IMAGE_SEND__" if row["kind"] == "image" else ""
+                contents[idx] = prefix + row["payload"]
+        missing = [idx for idx, content in enumerate(contents) if not content]
+        if missing:
+            allocated = await self._auto_delivery(
+                item_id, item_title, order_id, buyer_id, ctx=ctx, quantity=len(missing),
+            )
+            for idx, content in zip(missing, allocated or []):
+                contents[idx] = content
+            missing = [idx for idx, content in enumerate(contents) if not content]
+
+            rule = (ctx or {}).get("rule") or {}
+            if missing and rule.get("card_type") == "data":
+                try:
+                    from delivery_supplier_procurement import DeliverySupplierProcurement
+                    from db_manager import db_manager
+
+                    service = getattr(self, "_supplier_delivery_procurement", None)
+                    if service is None:
+                        service = DeliverySupplierProcurement()
+                        self._supplier_delivery_procurement = service
+
+                    card_id = int(rule.get("card_id") or 0)
+                    binding = await asyncio.to_thread(
+                        service.store.get_binding,
+                        self.cookie_id,
+                        item_id,
+                        card_id,
+                    )
+                    if binding is not None:
+                        row = db_manager.get_order_by_id(order_id) or {}
+                        if not str(row.get("amount") or "").strip():
+                            try:
+                                await self.fetch_order_detail_info(
+                                    order_id,
+                                    item_id,
+                                    buyer_id,
+                                )
+                            except Exception as detail_exc:
+                                logger.warning(
+                                    f"【{self.cookie_id}】供应商采购前获取订单金额失败，"
+                                    f"将继续由利润熔断判定: {self._safe_str(detail_exc)}"
+                                )
+
+                        card_description = str(rule.get("card_description") or "")
+
+                        def transform_supplier_code(code: str) -> str:
+                            return self._process_delivery_content_with_description(
+                                code,
+                                card_description,
+                            )
+
+                        decision = await asyncio.to_thread(
+                            service.procure,
+                            cookie_id=self.cookie_id,
+                            item_id=item_id,
+                            card_id=card_id,
+                            order_id=order_id,
+                            buyer_id=buyer_id,
+                            quantity=len(missing),
+                            chat_id=chat_id,
+                            spec=str((ctx or {}).get("order_spec") or ""),
+                            target_indices=tuple(missing),
+                            code_transform=transform_supplier_code,
+                        )
+                        ctx["supplier_procurement"] = decision.public_payload()
+                        if decision.ok:
+                            contents = [""] * quantity
+                            for card in dr.cards(order_id, self.cookie_id):
+                                idx = int(card["idx"])
+                                if not 0 <= idx < quantity or card["item_id"] not in ("", item_id):
+                                    raise ValueError("供应商采购后账本位置或商品不一致")
+                                if card["payload"]:
+                                    prefix = "__IMAGE_SEND__" if card["kind"] == "image" else ""
+                                    contents[idx] = prefix + card["payload"]
+                            still_missing = [
+                                idx for idx, content in enumerate(contents) if not content
+                            ]
+                            if still_missing:
+                                message = (
+                                    "供应商采购返回成功，但发货账本仍缺少位置："
+                                    + ",".join(str(idx) for idx in still_missing)
+                                )
+                                ctx["supplier_procurement_error"] = message
+                                logger.critical(
+                                    f"【{self.cookie_id}】订单 {order_id} {message}"
+                                )
+                        else:
+                            logger.error(
+                                f"【{self.cookie_id}】订单 {order_id} 供应商采购停单："
+                                f"{decision.status.value}，{decision.message}"
+                            )
+                except Exception as procurement_exc:
+                    message = (
+                        "供应商自动采购接线异常，已整单停发："
+                        f"{type(procurement_exc).__name__}: "
+                        f"{self._safe_str(procurement_exc)}"
+                    )
+                    ctx["supplier_procurement_error"] = message
+                    logger.critical(
+                        f"【{self.cookie_id}】订单 {order_id} {message}"
+                    )
+        return contents
+
+    async def deliver_order_manually(self, order_id, item_id, buyer_id, chat_id):
+        """在账号队列发货，按已有账本续发尚未发送的卡密。"""
+        import delivery_reliability as dr
+        from db_manager import db_manager
+        from order_status_rules import cross_shop_block_reason, delivery_check
+        from rate_limiter import gate_write
+        from ship_verify import verify
+
+        async with self._order_locks[order_id]:
+            order = db_manager.get_order_by_id(order_id)
+            if not order or (order["cookie_id"], order["item_id"], order["buyer_id"]) != (self.cookie_id, item_id, buyer_id):
+                return {"success": False, "message": "订单信息已变更，请刷新后重试"}
+            if order.get("dropship_status"):
+                return {"success": False, "reason_code": "physical_dropship", "message": "实物代拍订单须使用物流发货"}
+            if db_manager.is_voucher_async_order(order_id, self.cookie_id):
+                return {"success": False, "reason_code": "voucher_async", "message": "异步充值订单由充值渠道履约"}
+            blocked = cross_shop_block_reason(db_manager, buyer_id)
+            if blocked:
+                return {"success": False, "reason_code": "cross_shop_blacklist", "message": blocked}
+            if db_manager.is_order_system_shipped(order_id):
+                return {"success": False, "reason_code": "already_shipped", "message": "订单卡密已发齐"}
+            state = delivery_check(order.get("order_status"))
+            if not state["ok"]:
+                return {"success": False, "reason_code": "order_status", "message": state["reason"]}
+            if not self.ws or self.ws.closed:
+                return {"success": False, "message": "账号连接已断开，请在恢复连接后重试"}
+
+            quantity = 1
+            if db_manager.get_item_multi_quantity_delivery_status(self.cookie_id, item_id):
+                detail = await self.fetch_order_detail_info(order_id, item_id, buyer_id)
+                raw_quantity = (detail or {}).get("quantity") or order.get("quantity")
+                try:
+                    quantity = int(str(raw_quantity).strip())
+                    if quantity < 1:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    return {"success": False, "message": "未核实订单数量，请刷新订单后重试"}
+
+            checked = await asyncio.to_thread(verify, order_id, self.cookies_str, self.cookie_id, expect_buyer=str(buyer_id))
+            if not checked["ok"]:
+                return {"success": False, "message": checked.get("reason") or "平台订单不可发货"}
+
+            blocked = cross_shop_block_reason(db_manager, buyer_id)
+            if blocked:
+                return {"success": False, "reason_code": "cross_shop_blacklist", "message": blocked}
+            ctx = {}
+            contents = await self._prepare_delivery_contents(
+                item_id,
+                "",
+                order_id,
+                buyer_id,
+                quantity,
+                ctx,
+                chat_id=chat_id,
+            )
+            order_refs = {"item_id": item_id, "chat_id": chat_id, "buyer_id": buyer_id, "spec": ctx.get("order_spec") or ""}
+            dr.ensure_order(order_id, self.cookie_id, contents, **order_refs)
+            allocated = sum(bool(content) for content in contents)
+            if allocated < quantity:
+                for idx, content in enumerate(contents):
+                    if not content:
+                        dr.record_missing(order_id, self.cookie_id, idx, 1, **order_refs)
+                available = allocated + ctx.get("available", 0)
+                message = f"库存不足：订单需要 {quantity} 张，可用 {available} 张，已整单停发"
+                dr.mark_shortage(order_id, self.cookie_id, quantity, allocated, message)
+                return {"success": False, "reason_code": "stock_shortage", "message": message}
+
+            dr.reap_expired_leases()
+            user_url = f"https://www.goofish.com/personal?userId={buyer_id}"
+            for idx, content in enumerate(contents):
+                claimed = dr.claim_card(order_id, self.cookie_id, idx, owner=f"manual-{os.getpid()}", allow_failed=True)
+                if not claimed["claimed"]:
+                    continue
+                token = claimed["card"]["lease_token"]
+                if not gate_write(self.cookie_id)[0]:
+                    dr.defer_unsent_card(order_id, self.cookie_id, idx, token)
+                    break
+                if db_manager.is_voucher_async_order(order_id, self.cookie_id):
+                    dr.defer_unsent_card(order_id, self.cookie_id, idx, token)
+                    return {"success": False, "reason_code": "voucher_async", "message": "异步充值订单由充值渠道履约"}
+                try:
+                    from pickup_service import prepare_delivery_message
+
+                    message = await prepare_delivery_message(order_id, self.cookie_id, buyer_id, content)
+                    blocked = cross_shop_block_reason(db_manager, buyer_id)
+                    if blocked:
+                        dr.defer_unsent_card(order_id, self.cookie_id, idx, token)
+                        return {"success": False, "reason_code": "cross_shop_blacklist", "message": blocked}
+                    await self._send_delivery_card(self.ws, chat_id, buyer_id, message, idx, quantity, user_url, "[手动发货]")
+                except Exception as exc:
+                    dr.record_send_exception(order_id, self.cookie_id, idx, exc, token=token)
+                else:
+                    try:
+                        if not dr.mark_sent(order_id, self.cookie_id, idx, token=token):
+                            logger.warning(
+                                f"【{self.cookie_id}】手动发货订单 {order_id} 卡 {idx+1} "
+                                "已写出，但租约已被接管；本次状态结论作废"
+                            )
+                    except Exception as ledger_exc:
+                        logger.critical(
+                            f"【{self.cookie_id}】消息已写出，但发货账本结算失败，"
+                            f"订单 {order_id} 卡 {idx+1} 将按租约过期转人工：{self._safe_str(ledger_exc)}"
+                        )
+                if idx < quantity - 1:
+                    await asyncio.sleep(1)
+
+            summary = dr.summary(order_id, self.cookie_id)
+            if not summary["all_sent"]:
+                return {
+                    "success": False, "partial": 0 < summary["sent"] < quantity,
+                    "reason_code": "partial_send",
+                    "message": f"已发 {summary['sent']}/{quantity} 张，重试会继续处理未发出的卡密",
+                }
+            if db_manager.is_order_system_shipped(order_id):
+                return {"success": True, "message": f"已发送 {quantity} 张卡密"}
+            self.mark_delivery_sent(order_id)
+            db_manager.insert_or_update_order(order_id=order_id, system_shipped=True, chat_id=chat_id)
+            confirmed = await self._confirm_platform_shipped(order_id, item_id, "[手动发货]", force=True)
+            if confirmed:
+                db_manager.insert_or_update_order(order_id=order_id, order_status="shipped")
+            message = f"已发送 {quantity} 张卡密"
+            if not confirmed:
+                message += "，闲鱼发货状态待确认"
+            return {"success": True, "message": message}
+
+    async def _resend_undelivered(self, ws, limit: int = 5) -> int:
+        """
+        补发扫描（C3）。发的是**账本里存的那份内容**，不是去卡池再取一张新的。
+
+        发之前必须再确认一次订单还有效 —— 退款/关闭的单补发等于再送一份货。
+        """
+        try:
+            from db_manager import db_manager
+            import delivery_reliability as dr
+            from order_status_rules import cross_shop_block_reason
+            from rate_limiter import circuit_blocked, gate_write
+            if db_manager.is_account_automation_silent(self.cookie_id):
+                return 0
+            cfg = dr.get_config()
+            if not cfg.get("auto_resend") or circuit_blocked(self.cookie_id)[0]:
+                return 0
+        except Exception:
+            return 0
+
+        try:
+            dr.reap_expired_leases()
+        except Exception:
+            pass
+
+        done = 0
+        try:
+            cands = [c for c in dr.resend_candidates(limit=limit * 3)
+                     if c.get("cookie_id") == self.cookie_id][:limit]
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】读取补发候选失败: {self._safe_str(e)}")
+            return 0
+
+        for cand in cands:
+            order_id = cand["order_id"]
+            try:
+                from order_status_rules import delivery_check
+                from db_manager import db_manager as _dbm_r
+                _row = _dbm_r.get_order_by_id(order_id)
+                if not _row:
+                    dr.mark_unknown(
+                        order_id,
+                        cand["cookie_id"],
+                        cand["idx"],
+                        "本地订单账本不存在，补发转人工",
+                    )
+                    continue
+                _identity = (
+                    str(_row.get("cookie_id") or ""),
+                    str(_row.get("item_id") or ""),
+                    str(_row.get("buyer_id") or ""),
+                )
+                _expected = (
+                    str(cand.get("cookie_id") or ""),
+                    str(cand.get("item_id") or ""),
+                    str(cand.get("buyer_id") or ""),
+                )
+                if not all(_expected) or _identity != _expected:
+                    dr.mark_unknown(
+                        order_id,
+                        cand["cookie_id"],
+                        cand["idx"],
+                        "本地订单账号、商品或买家与补发账本不一致",
+                    )
+                    continue
+                if _row.get("dropship_status"):
+                    dr.mark_unknown(order_id, cand["cookie_id"], cand["idx"], "实物代拍订单不允许补发卡密")
+                    continue
+                if _dbm_r.is_voucher_async_order(order_id, cand["cookie_id"]):
+                    dr.mark_unknown(order_id, cand["cookie_id"], cand["idx"], "异步充值订单由充值渠道履约")
+                    continue
+                if cross_shop_block_reason(_dbm_r, _identity[2]):
+                    continue
+                _dc = delivery_check(_row.get("order_status"))
+                if not _dc["ok"]:
+                    logger.warning(f"【{self.cookie_id}】⛔ 补发跳过订单 {order_id}：{_dc['reason']}")
+                    dr.mark_unknown(order_id, cand["cookie_id"], cand["idx"],
+                                    f"订单状态不允许补发：{_dc['status']}")
+                    continue
+            except Exception as exc:
+                logger.warning(
+                    f"【{self.cookie_id}】补发前读取本地订单身份失败，已转人工："
+                    f"{self._safe_str(exc)}"
+                )
+                dr.mark_unknown(
+                    order_id,
+                    cand["cookie_id"],
+                    cand["idx"],
+                    "补发前读取本地订单身份失败",
+                )
+                continue
+
+            # 本机状态只是"上次同步到的样子"。补发离首次发货可能已经过了 10 分钟，
+            # 这单完全可能刚被退款/关闭 —— 再发一张就是把货白送。
+            # 平台身份或状态拿不到时同样停发，卡密发出后无法撤回。
+            try:
+                import ship_verify as _sv
+                _v = _sv.verify(order_id, self.cookies_str, self.cookie_id,
+                                expect_buyer=str(cand.get("buyer_id") or ""),
+                                expect_item=str(cand.get("item_id") or ""))
+                if not _v["ok"]:
+                    logger.warning(f"【{self.cookie_id}】⛔ 补发跳过订单 {order_id}（平台复核）：{_v['reason']}")
+                    dr.mark_unknown(order_id, cand["cookie_id"], cand["idx"],
+                                    f"平台复核未通过：{_v['reason']}")
+                    continue
+            except Exception as _ve:
+                logger.warning(
+                    f"【{self.cookie_id}】补发前平台复核异常，已转人工：{_ve}"
+                )
+                dr.mark_unknown(
+                    order_id,
+                    cand["cookie_id"],
+                    cand["idx"],
+                    f"补发前平台复核异常：{_ve}",
+                )
+                continue
+
+            cl = dr.claim_card(order_id, cand["cookie_id"], cand["idx"],
+                               owner=f"resend-{os.getpid()}", allow_failed=True)
+            if not cl["claimed"]:
+                continue
+            card = cl["card"]
+            # 这次抢占的租约号（拆解 8）。收尾必须带它：租约一旦被别人接管，
+            # 我们这条迟到的结论就不能再改状态，否则会盖掉接管者的"正在发"。
+            _tk = str(card.get("lease_token") or "")
+            content = ("__IMAGE_SEND__" + card["payload"]) if card["kind"] == "image" else card["payload"]
+            if not content:
+                continue
+            user_url = f"https://www.goofish.com/personal?userId={card['buyer_id']}"
+            try:
+                total = len(dr.cards(order_id, cand["cookie_id"])) or 1
+            except Exception:
+                total = 1
+            # 半开：熔断期拦全部；刚到期每 30 秒只放行一张卡当探针，
+            # 剩下的继续留在待补发队列里，不跟着一起冲上去。
+            if gate_write(self.cookie_id)[0] is False:
+                dr.defer_unsent_card(order_id, cand["cookie_id"], card["idx"], _tk)
+                break
+            try:
+                from pickup_service import prepare_delivery_message
+
+                message = await prepare_delivery_message(order_id, self.cookie_id, card["buyer_id"], content)
+                if cross_shop_block_reason(db_manager, card["buyer_id"]):
+                    dr.defer_unsent_card(order_id, cand["cookie_id"], card["idx"], _tk)
+                    continue
+                if db_manager.is_account_automation_silent(self.cookie_id):
+                    dr.defer_unsent_card(order_id, cand["cookie_id"], card["idx"], _tk)
+                    break
+                await self._send_delivery_card(ws, card["chat_id"], card["buyer_id"], message,
+                                               int(card["idx"]), total, user_url, "[补发]")
+            except Exception as e:
+                err = self._safe_str(e)
+                logger.error(f"【{self.cookie_id}】补发订单 {order_id} 第 {int(card['idx'])+1} 张失败: {err}")
+                if not dr.record_send_exception(order_id, cand["cookie_id"], card["idx"], e, token=_tk):
+                    logger.warning(f"【{self.cookie_id}】补发 {order_id} 卡 {card['idx']+1} "
+                                   f"的租约已被接管，本次结论作废（不改状态）")
+            else:
+                try:
+                    recorded = dr.mark_sent(order_id, cand["cookie_id"], card["idx"],
+                                            "补发消息已写出(无平台回执)", token=_tk)
+                except Exception as ledger_exc:
+                    logger.critical(
+                        f"【{self.cookie_id}】补发消息已写出，但账本结算失败，"
+                        f"订单 {order_id} 卡 {card['idx']+1} 将按租约过期转人工："
+                        f"{self._safe_str(ledger_exc)}"
+                    )
+                    continue
+                if not recorded:
+                    logger.warning(f"【{self.cookie_id}】补发 {order_id} 卡 {card['idx']+1} "
+                                   f"已发出但租约被接管，交给接管者记账")
+                    continue
+                done += 1
+                logger.info(f"【{self.cookie_id}】补发消息已写出（无平台回执）："
+                            f"订单 {order_id} 第 {int(card['idx'])+1} 张")
+                # 补到最后一张时给订单盖章
+                try:
+                    s = dr.summary(order_id, cand["cookie_id"])
+                    if s["all_sent"] and not _dbm_r.is_order_system_shipped(order_id):
+                        self.mark_delivery_sent(order_id)
+                        _dbm_r.insert_or_update_order(order_id=order_id, system_shipped=True,
+                                                      chat_id=card["chat_id"])
+                        # 补发补到"全齐"这一刻，平台那头可能还挂着待发货
+                        try:
+                            await self._confirm_platform_shipped(
+                                order_id, cand.get("item_id"), "[补发]")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        # 这一轮顺手把"内容早发完、平台还没确认"的单补掉（拆解 7）
+        try:
+            await self._retry_pending_confirms()
+        except Exception as _rc_e:
+            logger.debug(f"【{self.cookie_id}】补确认扫描异常: {self._safe_str(_rc_e)}")
+        return done
+
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
                                    item_id: str, chat_id: str, msg_time: str):
         """统一处理自动发货逻辑"""
         try:
+            if not self._is_auto_delivery_trigger(
+                str((message.get("1") or {}).get("10", {}).get("reminderContent") or ""),
+                message,
+            ):
+                logger.warning(
+                    f'[{msg_time}] 【{self.cookie_id}】非真实交易卡消息，拒绝自动发货'
+                )
+                return
+
+            from db_manager import db_manager
+            if db_manager.is_account_automation_silent(self.cookie_id):
+                logger.info("账号 {} 处于静默模式，已暂停自动发货", self.cookie_id)
+                return
+
             # 检查商品是否属于当前cookies
             if item_id and item_id != "未知商品":
                 try:
@@ -1121,17 +2007,60 @@ class XianyuLive:
                     return
 
             # 提取订单ID
-            order_id = self._extract_order_id(message)
+            order_id = self._extract_order_id(message, strict=True)
 
             # 如果order_id不存在，直接返回
             if not order_id:
                 logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 未能提取到订单ID，跳过自动发货')
                 return
 
+            # ====== 发货前统一检查：订单状态 ======
+            # 原来四重检查（延迟锁/冷却/锁/再冷却）全是"发过没有"，没有一条是
+            # "这单还该不该发"。于是一个已经退款关闭的订单，只要买家再发一条消息
+            # 触发自动发货，就会把卡密发出去 —— 而退款单发卡密 = 钱货两失。
+            # 状态取不到（unknown，首次发货时订单还没入库）按放行处理，
+            # 真正的判重靠下面的 can_auto_delivery。
+            try:
+                from order_status_rules import delivery_check
+                from db_manager import db_manager as _dbm_st
+                _row = _dbm_st.get_order_by_id(order_id) or {}
+                _identity = (
+                    str(_row.get("cookie_id") or ""),
+                    str(_row.get("item_id") or ""),
+                    str(_row.get("buyer_id") or ""),
+                )
+                if _row and (
+                    (_identity[0] and _identity[0] != self.cookie_id)
+                    or (_identity[1] and item_id and _identity[1] != item_id)
+                    or (_identity[2] and _identity[2] != str(send_user_id or ""))
+                ):
+                    logger.error(
+                        f'[{msg_time}] 【{self.cookie_id}】⛔ 订单 {order_id} '
+                        f'本地身份与当前账号、商品或买家不一致，拒绝自动发货'
+                    )
+                    return
+                _dc = delivery_check(_row.get('order_status'))
+                if not _dc['ok']:
+                    logger.warning(
+                        f'[{msg_time}] 【{self.cookie_id}】⛔ 订单 {order_id} 状态为 '
+                        f'{_dc["status"]}，不发货：{_dc["reason"]}'
+                    )
+                    return
+            except Exception as e:
+                # 与黑名单检查不同：这里失败不能直接跳过发货，
+                # 因为首次自动发货时订单尚未入库，查不到是正常情况。
+                # 真正的兜底是 can_auto_delivery 的 system_shipped 判重。
+                logger.error(f'[{msg_time}] 【{self.cookie_id}】订单状态检查异常，继续按判重处理: {self._safe_str(e)}')
+
             # 退款黑名单仅阻止自动发货。全局开关开启时覆盖全部商品；
             # 全局关闭时，仅在当前商品单独开启后生效。
             try:
                 from db_manager import db_manager
+                from order_status_rules import cross_shop_block_reason
+                blocked = cross_shop_block_reason(db_manager, send_user_id)
+                if blocked:
+                    logger.warning("【{}】订单 {}：{}", self.cookie_id, order_id, blocked)
+                    return
                 if db_manager.should_block_refund_buyer_delivery(
                     buyer_id=send_user_id,
                     cookie_id=self.cookie_id,
@@ -1224,117 +2153,328 @@ class XianyuLive:
                     else:
                         logger.info(f"无订单ID，发送单个卡券")
 
-                    # 多次调用自动发货方法，每次获取不同的内容
-                    delivery_contents = []
-                    success_count = 0
+                    # 在任何本地卡池分配之前先核平台身份。否则即使发送前复核
+                    # 拦住，错误订单也可能已经把别人的卡位扣成 unknown。
+                    try:
+                        import ship_verify as _sv_preflight
+                        _preflight = _sv_preflight.verify(
+                            order_id,
+                            self.cookies_str,
+                            self.cookie_id,
+                            expect_buyer=str(send_user_id or ""),
+                            expect_item=str(item_id or ""),
+                            expect_quantity=quantity_to_send,
+                            max_age=0,
+                        )
+                        if not _preflight.get("ok"):
+                            _preflight_reason = str(
+                                _preflight.get("reason") or "平台无法确认订单身份"
+                            )
+                            logger.error(
+                                f'[{msg_time}] 【{self.cookie_id}】⛔ 订单 {order_id} '
+                                f'发货预检未通过，未分配卡密：{_preflight_reason}'
+                            )
+                            await self.send_delivery_failure_notification(
+                                send_user_name,
+                                send_user_id,
+                                item_id,
+                                f"发货预检未通过，已转人工：{_preflight_reason}",
+                                chat_id,
+                            )
+                            return
+                    except Exception as _preflight_exc:
+                        logger.error(
+                            f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} '
+                            f'发货预检异常，未分配卡密：'
+                            f'{self._safe_str(_preflight_exc)}'
+                        )
+                        await self.send_delivery_failure_notification(
+                            send_user_name,
+                            send_user_id,
+                            item_id,
+                            "发货预检异常，已转人工",
+                            chat_id,
+                        )
+                        return
 
-                    for i in range(quantity_to_send):
+                    if (cross_shop_block_reason(db_manager, send_user_id)
+                            or db_manager.is_account_automation_silent(self.cookie_id)):
+                        return
+                    # 账本中的卡密已经领过，后续触发只需处理尚未发送的位置。
+                    deliver_ctx = {}
+                    delivery_contents = await self._prepare_delivery_contents(
+                        item_id,
+                        item_title,
+                        order_id,
+                        send_user_id,
+                        quantity_to_send,
+                        deliver_ctx,
+                        chat_id=chat_id,
+                    )
+                    allocated = sum(bool(content) for content in delivery_contents)
+
+                    # ---- C3：先记账，再发 ----
+                    # 顺序不能反。先记账才知道"发到第几张断了"，
+                    # 才可能重发**同一张**卡；反过来就只剩一句"订单已发货"。
+                    dr = None
+                    _stock_short = ""
+                    try:
+                        import delivery_reliability as dr
+                        dr.ensure_order(order_id, self.cookie_id, delivery_contents,
+                                        item_id=item_id, chat_id=chat_id, buyer_id=send_user_id,
+                                        spec=deliver_ctx.get("order_spec") or "")
+                        missing = quantity_to_send - allocated
+                        if missing:
+                            # 内容没取到的卡也要落库，否则订单被盖章后它们等于凭空蒸发
+                            for idx, content in enumerate(delivery_contents):
+                                if not content:
+                                    dr.record_missing(order_id, self.cookie_id, idx, 1,
+                                                      item_id=item_id, chat_id=chat_id,
+                                                      buyer_id=send_user_id,
+                                                      spec=deliver_ctx.get("order_spec") or "")
+                            # 库存不够 = 整单不发（嗷嗷鱼 Q23）。
+                            # 买家买 3 件只收到 1 张卡，剩下 2 件只能退款或吵；而发出去的
+                            # 那张是一次性消耗品，退款也收不回来。宁可一张不发，转人工。
+                            available = allocated + deliver_ctx.get("available", 0)
+                            _stock_short = f"库存不足：需要 {quantity_to_send} 张，只有 {available} 张"
+                            try:
+                                dr.mark_shortage(order_id, self.cookie_id, quantity_to_send,
+                                                 allocated, _stock_short)
+                            except Exception as _ms_e:
+                                logger.error(f'【{self.cookie_id}】标记缺货停发失败: {self._safe_str(_ms_e)}')
+                            logger.error(f'[{msg_time}] 【{self.cookie_id}】⛔ 订单 {order_id} {_stock_short}，整单停发')
+                            try:
+                                import notify_service as _ns
+                                _ns.send_event("risk", "⚠️ 缺货整单停发",
+                                               f"订单 {order_id} {_stock_short}，已停发，"
+                                               f"请补货后人工补发或退款")
+                            except Exception:
+                                pass
+                    except Exception as _dr_e:
+                        _stock_short = "发货账本不可用"
+                        logger.error(f'【{self.cookie_id}】发货账本不可用，整单停发: {self._safe_str(_dr_e)}')
+
+                    # 缺货停发要让卖家在页面上看得到（不是只写一行日志）
+                    if _stock_short:
                         try:
-                            # 每次调用都可能获取不同的内容（API卡券、批量数据等）
-                            delivery_content = await self._auto_delivery(item_id, item_title, order_id, send_user_id)
-                            if delivery_content:
-                                delivery_contents.append(delivery_content)
-                                success_count += 1
-                                if quantity_to_send > 1:
-                                    logger.info(f"第 {i+1}/{quantity_to_send} 个卡券内容获取成功")
-                            else:
-                                logger.warning(f"第 {i+1}/{quantity_to_send} 个卡券内容获取失败")
-                        except Exception as e:
-                            logger.error(f"第 {i+1}/{quantity_to_send} 个卡券获取异常: {self._safe_str(e)}")
+                            await self.send_delivery_failure_notification(
+                                send_user_name, send_user_id, item_id,
+                                f"{_stock_short}，已整单停发，请补货后人工补发或退款", chat_id)
+                        except Exception as _sn_e:
+                            logger.warning(f'【{self.cookie_id}】缺货通知发送失败: {self._safe_str(_sn_e)}')
 
-                    if delivery_contents:
-                        # 标记已发货（防重复）- 基于订单ID
-                        self.mark_delivery_sent(order_id)
-
-                        # 更新订单数据库，标记系统已发货
-                        if order_id:
-                            try:
-                                from db_manager import db_manager
-                                db_manager.insert_or_update_order(
-                                    order_id=order_id,
-                                    system_shipped=True,
-                                    chat_id=chat_id
-                                )
-                                logger.info(f'【{self.cookie_id}】✅ 订单 {order_id} 已标记为系统已发货 (system_shipped=1)')
-                            except Exception as db_e:
-                                logger.error(f'【{self.cookie_id}】❌ 更新订单system_shipped状态失败: {self._safe_str(db_e)}')
-
-                        # 标记锁为持有状态，并启动延迟释放任务
-                        self._lock_hold_info[lock_key] = {
-                            'locked': True,
-                            'lock_time': time.time(),
-                            'release_time': None,
-                            'task': None
-                        }
-
-                        # 启动延迟释放锁的异步任务（10分钟后释放）
-                        delay_task = asyncio.create_task(self._delayed_lock_release(lock_key, delay_minutes=10))
-                        self._lock_hold_info[lock_key]['task'] = delay_task
-
-                        # 发送所有获取到的发货内容
-                        for i, delivery_content in enumerate(delivery_contents):
-                            try:
-                                # 检查是否是图片发送标记
-                                if delivery_content.startswith("__IMAGE_SEND__"):
-                                    # 提取卡券ID和图片URL
-                                    image_data = delivery_content.replace("__IMAGE_SEND__", "")
-                                    if "|" in image_data:
-                                        card_id_str, image_url = image_data.split("|", 1)
-                                        try:
-                                            card_id = int(card_id_str)
-                                        except ValueError:
-                                            logger.error(f"无效的卡券ID: {card_id_str}")
-                                            card_id = None
-                                    else:
-                                        # 兼容旧格式（没有卡券ID）
-                                        card_id = None
-                                        image_url = image_data
-
-                                    # 发送图片消息
-                                    await self.send_image_msg(websocket, chat_id, send_user_id, image_url, card_id=card_id)
-                                    if len(delivery_contents) > 1:
-                                        logger.info(f'[{msg_time}] 【多数量自动发货图片】第 {i+1}/{len(delivery_contents)} 张已向 {user_url} 发送图片: {image_url}')
-                                    else:
-                                        logger.info(f'[{msg_time}] 【自动发货图片】已向 {user_url} 发送图片: {image_url}')
-
-                                    # 多数量发货时，消息间隔1秒
-                                    if len(delivery_contents) > 1 and i < len(delivery_contents) - 1:
-                                        await asyncio.sleep(1)
-
-                                else:
-                                    # 普通文本发货内容
-                                    await self.send_msg(websocket, chat_id, send_user_id, delivery_content)
-                                    if len(delivery_contents) > 1:
-                                        logger.info(f'[{msg_time}] 【多数量自动发货】第 {i+1}/{len(delivery_contents)} 条已向 {user_url} 发送发货内容')
-                                    else:
-                                        logger.info(f'[{msg_time}] 【自动发货】已向 {user_url} 发送发货内容')
-
-                                    # 多数量发货时，消息间隔1秒
-                                    if len(delivery_contents) > 1 and i < len(delivery_contents) - 1:
-                                        await asyncio.sleep(1)
-
-                            except Exception as e:
-                                logger.error(f"发送第 {i+1} 条消息失败: {self._safe_str(e)}")
-
-                        # 卡密发送完成后，可按卡券分组配置给买家发送一条后续消息。
-                        if rule.get('after_delivery_enabled', True) and chat_id:
-                            follow_up = (rule.get('after_delivery_message') or '').strip()
-                            if follow_up:
-                                follow_up = follow_up.replace('{ITEM_ID}', str(item_id or ''))
-                                follow_up = follow_up.replace('{COUNT}', str(len(delivery_contents)))
-                                follow_up = follow_up.replace('{CARD_GROUP}', str(rule.get('card_name') or ''))
+                    # 发送前用平台真实订单再核一次（拆解 7）。从"判该发"到这里，
+                    # 中间隔了发货延时、限流等待和取内容的时间，买家可能已经退款。
+                    # 身份或状态拿不到同样停发，卡密发出后无法撤回。
+                    _verify_block = ""
+                    if delivery_contents and not _stock_short:
+                        try:
+                            import ship_verify as _sv
+                            _v = _sv.verify(order_id, self.cookies_str, self.cookie_id,
+                                            expect_buyer=str(send_user_id or ""),
+                                            expect_item=str(item_id or ""),
+                                            expect_quantity=quantity_to_send)
+                            if not _v["ok"]:
+                                _verify_block = _v.get("reason") or "平台订单已不可发货"
+                        except Exception as _ve:
+                            _verify_block = f"发货前平台复核异常：{_ve}"
+                    if _verify_block:
+                        logger.error(f'[{msg_time}] 【{self.cookie_id}】⛔ 订单 {order_id} 平台复核未通过，'
+                                     f'整单不发：{_verify_block}')
+                        if dr is not None:
+                            for _i in range(len(delivery_contents)):
                                 try:
-                                    await self.send_msg(websocket, chat_id, send_user_id, follow_up)
-                                    logger.info(f'[{msg_time}] 【自动发货】已向买家发送发货后消息')
-                                except Exception as follow_up_error:
-                                    logger.error(f'发送发货后消息失败: {self._safe_str(follow_up_error)}')
+                                    # 不是 failed（重试也没用），是 unknown：让人去看这单到底怎么了
+                                    dr.mark_unknown(order_id, self.cookie_id, _i,
+                                                    f"平台复核未通过：{_verify_block}")
+                                except Exception:
+                                    pass
+                        await self.send_delivery_failure_notification(
+                            send_user_name, send_user_id, item_id,
+                            f"平台复核未通过，整单转人工：{_verify_block}", chat_id)
 
-                        # 发送成功通知到已配置的外部通知渠道
-                        if len(delivery_contents) > 1:
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {len(delivery_contents)} 个卡券", chat_id)
+                    if delivery_contents and not _verify_block and not _stock_short:
+                        from rate_limiter import gate_write
+                        if dr is not None:
+                            try:
+                                dr.reap_expired_leases()
+                            except Exception as reap_exc:
+                                logger.warning(
+                                    f"【{self.cookie_id}】发货前清理过期租约失败："
+                                    f"{self._safe_str(reap_exc)}"
+                                )
+                        sent_ok = 0
+                        for i, delivery_content in enumerate(delivery_contents):
+                            if db_manager.is_account_automation_silent(self.cookie_id):
+                                break
+                            # 逐卡抢占：已发过的直接跳过。这层重启后依然有效，
+                            # 内存里的冷却和锁都不行。
+                            _tk = ""
+                            if dr is not None:
+                                try:
+                                    _cl = dr.claim_card(order_id, self.cookie_id, i,
+                                                        owner=f"pid{os.getpid()}")
+                                except Exception as _ce:
+                                    logger.error(f'【{self.cookie_id}】卡 {i+1} 抢占账本异常，暂不发送: {self._safe_str(_ce)}')
+                                    continue
+                                if not _cl["claimed"]:
+                                    logger.info(f'[{msg_time}] 【自动发货】第 {i+1}/{len(delivery_contents)} 张跳过：{_cl["reason"]}')
+                                    if _cl["reason"] == "sent":
+                                        sent_ok += 1
+                                    continue
+                                # 租约号（拆解 8）：收尾时带上，租约被接管后旧结论自动作废
+                                _tk = str((_cl.get("card") or {}).get("lease_token") or "")
+
+                            # 半开：到期后每 30 秒只放行一张卡当探针，其余留在账本里。
+                            # 这里每张卡都过闸（不是整批只过一次），否则多卡订单会一起涌上去。
+                            if gate_write(self.cookie_id)[0] is False:
+                                if dr is not None and _tk:
+                                    dr.defer_unsent_card(order_id, self.cookie_id, i, _tk)
+                                continue
+
+                            try:
+                                from pickup_service import prepare_delivery_message
+
+                                message = await prepare_delivery_message(
+                                    order_id, self.cookie_id, send_user_id, delivery_content,
+                                )
+                                if (cross_shop_block_reason(db_manager, send_user_id)
+                                        or db_manager.is_voucher_async_order(order_id, self.cookie_id)
+                                        or db_manager.is_account_automation_silent(self.cookie_id)):
+                                    if dr is not None and _tk:
+                                        dr.defer_unsent_card(order_id, self.cookie_id, i, _tk)
+                                    break
+                                await self._send_delivery_card(
+                                    websocket, chat_id, send_user_id, message,
+                                    i, len(delivery_contents), user_url, msg_time)
+                            except Exception as exc:
+                                logger.error(
+                                    f"发送第 {i+1} 条消息未完成；"
+                                    f"结果将按发送阶段记账，不再就地重试：{self._safe_str(exc)}"
+                                )
+                                if dr is not None:
+                                    try:
+                                        if not dr.record_send_exception(
+                                                order_id, self.cookie_id, i, exc, token=_tk):
+                                            logger.warning(
+                                                f'【{self.cookie_id}】卡 {i+1} 的租约已被接管，'
+                                                f'本次失败结论作废（不改状态）'
+                                            )
+                                    except Exception as ledger_exc:
+                                        logger.critical(
+                                            f'【{self.cookie_id}】卡 {i+1} 发送失败，'
+                                            f'且异常落账失败：{self._safe_str(ledger_exc)}'
+                                        )
+                            else:
+                                sent_ok += 1
+                                if dr is not None:
+                                    try:
+                                        if not dr.mark_sent(
+                                                order_id, self.cookie_id, i,
+                                                "消息已写出(无平台回执)", token=_tk):
+                                            logger.warning(f'【{self.cookie_id}】卡 {i+1} 已发出但租约已被接管，'
+                                                           f'交给接管者记账（不覆盖它的状态）')
+                                    except Exception as ledger_exc:
+                                        logger.critical(
+                                            f'【{self.cookie_id}】卡 {i+1} 消息已写出，'
+                                            f'但账本结算失败，将按租约过期转人工：'
+                                            f'{self._safe_str(ledger_exc)}'
+                                        )
+
+                            # 多数量发货时，消息间隔1秒
+                            if len(delivery_contents) > 1 and i < len(delivery_contents) - 1:
+                                await asyncio.sleep(1)
+
+                        _sum = None
+                        if dr is not None:
+                            try:
+                                _sum = dr.summary(order_id, self.cookie_id)
+                            except Exception as summary_exc:
+                                logger.critical(
+                                    f'【{self.cookie_id}】订单 {order_id} 发货账本汇总失败，'
+                                    f'整单不得确认完成：{self._safe_str(summary_exc)}'
+                                )
+                                _sum = None
+                            # 只要订单已进入发货账本，整单完成必须由账本汇总确认。
+                            # WebSocket 写出成功只代表本地写入完成，不能替代账本核销。
+                            _all_done = bool((_sum or {}).get("all_sent") is True)
                         else:
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id)
-                    else:
+                            _all_done = sent_ok >= len(delivery_contents)
+
+                        if not _all_done:
+                            # 没全发完**不盖章**：不 mark_delivery_sent、不写 system_shipped。
+                            # 买家再发消息或补发扫描会命中同一批卡，已 sent 的跳过、
+                            # failed 的重发，天然实现"只补缺的那张"。
+                            detail = (_sum or {})
+                            logger.error(f'[{msg_time}] 【{self.cookie_id}】❌ 订单 {order_id} 发货未完成：'
+                                         f'{detail.get("sent", sent_ok)}/{detail.get("total", len(delivery_contents))} 张成功，'
+                                         f'待人工 {detail.get("need_human") or []}')
+                            await self.send_delivery_failure_notification(
+                                send_user_name, send_user_id, item_id,
+                                f"多数量发货未完成：{detail.get('sent', sent_ok)}/"
+                                f"{detail.get('total', len(delivery_contents))} 张已发，"
+                                f"失败卡号 {detail.get('need_human') or []}（系统会按次补发，超次数需人工）",
+                                chat_id)
+                        elif not db_manager.is_order_system_shipped(order_id):
+                            # 全部落地才盖章。这是本轮修的**核心顺序问题**：
+                            # 原来是发送前就 mark_delivery_sent + system_shipped=1。
+                            self.mark_delivery_sent(order_id)
+
+                            if order_id:
+                                try:
+                                    from db_manager import db_manager
+                                    db_manager.insert_or_update_order(
+                                        order_id=order_id,
+                                        system_shipped=True,
+                                        chat_id=chat_id
+                                    )
+                                    logger.info(f'【{self.cookie_id}】✅ 订单 {order_id} 已标记为系统已发货 (system_shipped=1)')
+                                except Exception as db_e:
+                                    logger.error(f'【{self.cookie_id}】❌ 更新订单system_shipped状态失败: {self._safe_str(db_e)}')
+
+                            # 内容全部落地了，才去告诉平台"已发货"（拆解 7）。
+                            # 失败不影响发码状态，进 platform_ship 队列由心跳补。
+                            if order_id:
+                                try:
+                                    await self._confirm_platform_shipped(order_id, item_id, msg_time)
+                                except Exception as _cf_e:
+                                    logger.warning(f'【{self.cookie_id}】确认发货调用异常（不影响发码）: {self._safe_str(_cf_e)}')
+
+                            # 标记锁为持有状态，并启动延迟释放任务
+                            self._lock_hold_info[lock_key] = {
+                                'locked': True,
+                                'lock_time': time.time(),
+                                'release_time': None,
+                                'task': None
+                            }
+
+                            # 启动延迟释放锁的异步任务（10分钟后释放）
+                            delay_task = asyncio.create_task(self._delayed_lock_release(lock_key, delay_minutes=10))
+                            self._lock_hold_info[lock_key]['task'] = delay_task
+
+                            # 卡密发送完成后，可按卡券分组配置给买家发送一条后续消息。
+                            # 注意：这里原来直接引用 rule，而 rule 是 _auto_delivery 里的局部变量，
+                            # 在本函数作用域内根本不存在 → 每次发货成功都会抛 NameError，
+                            # 被下面的 except 吞掉后记成"自动发货处理异常"。改为从出参里取。
+                            rule = deliver_ctx.get("rule") or {}
+                            if (rule.get('after_delivery_enabled', True) and chat_id
+                                    and not db_manager.is_account_automation_silent(self.cookie_id)):
+                                follow_up = (rule.get('after_delivery_message') or '').strip()
+                                if follow_up:
+                                    follow_up = follow_up.replace('{ITEM_ID}', str(item_id or ''))
+                                    follow_up = follow_up.replace('{COUNT}', str(len(delivery_contents)))
+                                    follow_up = follow_up.replace('{CARD_GROUP}', str(rule.get('card_name') or ''))
+                                    try:
+                                        await self.send_msg(websocket, chat_id, send_user_id, follow_up)
+                                        logger.info(f'[{msg_time}] 【自动发货】已向买家发送发货后消息')
+                                    except Exception as follow_up_error:
+                                        logger.error(f'发送发货后消息失败: {self._safe_str(follow_up_error)}')
+
+                            # 发货成功不再推外部通知：成功是常态，每单推一条会把渠道刷爆，
+                            # 真正需要人看的是失败。多数量发货在日志里留个明细即可。
+                            logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 自动发货完成: 订单 {order_id}, '
+                                        f'发送 {len(delivery_contents)} 条内容')
+                    elif not _verify_block:
                         logger.warning(f'[{msg_time}] 【自动发货】未找到匹配的发货规则或获取发货内容失败')
                         # 发送自动发货失败通知
                         await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "未找到匹配的发货规则或获取发货内容失败", chat_id)
@@ -2731,9 +3871,11 @@ class XianyuLive:
                     '--use-mock-keychain'
                 ])
 
-            browser = await playwright.chromium.launch(
-                headless=True,
-                args=browser_args
+            from browser_limit import launch_browser as _launch_browser
+            browser = await _launch_browser(
+                playwright,
+                {'headless': True, 'args': browser_args},
+                f'商品详情 {item_id}'
             )
 
             # 创建浏览器上下文
@@ -3001,7 +4143,7 @@ class XianyuLive:
         params = {
             'jsv': '2.7.2',
             'appKey': '34839810',
-            't': str(int(time.time()) * 1000),
+            't': str(int(time.time() * 1000)),
             'sign': '',
             'v': '1.0',
             'type': 'originaljson',
@@ -3272,6 +4414,28 @@ class XianyuLive:
             logger.error(f"获取默认回复失败: {self._safe_str(e)}")
             return None
 
+    @staticmethod
+    def _kw_match(keyword: str, message: str) -> bool:
+        """关键词是否命中：精确子串优先，没命中再走归一化兜底（方向三）。
+
+        买家打「多久 发货？」「多久发货?」「多久发货呀」，原来的
+        `keyword.lower() in send_message.lower()` 一条都命不中 —— 词条明明配了，
+        却掉进 AI 或默认回复。归一化（全角→半角、去空白/标点/表情）能对上，
+        但只对 ≥4 个字的词条生效（见 faq_kb.MIN_FUZZY_LEN），避免「1」「包邮」
+        这种短词把不相关的话也吞掉。
+        """
+        kw = str(keyword or "").strip()
+        if not kw:
+            return False
+        if kw.lower() in str(message or "").lower():
+            return True
+        try:
+            import faq_kb as _fk
+            # 多行关键词（每行一个触发词）+ 归一化兜底，都收在 match_keyword 里
+            return _fk.match_keyword(kw, message)
+        except Exception:
+            return False
+
     async def get_keyword_reply(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str = None) -> str:
         """获取关键词匹配回复（支持商品ID优先匹配和图片类型）"""
         try:
@@ -3293,7 +4457,7 @@ class XianyuLive:
                     keyword_type = keyword_data.get('type', 'text')
                     image_url = keyword_data.get('image_url')
 
-                    if keyword_item_id == item_id and keyword.lower() in send_message.lower():
+                    if keyword_item_id == item_id and self._kw_match(keyword, send_message):
                         logger.info(f"商品ID关键词匹配成功: 商品{item_id} '{keyword}' (类型: {keyword_type})")
 
                         # 根据关键词类型处理
@@ -3328,7 +4492,7 @@ class XianyuLive:
                 keyword_type = keyword_data.get('type', 'text')
                 image_url = keyword_data.get('image_url')
 
-                if not keyword_item_id and keyword.lower() in send_message.lower():
+                if not keyword_item_id and self._kw_match(keyword, send_message):
                     logger.info(f"通用关键词匹配成功: '{keyword}' (类型: {keyword_type})")
 
                     # 根据关键词类型处理
@@ -4456,6 +5620,126 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】加密确认模块调用失败: {self._safe_str(e)}")
             return {"error": f"加密确认模块调用失败: {self._safe_str(e)}", "order_id": order_id}
 
+    async def _confirm_platform_shipped(self, order_id, item_id=None, msg_time: str = "", *, force: bool = False) -> bool:
+        """
+        **内容已全部发出去之后**，再确认平台发货（拆解 7 的顺序修正）。
+
+        两条独立的重试线：
+        - 发卡密失败 → `delivery_reliability` 的逐卡补发；
+        - 确认发货失败 → `platform_ship` 表，心跳里补确认。
+
+        原来两件事挤在"取内容"那一步里，且失败只打一行 warning
+        （原文："即使确认发货失败，也继续发送发货内容"）。结果是：
+        确认成功而内容失败 → 订单显示已发货、买家两手空空；
+        内容成功而确认失败 → 买家拿到了货，平台还挂着待发货，没人补。
+
+        返回是否确认成功。失败**不上抛**：内容已经发出去了，订单不能因此回滚。
+        """
+        if not order_id:
+            return False
+        try:
+            from db_manager import db_manager
+            from order_status_rules import cross_shop_block_reason
+            order = db_manager.get_order_by_id(order_id)
+            if order and order.get("dropship_status"):
+                return False
+            if db_manager.is_voucher_async_order(order_id, self.cookie_id):
+                return False
+            if not force and not self.is_auto_confirm_enabled():
+                return False
+            blocked = cross_shop_block_reason(db_manager, order.get("buyer_id") if order else None)
+        except Exception:
+            return False
+
+        now = time.time()
+        # 冷却判断放在过闸之前：这一单只是"刚确认过、跳过"，并没有碰平台，
+        # 不该占掉一次半开探针——否则到期后的第一笔真写会被这次空转拖后 30 秒。
+        try:
+            last = self.confirmed_orders.get(order_id)
+            if last and now - last < self.order_confirm_cooldown:
+                logger.info(f"订单 {order_id} 已在 {self.order_confirm_cooldown} 秒内确认过，跳过重复确认")
+                return True
+        except Exception:
+            pass
+
+        from rate_limiter import gate_write
+        if (blocked or (not force and db_manager.is_account_automation_silent(self.cookie_id))
+                or gate_write(self.cookie_id)[0] is False):
+            try:
+                import delivery_reliability as dr
+                dr.note_platform_ship(order_id, self.cookie_id, item_id or "",
+                                      blocked or "账号暂停或熔断半开，等待恢复后确认发货", policy="refresh")
+            except Exception as exc:
+                logger.error(f"【{self.cookie_id}】暂停期间写入待确认发货账本失败: {self._safe_str(exc)}")
+            return False
+
+        logger.info(f"开始自动确认发货（内容已发完）: 订单ID={order_id}, 商品ID={item_id}")
+        try:
+            confirm_result = await self.auto_confirm(order_id, item_id) or {}
+        except Exception as e:
+            confirm_result = {"success": False, "error": self._safe_str(e)}
+
+        if confirm_result.get("success"):
+            try:
+                self.confirmed_orders[order_id] = now
+            except Exception:
+                pass
+            logger.info(f"🎉 自动确认发货成功！订单ID: {order_id}")
+            try:
+                import delivery_reliability as _dr_ok
+                _dr_ok.mark_platform_shipped(order_id, self.cookie_id, confirmed_item_id=item_id or "")
+            except Exception:
+                pass
+            return True
+
+        err = str(confirm_result.get("error") or "未知错误")
+        # 拆解 9：先分级，再记账。三类失败的账完全不一样：
+        #   stop    平台已是终态/签名错/风控 —— 记成"停止重试"，不算失败次数；
+        #   refresh 登录态失效 —— 不加次数等保活，否则"我没登录"5 次就变成"死信"；
+        #   retry   普通失败 —— 才累加次数、到上限转人工。
+        try:
+            from mtop_response import retry_policy
+            policy = str(confirm_result.get("policy") or retry_policy(err))
+        except Exception:
+            policy = "retry"
+        if policy == "stop":
+            logger.warning(f"⛔ 自动确认发货停止重试（重试不会改变结果）: 订单ID={order_id}, "
+                           f"{err}；内容已发，此后由状态机/人工兜底")
+        elif policy == "refresh":
+            logger.warning(f"⏳ 自动确认发货等登录态恢复: 订单ID={order_id}, {err}（不占重试次数）")
+        else:
+            logger.warning(f"⚠️ 自动确认发货失败（内容已发，稍后自动重试）: 订单ID={order_id}, {err}")
+        try:
+            import delivery_reliability as _dr_fail
+            _dr_fail.note_platform_ship(order_id, self.cookie_id, item_id or "", err,
+                                        policy=policy)
+        except Exception:
+            pass
+        return False
+
+    async def _retry_pending_confirms(self, limit: int = 5) -> int:
+        """心跳里补确认：内容早就发出去了，只是平台还没被点上"已发货"。"""
+        try:
+            from db_manager import db_manager
+            import delivery_reliability as dr
+            from rate_limiter import circuit_blocked
+            if db_manager.is_account_automation_silent(self.cookie_id) or circuit_blocked(self.cookie_id)[0]:
+                return 0
+            rows = dr.pending_platform_shipments(cookie_id=self.cookie_id, limit=limit)
+        except Exception:
+            return 0
+        done = 0
+        for row in rows:
+            try:
+                if await self._confirm_platform_shipped(row["order_id"], row.get("item_id"),
+                                                        "[补确认]"):
+                    done += 1
+            except Exception as e:
+                logger.warning(f"【{self.cookie_id}】补确认发货异常 {row.get('order_id')}: {self._safe_str(e)}")
+        if done:
+            logger.info(f"【{self.cookie_id}】✅ 补确认发货成功 {done} 单")
+        return done
+
     async def auto_freeshipping(self, order_id, item_id, buyer_id, retry_count=0):
         """自动免拼发货 - 使用解密模块"""
         try:
@@ -4513,9 +5797,11 @@ class XianyuLive:
                     logger.info(f"【{self.cookie_id}】订单详情获取成功: {order_id}")
                     logger.info(f"【{self.cookie_id}】页面标题: {result.get('title', '未知')}")
 
-                    # 获取解析后的规格信息
+                    # 获取解析后的规格信息（最多两组；第二组可能为空）
                     spec_name = result.get('spec_name', '')
                     spec_value = result.get('spec_value', '')
+                    spec_name_2 = result.get('spec_name_2', '')
+                    spec_value_2 = result.get('spec_value_2', '')
                     quantity = result.get('quantity', '')
                     amount = result.get('amount', '')
 
@@ -4557,11 +5843,13 @@ class XianyuLive:
                                 buyer_id=buyer_id,
                                 spec_name=spec_name,
                                 spec_value=spec_value,
+                                spec_name_2=spec_name_2 or None,
+                                spec_value_2=spec_value_2 or None,
                                 quantity=quantity,
-                                amount=amount,
+                                amount=amount or None,
                                 order_status=result.get('order_status'),  # 添加订单状态
                                 cookie_id=self.cookie_id,
-                                created_at=order_time,
+                                created_at=order_time or None,
                                 receiver_name=receiver_name,
                                 receiver_phone=receiver_phone,
                                 receiver_address=receiver_address
@@ -4608,8 +5896,13 @@ class XianyuLive:
                 logger.error(f"【{self.cookie_id}】获取订单详情异常: {self._safe_str(e)}")
                 return None
 
-    async def _auto_delivery(self, item_id: str, item_title: str = None, order_id: str = None, send_user_id: str = None):
-        """自动发货功能 - 获取卡券规则，执行延时，确认发货，发送内容"""
+    async def _auto_delivery(self, item_id: str, item_title: str = None, order_id: str = None, send_user_id: str = None,
+                             ctx: dict = None, quantity: int = 1):
+        """匹配发货规则并准备指定数量的卡券内容。
+
+        ctx：可选的出参字典。命中规则后写入 ctx["rule"]，供调用方拿卡券分组配置
+        （发货后消息等）。不用实例属性，避免同一账号并发处理两个订单时串规则。
+        """
         try:
             from db_manager import db_manager
 
@@ -4679,59 +5972,107 @@ class XianyuLive:
 
             logger.info(f"使用搜索文本匹配发货规则: {search_text[:100]}...")
 
-            # 检查商品是否为多规格商品
-            is_multi_spec = db_manager.get_item_multi_spec_status(self.cookie_id, item_id)
-            spec_name = None
-            spec_value = None
+            # ——— 规格闸（第 1、2 层）：商品级声明 + 订单侧解析 ———
+            #
+            # 每一处"拿不准"都必须停，绝不能退回到普通关键词卡：
+            # 发不出货是看得见的失败；发错货（买家收到别人的卡密）是看不见的失败。
+            spec_meta = db_manager.get_item_spec_meta(self.cookie_id, item_id)
+            is_multi_spec = bool(spec_meta.get('is_multi_spec'))
+            declared_groups = spec_meta.get('spec_group_count')  # None = 未声明
+            spec_name = spec_value = spec_name_2 = spec_value_2 = None
+            parsed_groups = 0
+            spec_parse_mode = 'not_fetched'
 
-            # 如果是多规格商品且有订单ID，获取规格信息
-            if is_multi_spec and order_id:
+            expects_spec = needs_detail_fetch(is_multi_spec, declared_groups)
+
+            # 只有"预期有规格"才拉订单详情：拉一次要起浏览器，不是免费动作
+            if expects_spec and order_id:
                 logger.info(f"检测到多规格商品，获取订单规格信息: {order_id}")
                 try:
                     order_detail = await self.fetch_order_detail_info(order_id, item_id, send_user_id)
-                    # 确保order_detail是字典类型
-                    if order_detail and isinstance(order_detail, dict):
-                        spec_name = order_detail.get('spec_name', '')
-                        spec_value = order_detail.get('spec_value', '')
-                        if spec_name and spec_value:
-                            logger.info(f"获取到规格信息: {spec_name} = {spec_value}")
-                        else:
-                            logger.warning(f"未能获取到规格信息，将跳过自动发货")
-                            return None
-                    else:
-                        logger.warning(f"获取订单详情失败（返回类型: {type(order_detail).__name__}），将跳过自动发货")
-                        return None
                 except Exception as e:
-                    logger.error(f"获取订单规格信息失败: {self._safe_str(e)}，将跳过自动发货")
+                    logger.error(f"获取订单规格信息失败: {self._safe_str(e)}，跳过自动发货")
                     return None
+
+                if not order_detail or not isinstance(order_detail, dict):
+                    logger.error(f"获取订单详情失败（返回类型: {type(order_detail).__name__}），跳过自动发货")
+                    return None
+
+                spec_name = order_detail.get('spec_name') or None
+                spec_value = order_detail.get('spec_value') or None
+                spec_name_2 = order_detail.get('spec_name_2') or None
+                spec_value_2 = order_detail.get('spec_value_2') or None
+                try:
+                    parsed_groups = int(order_detail.get('spec_group_count') or 0)
+                except (TypeError, ValueError):
+                    parsed_groups = 0
+                spec_parse_mode = order_detail.get('spec_parse_mode') or 'no_spec'
+
+                logger.info(
+                    f"订单规格解析: mode={spec_parse_mode} groups={parsed_groups} "
+                    f"spec={spec_name}:{spec_value}"
+                    + (f" spec2={spec_name_2}:{spec_value_2}" if spec_name_2 else "")
+                )
+
+            # 闸门 A/B：声明与解析必须对得上（纯函数判定，见 spec_gate.py）
+            shape_ok, shape_reason = check_spec_shape(is_multi_spec, declared_groups, parsed_groups)
+            if not shape_ok:
+                if shape_reason == REASON_PARSE_FAILED:
+                    logger.error(
+                        f"❌ unknown_spec/parse_failed：多规格商品但订单规格解析失败"
+                        f"（mode={spec_parse_mode}），跳过自动发货"
+                    )
+                else:  # REASON_GROUP_MISMATCH
+                    logger.error(
+                        f"❌ unknown_spec/group_mismatch：商品声明 {declared_groups} 组，"
+                        f"订单解析出 {parsed_groups} 组，跳过自动发货"
+                    )
+                return None
 
             # 商品明确指定卡密分组时优先使用该分组；未指定时兼容原有关键词规则。
             delivery_rules = []
 
             if configured_card_id:
                 configured_rule = db_manager.get_item_delivery_card(self.cookie_id, item_id)
-                if configured_rule:
-                    delivery_rules = [configured_rule]
-                    logger.info(f"✅ 商品已指定卡密分组: {configured_rule['card_name']} (ID: {configured_card_id})")
-                else:
+                if not configured_rule:
                     logger.warning(f"商品指定的卡密分组不可用: {configured_card_id}，跳过自动发货")
                     return None
-
-            if not delivery_rules and is_multi_spec:
-                # 多规格商品：只匹配多规格发货规则
-                if spec_name and spec_value:
-                    logger.info(f"多规格商品，尝试匹配多规格发货规则: {search_text[:50]}... [{spec_name}:{spec_value}]")
-                    delivery_rules = db_manager.get_delivery_rules_by_keyword_and_spec(search_text, spec_name, spec_value)
-                    # 过滤只保留多规格卡券
-                    delivery_rules = [r for r in delivery_rules if r.get('is_multi_spec')]
-                    
-                    if delivery_rules:
-                        logger.info(f"✅ 找到匹配的多规格发货规则: {len(delivery_rules)}个")
-                    else:
-                        logger.warning(f"❌ 多规格商品未找到匹配的多规格发货规则，跳过自动发货")
+                if expects_spec and not configured_rule.get('is_multi_spec'):
+                    logger.error(
+                        f"❌ 商品是多规格，但指定的卡密分组不是多规格卡券"
+                        f"（{configured_rule.get('card_name')}），跳过自动发货"
+                    )
+                    return None
+                if expects_spec and configured_rule.get('is_multi_spec'):
+                    # 指定分组本身可能是某一档规格，必须和订单解析出的规格逐字相等
+                    card_key = card_spec_key(configured_rule)
+                    order_key = order_spec_key(spec_name, spec_value, spec_name_2, spec_value_2)
+                    if card_key != order_key:
+                        logger.error(
+                            f"❌ 指定卡密分组的规格与订单不一致：卡券{card_key} ≠ 订单{order_key}，"
+                            f"跳过自动发货"
+                        )
                         return None
+                delivery_rules = [configured_rule]
+                logger.info(f"✅ 商品已指定卡密分组: {configured_rule['card_name']} (ID: {configured_card_id})")
+
+            if not delivery_rules and expects_spec:
+                order_spec = spec_desc(spec_name, spec_value, spec_name_2, spec_value_2)
+                logger.info(
+                    f"多规格商品，按 {parsed_groups} 组规格严格匹配发货规则: "
+                    f"{search_text[:50]}... [{order_spec}]"
+                )
+                delivery_rules = db_manager.get_delivery_rules_by_keyword_and_spec(
+                    search_text, spec_name, spec_value, spec_name_2, spec_value_2
+                )
+                delivery_rules = [r for r in delivery_rules if r.get('is_multi_spec')]
+                if delivery_rules:
+                    logger.info(f"✅ 找到匹配的多规格发货规则: {len(delivery_rules)}个")
                 else:
-                    logger.warning(f"❌ 多规格商品但无规格信息，跳过自动发货")
+                    logger.error(
+                        f"❌ 规格 [{order_spec}] 没有匹配的多规格卡券，跳过自动发货"
+                        f"（不回落普通卡券）"
+                    )
                     return None
             elif not delivery_rules:
                 # 非多规格商品：只匹配非多规格发货规则
@@ -4739,7 +6080,7 @@ class XianyuLive:
                 delivery_rules = db_manager.get_delivery_rules_by_keyword(search_text)
                 # 过滤只保留非多规格卡券
                 delivery_rules = [r for r in delivery_rules if not r.get('is_multi_spec')]
-                
+
                 if delivery_rules:
                     logger.info(f"✅ 找到匹配的普通发货规则: {len(delivery_rules)}个")
                 else:
@@ -4748,7 +6089,15 @@ class XianyuLive:
 
             # 检查匹配到的卡券数量，只有唯一匹配时才自动发货
             if len(delivery_rules) > 1:
-                rule_names = [f"{r['card_name']}({r.get('spec_name', '')}:{r.get('spec_value', '')})" if r.get('is_multi_spec') else r['card_name'] for r in delivery_rules]
+                rule_names = []
+                for r in delivery_rules:
+                    if r.get('is_multi_spec'):
+                        _s = f"{r.get('spec_name') or ''}:{r.get('spec_value') or ''}"
+                        if r.get('spec_name_2'):
+                            _s += f";{r.get('spec_name_2')}:{r.get('spec_value_2') or ''}"
+                        rule_names.append(f"{r['card_name']}({_s})")
+                    else:
+                        rule_names.append(r['card_name'])
                 logger.warning(f"❌ 匹配到多个发货规则({len(delivery_rules)}个)，无法确定使用哪个，跳过自动发货: {', '.join(rule_names)}")
                 return None
 
@@ -4758,6 +6107,9 @@ class XianyuLive:
 
             # 使用唯一匹配的规则
             rule = delivery_rules[0]
+            # 把命中的规则回传给调用方（发货后消息要用分组配置）；只在真正命中时写
+            if isinstance(ctx, dict):
+                ctx["rule"] = rule
             logger.info(f"✅ 唯一匹配发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
 
             # 保存商品信息到数据库（需要有商品标题才保存）
@@ -4777,19 +6129,21 @@ class XianyuLive:
             else:
                 logger.warning(f"跳过保存商品信息：缺少商品标题 - {item_id}")
 
-            # 详细的匹配结果日志
+            # 详细的匹配结果日志（规格只在多规格链路上出现）
+            order_spec = spec_desc(spec_name, spec_value, spec_name_2, spec_value_2)
+            # 出参带出规格：外层 ensure_order 记账时要把它一起落库（拆解 39 §八-1）。
+            # 规格解析失败时这里是空串，账本显示「未提供」，不拿商品标题去猜。
+            try:
+                ctx["order_spec"] = order_spec or ""
+            except Exception:
+                pass
             if rule.get('is_multi_spec'):
-                if spec_name and spec_value:
-                    logger.info(f"🎯 精确匹配多规格发货规则: {rule['keyword']} -> {rule['card_name']} [{rule['spec_name']}:{rule['spec_value']}]")
-                    logger.info(f"📋 订单规格: {spec_name}:{spec_value} ✅ 匹配卡券规格: {rule['spec_name']}:{rule['spec_value']}")
-                else:
-                    logger.info(f"⚠️ 使用多规格发货规则但无订单规格信息: {rule['keyword']} -> {rule['card_name']} [{rule['spec_name']}:{rule['spec_value']}]")
+                card_spec = spec_desc(rule.get('spec_name'), rule.get('spec_value'),
+                                      rule.get('spec_name_2'), rule.get('spec_value_2'))
+                logger.info(f"🎯 精确匹配多规格发货规则: {rule['keyword']} -> {rule['card_name']} [{card_spec}]")
+                logger.info(f"📋 订单规格: {order_spec} ✅ 匹配卡券规格: {card_spec}")
             else:
-                if spec_name and spec_value:
-                    logger.info(f"🔄 兜底匹配普通发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
-                    logger.info(f"📋 订单规格: {spec_name}:{spec_value} ➡️ 使用普通卡券兜底")
-                else:
-                    logger.info(f"✅ 匹配普通发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
+                logger.info(f"✅ 匹配普通发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
 
             # 获取延时设置
             delay_seconds = rule.get('card_delay_seconds', 0)
@@ -4800,31 +6154,11 @@ class XianyuLive:
                 await asyncio.sleep(delay_seconds)
                 logger.info(f"延时完成")
 
-            # 如果有订单ID，执行确认发货
-            if order_id:
-                # 检查是否启用自动确认发货
-                if not self.is_auto_confirm_enabled():
-                    logger.info(f"自动确认发货已关闭，跳过订单 {order_id}")
-                else:
-                    # 检查确认发货冷却时间
-                    current_time = time.time()
-                    should_confirm = True
-
-                    if order_id in self.confirmed_orders:
-                        last_confirm_time = self.confirmed_orders[order_id]
-                        if current_time - last_confirm_time < self.order_confirm_cooldown:
-                            logger.info(f"订单 {order_id} 已在 {self.order_confirm_cooldown} 秒内确认过，跳过重复确认")
-                            should_confirm = False
-
-                    if should_confirm:
-                        logger.info(f"开始自动确认发货: 订单ID={order_id}, 商品ID={item_id}")
-                        confirm_result = await self.auto_confirm(order_id, item_id)
-                        if confirm_result.get('success'):
-                            self.confirmed_orders[order_id] = current_time
-                            logger.info(f"🎉 自动确认发货成功！订单ID: {order_id}")
-                        else:
-                            logger.warning(f"⚠️ 自动确认发货失败: {confirm_result.get('error', '未知错误')}")
-                            # 即使确认发货失败，也继续发送发货内容
+            # 确认发货**不在这里做**（拆解 7 的顺序修正）。
+            # 原来这段在"取内容"这一步里，等于先告诉平台"我已发货"，再去取卡密、
+            # 再去发消息。任何一步失败，订单都已经是"已发货"状态，买家却什么都没收到。
+            # 现在由 `_handle_auto_delivery` 在**全部卡券发成功之后**调用
+            # `_confirm_platform_shipped`，两本账各自重试。
 
             # 检查是否存在订单ID，只有存在订单ID才处理发货内容
             if order_id:
@@ -4866,42 +6200,33 @@ class XianyuLive:
                 # 开始处理发货内容
                 logger.info(f"开始处理发货内容，规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
 
-                delivery_content = None
+                contents = []
 
                 # 根据卡券类型处理发货内容
                 if rule['card_type'] == 'api':
-                    # API类型：调用API获取内容，传入订单和商品信息用于动态参数替换
-                    delivery_content = await self._get_api_card_content(rule, order_id, item_id, send_user_id, spec_name, spec_value)
+                    for _ in range(quantity):
+                        content = await self._get_api_card_content(rule, order_id, item_id, send_user_id, spec_name, spec_value)
+                        if content:
+                            contents.append(content)
 
-                elif rule['card_type'] == 'text':
-                    # 固定文字类型：直接使用文字内容
-                    delivery_content = rule['text_content']
+                elif rule['card_type'] == 'text' and rule['text_content']:
+                    contents = [rule['text_content']] * quantity
 
                 elif rule['card_type'] == 'data':
-                    # 批量数据类型：获取并消费第一条数据
-                    delivery_content = db_manager.consume_batch_data(rule['card_id'])
+                    contents, available = db_manager.consume_batch_codes(rule['card_id'], quantity)
+                    if ctx is not None and not contents:
+                        ctx["available"] = available
 
-                elif rule['card_type'] == 'image':
-                    # 图片类型：返回图片发送标记，包含卡券ID
-                    image_url = rule.get('image_url')
-                    if image_url:
-                        delivery_content = f"__IMAGE_SEND__{rule['card_id']}|{image_url}"
-                        logger.info(f"准备发送图片: {image_url} (卡券ID: {rule['card_id']})")
-                    else:
-                        logger.error(f"图片卡券缺少图片URL: 卡券ID={rule['card_id']}")
-                        delivery_content = None
+                elif rule['card_type'] == 'image' and rule.get('image_url'):
+                    contents = [f"__IMAGE_SEND__{rule['card_id']}|{rule['image_url']}"] * quantity
 
-                if delivery_content:
-                    # 处理备注信息和变量替换
-                    final_content = self._process_delivery_content_with_description(delivery_content, rule.get('card_description', ''))
-
-                    # 增加发货次数统计
-                    db_manager.increment_delivery_times(rule['id'])
-                    logger.info(f"自动发货成功: 规则ID={rule['id']}, 内容长度={len(final_content)}")
-                    return final_content
-                else:
+                if not contents:
                     logger.warning(f"获取发货内容失败: 规则ID={rule['id']}")
                     return None
+                description = rule.get('card_description', '')
+                for _ in contents:
+                    db_manager.increment_delivery_times(rule['id'])
+                return [self._process_delivery_content_with_description(content, description) for content in contents]
             else:
                 # 没有订单ID，记录日志但不处理发货内容
                 logger.info(f"⚠️ 未检测到订单ID，跳过发货内容处理。规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
@@ -4915,29 +6240,33 @@ class XianyuLive:
 
     def _process_delivery_content_with_description(self, delivery_content: str, card_description: str) -> str:
         """处理发货内容和备注信息，实现变量替换"""
+        import delivery_reliability as _dr_content
+
         try:
             # 如果是图片发送标记，不进行备注处理，直接返回
             if delivery_content.startswith("__IMAGE_SEND__"):
                 return delivery_content
-            
+
             # 如果没有备注信息，直接返回发货内容
             if not card_description or not card_description.strip():
-                return delivery_content
+                return _dr_content.append_self_service_resend_hint(delivery_content)
 
             # 替换备注中的变量
             processed_description = card_description.replace('{DELIVERY_CONTENT}', delivery_content)
 
             # 如果备注中包含变量替换，返回处理后的备注
             if '{DELIVERY_CONTENT}' in card_description:
-                return processed_description
+                return _dr_content.append_self_service_resend_hint(processed_description)
             else:
                 # 如果备注中没有变量，将备注和发货内容组合
-                return f"{processed_description}\n\n{delivery_content}"
+                return _dr_content.append_self_service_resend_hint(
+                    f"{processed_description}\n\n{delivery_content}"
+                )
 
         except Exception as e:
             logger.error(f"处理备注信息失败: {e}")
             # 出错时返回原始发货内容
-            return delivery_content
+            return _dr_content.append_self_service_resend_hint(delivery_content)
 
     async def _get_api_card_content(self, rule, order_id=None, item_id=None, buyer_id=None, spec_name=None, spec_value=None, retry_count=0):
         """调用API获取卡券内容，支持动态参数替换和重试机制"""
@@ -5028,7 +6357,12 @@ class XianyuLive:
 
                 return None
 
-        except (aiohttp.ClientTimeout, aiohttp.ClientError) as e:
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            # 原来写的是 `except (aiohttp.ClientTimeout, aiohttp.ClientError)`。
+            # ClientTimeout 是**配置对象不是异常类**，Python 在匹配 except 时会现场抛
+            # `TypeError: catching classes that do not inherit from BaseException is not allowed`，
+            # 而且这个 TypeError 会**穿过后面所有 except（包括 except Exception）**直接冒到调用方。
+            # 后果：API 卡券只要能一次网络抖动，整单发货就崩，重试分支一次都进不去。
             logger.warning(f"API调用网络异常: {self._safe_str(e)}")
 
             # 网络异常也进行重试
@@ -5176,27 +6510,7 @@ class XianyuLive:
                     if current_time - self.last_token_refresh_time >= self.token_refresh_interval:
                         logger.info("Token即将过期，准备刷新...")
                         new_token = await self.refresh_token()
-                        if new_token:
-                            logger.info(f"【{self.cookie_id}】Token刷新成功，将关闭WebSocket以使用新Token重连")
-                            
-                            # Token刷新成功后，需要关闭WebSocket连接，让它用新Token重新连接
-                            # 原因：WebSocket连接建立时使用的是旧Token，新Token需要重新建立连接才能生效
-                            # 注意：只关闭WebSocket，不重启整个实例（后台任务继续运行）
-                            
-                            # 关闭当前WebSocket连接
-                            if self.ws and not self.ws.closed:
-                                try:
-                                    logger.info(f"【{self.cookie_id}】关闭当前WebSocket连接以使用新Token重连...")
-                                    await self.ws.close()
-                                    logger.info(f"【{self.cookie_id}】WebSocket连接已关闭，将自动重连")
-                                except Exception as close_e:
-                                    logger.warning(f"【{self.cookie_id}】关闭WebSocket时出错: {self._safe_str(close_e)}")
-                            
-                            # 退出Token刷新循环，让main循环重新建立连接
-                            # 后台任务（心跳、清理等）继续运行
-                            logger.info(f"【{self.cookie_id}】Token刷新完成，WebSocket将使用新Token重新连接")
-                            break
-                        else:
+                        if not new_token:
                             # 根据上一次刷新状态决定日志级别（冷却/已重启为正常情况）
                             if getattr(self, 'last_token_refresh_status', None) in ("skipped_cooldown", "restarted_after_cookie_refresh"):
                                 logger.info(f"【{self.cookie_id}】Token刷新未执行或已重启（正常），将在{self.token_retry_interval // 60}分钟后重试")
@@ -5255,6 +6569,10 @@ class XianyuLive:
         await ws.send(json.dumps(msg))
 
     async def send_msg(self, ws, cid, toid, text):
+        import delivery_reliability as dr
+
+        if ws is None:
+            raise dr.DeliverySubmissionNotAttempted("WebSocket 不存在，消息未提交")
         text = {
             "contentType": 1,
             "text": {
@@ -5298,7 +6616,13 @@ class XianyuLive:
                 }
             ]
         }
-        await ws.send(json.dumps(msg))
+        payload = json.dumps(msg)
+        try:
+            await ws.send(payload)
+        except Exception as exc:
+            raise dr.DeliverySubmissionUnknown(
+                f"WebSocket 写入结果未知：{self._safe_str(exc)}"
+            ) from exc
 
     async def init(self, ws):
         # 如果没有token或者token过期，获取新token
@@ -5368,7 +6692,8 @@ class XianyuLive:
         }
         # 添加超时保护，避免在WebSocket关闭时阻塞
         try:
-            await asyncio.wait_for(ws.send(json.dumps(msg)), timeout=2.0)
+            async with asyncio.timeout(2.0):
+                await ws.send(json.dumps(msg))
             self.last_heartbeat_time = time.time()
             logger.warning(f"【{self.cookie_id}】心跳包已发送")
         except asyncio.TimeoutError:
@@ -5382,8 +6707,15 @@ class XianyuLive:
         consecutive_failures = 0
         max_failures = 3  # 连续失败3次后停止心跳
 
+        # 心跳是最能说明"这条连接还活着"的信号：它停了，回复和发货就全停了。
+        # 正常退出（账号停用/连接关闭）会注销，只有异常卡死才会被判定为停滞。
+        import task_watchdog as _wd
+        _hb_key = f"heartbeat:{self.cookie_id}"
+        _wd.register(_hb_key, self.heartbeat_interval, f"账号心跳（{self.cookie_id}）")
+
         try:
-            while True:
+            while not self._heartbeat_stop.is_set():
+                heartbeat_delay = self.heartbeat_interval
                 try:
                     # 检查账号是否启用
                     from cookie_manager import manager as cookie_manager
@@ -5398,13 +6730,37 @@ class XianyuLive:
 
                     await self.send_heartbeat(ws)
                     consecutive_failures = 0  # 重置失败计数
+                    _wd.beat(_hb_key)
 
-                    await self._interruptible_sleep(self.heartbeat_interval)
+                    # C3 补发扫描：挂在心跳上，因为补发必须复用这条活着的连接。
+                    # 每 60 个心跳扫一次（心跳默认 10s → 约 10 分钟，与补发冷却同量级）。
+                    self._resend_tick = int(getattr(self, "_resend_tick", 0)) + 1
+                    if self._resend_tick >= 60:
+                        self._resend_tick = 0
+                        try:
+                            await self._resend_undelivered(ws)
+                        except Exception as _rs_e:
+                            logger.error(f"【{self.cookie_id}】补发扫描异常: {self._safe_str(_rs_e)}")
+                        # 回复发件箱补发（拆解 10）：只补 pending，沿用同一条活着的连接
+                        try:
+                            await self._resume_reply_outbox(ws)
+                        except Exception as _ob_e:
+                            logger.error(f"【{self.cookie_id}】回复发件箱补发异常: {self._safe_str(_ob_e)}")
+                        # 订单全量对账（拆解 11）：扫第 1 页，只为发现"平台有单、本地没有"。
+                        # 漏单不会进 C3 补发队列（补发只认库里的单），所以必须单独对一次。
+                        try:
+                            import order_reconcile as _orc
+                            await asyncio.to_thread(_orc.reconcile, self.cookies_str, self.cookie_id, 1, 20)
+                        except Exception as _rc_e:
+                            logger.warning(f"【{self.cookie_id}】订单对账异常（不影响心跳）: {self._safe_str(_rc_e)}")
+                        # 卡券低库存预警（拆解 13）：断货时买家付了钱没卡，代价最大。
+                        # 按卡券 24 小时去重，扫库是纯读，频率不敏感。
+                        try:
+                            import stock_alert as _sa
+                            await asyncio.to_thread(_sa.maybe_notify)
+                        except Exception as _sa_e:
+                            logger.warning(f"【{self.cookie_id}】库存预警异常（不影响心跳）: {self._safe_str(_sa_e)}")
 
-                except asyncio.CancelledError:
-                    # 收到取消信号，立即退出循环
-                    logger.info(f"【{self.cookie_id}】心跳循环收到取消信号，准备退出")
-                    raise  # 重新抛出，让任务正常结束
                 except Exception as e:
                     consecutive_failures += 1
                     logger.error(f"心跳发送失败 ({consecutive_failures}/{max_failures}): {self._safe_str(e)}")
@@ -5413,19 +6769,23 @@ class XianyuLive:
                         logger.error(f"【{self.cookie_id}】心跳连续失败{max_failures}次，停止心跳循环")
                         break
 
-                    # 失败后短暂等待再重试，使用可中断的sleep
-                    try:
-                        await self._interruptible_sleep(5)
-                    except asyncio.CancelledError:
-                        # 在等待重试时收到取消信号，立即退出
-                        logger.info(f"【{self.cookie_id}】心跳循环在重试等待时收到取消信号，准备退出")
-                        raise
+                    heartbeat_delay = 5
+
+                try:
+                    async with asyncio.timeout(heartbeat_delay):
+                        await self._heartbeat_stop.wait()
+                except asyncio.TimeoutError:
+                    pass
         except asyncio.CancelledError:
             # 确保CancelledError被正确传播
             logger.info(f"【{self.cookie_id}】心跳循环已取消，正在退出...")
             raise
         finally:
             # 确保任务能正常结束
+            try:
+                _wd.unregister(_hb_key)
+            except Exception:
+                pass
             logger.info(f"【{self.cookie_id}】心跳循环已退出")
 
     async def handle_heartbeat_response(self, message_data):
@@ -5706,11 +7066,8 @@ class XianyuLive:
                 logger.info(f"【{self.cookie_id}】开始Cookie刷新任务，暂时暂停心跳以避免连接冲突...")
 
                 # 暂时暂停心跳任务，避免与浏览器操作冲突
-                heartbeat_was_running = False
-                if self.heartbeat_task and not self.heartbeat_task.done():
-                    heartbeat_was_running = True
-                    self.heartbeat_task.cancel()
-                    logger.warning(f"【{self.cookie_id}】已暂停心跳任务")
+                heartbeat_was_running = self.heartbeat_task is not None and not self.heartbeat_task.done()
+                await self._stop_heartbeat()
 
                 # 为整个Cookie刷新任务添加超时保护（3分钟，缩短时间减少影响）
                 success = await asyncio.wait_for(
@@ -5719,9 +7076,8 @@ class XianyuLive:
                 )
 
                 # 重新启动心跳任务
-                if heartbeat_was_running and self.ws and not self.ws.closed:
-                    logger.warning(f"【{self.cookie_id}】重新启动心跳任务")
-                    self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
+                if heartbeat_was_running:
+                    self._start_heartbeat()
 
                 if success:
                     self.last_cookie_refresh_time = current_time
@@ -5769,10 +7125,7 @@ class XianyuLive:
                 self.last_cookie_refresh_time = current_time
             finally:
                 # 确保心跳任务恢复（如果WebSocket仍然连接）
-                if (self.ws and not self.ws.closed and
-                    (not self.heartbeat_task or self.heartbeat_task.done())):
-                    logger.info(f"【{self.cookie_id}】Cookie刷新完成，心跳任务正常运行")
-                    self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
+                self._start_heartbeat()
 
                 # 清空消息接收标志，允许下次正常执行Cookie刷新
                 self.last_message_received_time = 0
@@ -5915,9 +7268,11 @@ class XianyuLive:
                 ])
 
             # 使用无头浏览器
-            browser = await playwright.chromium.launch(
-                headless=True,  # 改回无头模式
-                args=browser_args
+            from browser_limit import launch_browser as _launch_browser
+            browser = await _launch_browser(
+                playwright,
+                {'headless': True, 'args': browser_args},
+                f'扫码取Cookie {cookie_id or ""}'
             )
 
             # 创建浏览器上下文
@@ -6300,9 +7655,11 @@ class XianyuLive:
                 ])
 
             # 使用无头浏览器
-            browser = await playwright.chromium.launch(
-                headless=True,
-                args=browser_args
+            from browser_limit import launch_browser as _launch_browser
+            browser = await _launch_browser(
+                playwright,
+                {'headless': True, 'args': browser_args},
+                'Cookie刷新（页面）'
             )
 
             # 创建浏览器上下文
@@ -6603,9 +7960,11 @@ class XianyuLive:
                 ])
 
             # Cookie刷新模式使用无头浏览器
-            browser = await playwright.chromium.launch(
-                headless=True,
-                args=browser_args
+            from browser_limit import launch_browser as _launch_browser
+            browser = await _launch_browser(
+                playwright,
+                {'headless': True, 'args': browser_args},
+                f'Cookie刷新 {self.cookie_id}'
             )
 
             # 创建浏览器上下文
@@ -7314,6 +8673,183 @@ class XianyuLive:
             self.message_debounce_tasks[chat_id]['task'] = task
             logger.warning(f"【{self.cookie_id}】为chat_id {chat_id} 创建防抖任务，延迟 {self.message_debounce_delay} 秒")
 
+    # ------------------------------------------------------------------
+    # 回复发件箱（拆解 10：falses00/Falses-Goofish-GuardAgent 的 core/reply_outbox.py）
+    #
+    # 内存里的 processed_message_ids 重启即失忆，所以"进程崩在生成之后、发送之前"
+    # 这件事只能靠落盘的表说清楚。三个动作：发之前登记 + 抢占（begin），
+    # 发完收尾（finish），心跳上补发只剩下 pending 的（resume）。
+    # 结果语义和 C3 一致：只有 pending（一个字节都没发出去）能自动补，
+    # unknown（发送中崩溃/异常）永不自动补，留给人。
+    # ------------------------------------------------------------------
+    def _reply_outbox_key(self, message_data: dict, chat_id: str, send_message: str) -> str:
+        """稳定的"这一条买家消息"标识。优先平台 messageId；没有就退化到 chat+时间。"""
+        try:
+            mid = self._extract_message_id(message_data)
+        except Exception:
+            mid = None
+        if mid:
+            return str(mid)
+        create_time = 0
+        try:
+            m1 = message_data.get("1") if isinstance(message_data, dict) else None
+            if isinstance(m1, dict):
+                create_time = int(m1.get("5", 0) or 0)
+        except Exception:
+            create_time = 0
+        if not create_time:
+            # 没有时间戳时不能用当前时间兜底：重推会算出新 key，等于没去重。
+            # 用"会话+内容"的摘要，至少同一条消息永远是同一个 key。
+            import hashlib
+            digest = hashlib.sha1(f"{chat_id}|{send_message}".encode("utf-8")).hexdigest()[:16]
+            return f"fallback:{chat_id}:{digest}"
+        return f"fallback:{chat_id}:{create_time}"
+
+    def _outbox_status(self, message_data: dict, chat_id: str, send_message: str) -> str:
+        """查这条消息在发件箱里的状态；模块不可用返回 ''。"""
+        try:
+            import reply_outbox as _ro
+            return _ro.status_of(self.cookie_id, self._reply_outbox_key(message_data, chat_id, send_message))
+        except Exception:
+            return ""
+
+    def _outbox_begin(self, message_data: dict, chat_id: str, send_user_id: str, item_id: str,
+                      send_message: str, reply_text: str,
+                      payload_kind: str = "text", payload: str = ""):
+        """
+        登记并抢占发送权。
+        返回 str=key（可以发）/ False=这次不发 / None=模块不可用（退回原行为）。
+        """
+        try:
+            import reply_outbox as _ro
+        except Exception:
+            return None
+        try:
+            key = self._reply_outbox_key(message_data, chat_id, send_message)
+            # 三档结论在这里定，也在**这里**执行（拆解 39 §八-3）。
+            # 放在唯一的发送口而不是只放在 AI 引擎里：关键词回复、默认回复都
+            # 不经过 ai_reply_engine，只在那里拦等于漏一半。
+            #   block → 整条不发，登记 skipped（终态，重推/补发都不会再发）
+            #   draft → 默认扣下不发，登记 held，等人在发件箱放行
+            _tier, _tier_reason, _tier_enforce = "", "", False
+            try:
+                import reply_guard as _rg_tier
+                _rgc = _rg_tier.classify(reply_text) or {}
+                _tier = _rgc.get("tier", "") or ""
+                _tier_reason = _rgc.get("reason", "") or ""
+                _tier_enforce = bool(_rg_tier.enforce_draft())
+            except Exception as _e:
+                # 闸门自己异常：block/draft 都判不了，按"没命中"放行不符合
+                # 「回复不能说出去就算」的立场，但也不能因此整条链路停摆。
+                # 折中：记日志，继续走原来的发送流程（与 reply_guard.check 的
+                # 异常口径一致——异常转人工的逻辑在 AI 引擎那一层）。
+                logger.warning(f"【{self.cookie_id}】回复三档判定失败，按 auto 处理: {self._safe_str(_e)}")
+
+            if _tier == "block":
+                logger.error(f"【{self.cookie_id}】回复含站外导流/违规词，已拦截: {_tier_reason}")
+                try:
+                    _ro.hold(self.cookie_id, key, chat_id=chat_id, item_id=item_id or "",
+                             user_id=send_user_id or "", reply_text=reply_text or "",
+                             payload_kind=payload_kind, payload=payload,
+                             tier="block", reason=_tier_reason)
+                    _ro.finish(self.cookie_id, key, "skipped", _tier_reason or "合规闸拦截")
+                except Exception:
+                    pass
+                try:
+                    from notify_service import send_event
+                    send_event("risk", "回复含违规词，已拦截未发送",
+                               f"会话 {chat_id}：{_tier_reason}", level="err")
+                except Exception:
+                    pass
+                return False
+
+            if _tier == "draft" and _tier_enforce:
+                logger.warning(f"【{self.cookie_id}】draft 档回复已扣下待人工确认: {_tier_reason}")
+                try:
+                    _ro.hold(self.cookie_id, key, chat_id=chat_id, item_id=item_id or "",
+                             user_id=send_user_id or "", reply_text=reply_text or "",
+                             payload_kind=payload_kind, payload=payload,
+                             tier="draft", reason=_tier_reason or "需人工收尾")
+                except Exception as _e:
+                    # 登记失败还照发 = draft 默认扣不住的假象，宁可这次不发。
+                    logger.error(f"【{self.cookie_id}】draft 扣下登记失败，本条不发: {self._safe_str(_e)}")
+                    return False
+                try:
+                    from notify_service import send_event
+                    send_event("risk", "draft 档回复已扣下待人工确认",
+                               f"会话 {chat_id}：{_tier_reason}", level="warn")
+                except Exception:
+                    pass
+                return False
+
+            res = _ro.begin(self.cookie_id, key, chat_id=chat_id, item_id=item_id or "",
+                            user_id=send_user_id or "", reply_text=reply_text or "",
+                            payload_kind=payload_kind, payload=payload, tier=_tier)
+            if res.get("ok"):
+                return key
+            reason = res.get("reason")
+            if reason == "done":
+                logger.warning(f"【{self.cookie_id}】回复发件箱：这条消息已处理过（{res.get('status')}），跳过")
+            elif reason == "in_flight":
+                logger.warning(f"【{self.cookie_id}】回复发件箱：另一个处理器正在发这条消息，跳过")
+            elif reason == "unknown":
+                logger.warning(f"【{self.cookie_id}】回复发件箱：上次发送结果未知，不自动重发（等人工确认）")
+            return False
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】回复发件箱登记失败，按原流程发送: {self._safe_str(e)}")
+            return None
+
+    def _outbox_end(self, key, status: str, error: str = ""):
+        """收尾。key 为空（模块不可用/没抢到）时什么都不做。"""
+        if not key:
+            return
+        try:
+            import reply_outbox as _ro
+            _ro.finish(self.cookie_id, key, status, error)
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】回复发件箱收尾失败: {self._safe_str(e)}")
+
+    async def _resume_reply_outbox(self, ws):
+        """
+        补发只剩下 `pending` 的回复（登记了但一个字节都没发出去）。
+
+        挂在心跳上，复用这条活着的连接。`failed` / `unknown` 不在这里处理——
+        它们要人去页面上看一眼（回复发件箱的停止态只有人工出口）。
+        """
+        try:
+            import reply_outbox as _ro
+        except Exception:
+            return
+        try:
+            _ro.reap_stale()
+            pend = _ro.pending_rows(self.cookie_id, limit=3)
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】回复发件箱扫描失败: {self._safe_str(e)}")
+            return
+        for r in pend:
+            key = r.get("source_msg_id") or ""
+            try:
+                claim = _ro.begin(self.cookie_id, key, chat_id=r.get("chat_id", ""),
+                                  item_id=r.get("item_id", ""), user_id=r.get("user_id", ""),
+                                  reply_text=r.get("reply_text", ""),
+                                  payload_kind=r.get("payload_kind") or "text",
+                                  payload=r.get("payload", ""))
+                if not claim.get("ok"):
+                    continue
+                chat_id, toid = r.get("chat_id") or "", r.get("user_id") or ""
+                if not chat_id or not toid:
+                    _ro.finish(self.cookie_id, key, "failed", "缺少会话/用户ID，无法补发")
+                    continue
+                if (r.get("payload_kind") or "text") == "image" and r.get("payload"):
+                    await self.send_image_msg(ws, chat_id, toid, r.get("payload"))
+                else:
+                    await self.send_msg(ws, chat_id, toid, r.get("reply_text") or "")
+                _ro.finish(self.cookie_id, key, "sent")
+                logger.warning(f"【{self.cookie_id}】回复发件箱：补发成功 {key[:40]}")
+            except Exception as e:
+                _ro.finish(self.cookie_id, key, "unknown", self._safe_str(e))
+                logger.error(f"【{self.cookie_id}】回复发件箱补发失败（记未知，不重试）: {self._safe_str(e)}")
+
     async def _process_chat_message_reply(self, message_data: dict, websocket, send_user_name: str,
                                          send_user_id: str, send_message: str, item_id: str,
                                          chat_id: str, msg_time: str):
@@ -7344,6 +8880,24 @@ class XianyuLive:
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】chat_id {chat_id} 自动回复已暂停，剩余时间: {remaining_minutes}分{remaining_seconds}秒")
                 return
 
+            # 落盘去重（拆解 10）：重启后内存表是空的，靠发件箱挡住平台重推。
+            # sending（另一个处理器正在发）/ unknown（上次结果未知）也跳过——宁可少回一条，
+            # 不能重复回一条；unknown 留给人去发件箱里确认。
+            _ob_state = self._outbox_status(message_data, chat_id, send_message)
+            if _ob_state in ("sent", "skipped", "sending", "unknown", "held"):
+                logger.warning(f"[{msg_time}] 【{self.cookie_id}】回复发件箱：这条消息状态为 {_ob_state}，跳过重复处理")
+                return
+
+            # 买家提问观测（方向三）：先落盘，再决定怎么回。
+            # 原来是反的 —— `ai_conversations` 只在 AI 生成回复时写入，于是
+            # **关键词越答得上的问题，越不会留下任何记录**：想补词条只能靠猜。
+            _qid = None
+            try:
+                import faq_kb as _fk_q
+                _qid = _fk_q.safe_log(self.cookie_id, chat_id, send_user_id, item_id, send_message)
+            except Exception:
+                _qid = None
+
             # 构造用户URL
             user_url = f'https://www.goofish.com/personal?userId={send_user_id}'
 
@@ -7367,6 +8921,11 @@ class XianyuLive:
                 if reply == "EMPTY_REPLY":
                     # 匹配到关键词但回复内容为空，不进行任何回复
                     logger.info(f"[{msg_time}] 【{self.cookie_id}】匹配到空回复关键词，跳过自动回复")
+                    try:
+                        import faq_kb as _fk_e
+                        _fk_e.safe_note(_qid, "empty", "关键词回复为空")
+                    except Exception:
+                        pass
                     return
                 elif reply:
                     reply_source = '关键词'  # 标记为关键词回复
@@ -7381,6 +8940,11 @@ class XianyuLive:
                         if default_reply_result == "EMPTY_REPLY":
                             # 默认回复内容为空，不进行任何回复
                             logger.info(f"[{msg_time}] 【{self.cookie_id}】默认回复内容为空，跳过自动回复")
+                            try:
+                                import faq_kb as _fk_e2
+                                _fk_e2.safe_note(_qid, "empty", "默认回复为空")
+                            except Exception:
+                                pass
                             return
                         
                         # 处理默认回复（可能包含图片和文字）
@@ -7454,6 +9018,18 @@ class XianyuLive:
                             else:
                                 # 只有图片没有文字，已经发送完毕
                                 if default_image_url:
+                                    # 只发图也是一条回复：发件箱记一笔（拆解 10）
+                                    if final_image_url:
+                                        _ob_key_img = self._outbox_begin(
+                                            message_data, chat_id, send_user_id, item_id,
+                                            send_message, "", payload_kind="image",
+                                            payload=final_image_url)
+                                        self._outbox_end(_ob_key_img, "sent")
+                                        try:
+                                            import faq_kb as _fk_img
+                                            _fk_img.safe_note(_qid, "default", "默认回复（仅图片）")
+                                        except Exception:
+                                            pass
                                     return
                                 reply = None
                         else:
@@ -7465,6 +9041,26 @@ class XianyuLive:
 
             # 如果有回复内容，发送消息
             if reply:
+                # 回填"这条问题是怎么被答上的"（方向三）。放在发送之前：
+                # 发送失败也不影响这张统计表 —— 它记的是"我们有没有答案"，
+                # 不是"买家收没收到"（后者由发件箱负责）。
+                try:
+                    import faq_kb as _fk_n
+                    _fk_n.safe_note(_qid, {
+                        "API": "api", "关键词": "keyword", "AI": "ai", "默认": "default",
+                    }.get(reply_source, "keyword"))
+                except Exception:
+                    pass
+
+                # 发之前先登记 + 抢占（拆解 10）：抢不到就说明这条消息已经被处理过，
+                # 或者另一个处理器正在发——两种情况都不该再发。
+                _ob_kind = "image" if reply.startswith("__IMAGE_SEND__") else "text"
+                _ob_payload = reply.replace("__IMAGE_SEND__", "") if _ob_kind == "image" else ""
+                _ob_key = self._outbox_begin(message_data, chat_id, send_user_id, item_id,
+                                             send_message, reply,
+                                             payload_kind=_ob_kind, payload=_ob_payload)
+                if _ob_key is False:
+                    return
                 # 检查是否是图片发送标记
                 if reply.startswith("__IMAGE_SEND__"):
                     # 提取图片URL（关键词回复不包含卡券ID）
@@ -7472,24 +9068,34 @@ class XianyuLive:
                     # 发送图片消息
                     try:
                         await self.send_image_msg(websocket, chat_id, send_user_id, image_url)
+                        self._outbox_end(_ob_key, "sent")
                         # 记录发出的图片消息
                         msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                         logger.info(f"[{msg_time}] 【{reply_source}图片发出】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): 图片 {image_url}")
                     except Exception as e:
                         # 图片发送失败，发送错误提示
                         logger.error(f"图片发送失败: {self._safe_str(e)}")
+                        self._outbox_end(_ob_key, "unknown", self._safe_str(e))
                         await self.send_msg(websocket, chat_id, send_user_id, "抱歉，图片发送失败，请稍后重试。")
                         msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                         logger.error(f"[{msg_time}] 【{reply_source}图片发送失败】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id})")
                 else:
                     # 普通文本消息
-                    await self.send_msg(websocket, chat_id, send_user_id, reply)
-                    # 记录发出的消息
-                    msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                    logger.info(f"[{msg_time}] 【{reply_source}发出】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {reply}")
+                    try:
+                        await self.send_msg(websocket, chat_id, send_user_id, reply)
+                        self._outbox_end(_ob_key, "sent")
+                    except Exception as e:
+                        # 发文本抛异常 = 平台收没收到不知道，只能记未知，不自动重发
+                        self._outbox_end(_ob_key, "unknown", self._safe_str(e))
+                        raise
             else:
                 msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】未找到匹配的回复规则，不回复")
+                try:
+                    import faq_kb as _fk_none
+                    _fk_none.safe_note(_qid, "none")
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(f"处理聊天消息回复时发生错误: {self._safe_str(e)}")
 
@@ -7528,11 +9134,14 @@ class XianyuLive:
                 logger.debug(f"【{self.cookie_id}】非同步包消息，跳过处理")
                 return
 
-            # 获取并解密数据
-            sync_data = message_data["body"]["syncPushPackage"]["data"][0]
+            for sync_data in message_data["body"]["syncPushPackage"]["data"]:
+                await self._handle_sync_entry(sync_data, message_data, websocket)
+        except Exception as e:
+            logger.error(f"处理消息时发生错误: {self._safe_str(e)}")
 
-            # 检查是否有必要的字段
-            if "data" not in sync_data:
+    async def _handle_sync_entry(self, sync_data, message_data, websocket):
+        try:
+            if not isinstance(sync_data, dict) or "data" not in sync_data:
                 logger.warning("同步包中无data字段")
                 return
 
@@ -7744,6 +9353,7 @@ class XianyuLive:
                 send_user_name = message_10.get("senderNick", message_10.get("reminderTitle", "未知用户"))
                 send_user_id = message_10.get("senderUserId", "unknown")
                 send_message = message_10.get("reminderContent", "")
+                session_type = str(message_10.get("sessionType", "1")).strip()
 
                 chat_id_raw = message_1.get("2", "")
                 chat_id = chat_id_raw.split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
@@ -7755,7 +9365,7 @@ class XianyuLive:
             # 格式化消息时间
             msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(create_time/1000))
 
-
+            import delivery_reliability as _dr_self_service
 
             # 判断消息方向
             if send_user_id == self.myid:
@@ -7771,7 +9381,6 @@ class XianyuLive:
                 # 🔔 立即发送消息通知（独立于自动回复功能）
                 # 检查是否为群组消息，如果是群组消息则跳过通知
                 try:
-                    session_type = message_10.get("sessionType", "1")  # 默认为个人消息类型
                     if session_type == "30":
                         logger.info(f"📱 检测到群组消息（sessionType=30），跳过消息通知")
                     else:
@@ -7859,8 +9468,25 @@ class XianyuLive:
             elif send_message == '已发货':
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】发货确认消息不处理')
                 return
+            # 买家明确回复“1/提取”时，优先执行最近两小时已发订单的幂等补发，
+            # 不受人工接入暂停影响，也不进入普通 AI 回复防抖。
+            elif (
+                session_type != "30"
+                and _dr_self_service.is_self_service_resend_trigger(send_message)
+            ):
+                await self._handle_self_service_resend(
+                    websocket,
+                    message,
+                    send_user_name,
+                    send_user_id,
+                    send_message,
+                    chat_id,
+                    msg_time,
+                    session_type=session_type,
+                )
+                return
             # 【重要】检查是否为自动发货触发消息 - 即使在人工接入暂停期间也要处理
-            elif self._is_auto_delivery_trigger(send_message):
+            elif self._is_auto_delivery_trigger(send_message, message):
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】检测到自动发货触发消息，即使在暂停期间也继续处理: {send_message}')
                 # 使用统一的自动发货处理方法
                 await self._handle_auto_delivery(websocket, message, send_user_name, send_user_id,
@@ -7963,7 +9589,6 @@ class XianyuLive:
 
         except Exception as e:
             logger.error(f"处理消息时发生错误: {self._safe_str(e)}")
-            logger.warning(f"原始消息: {message_data}")
 
     async def main(self):
         """主程序入口"""
@@ -8005,14 +9630,7 @@ class XianyuLive:
                             # 记录后台任务启动前的状态
                             logger.warning(f"【{self.cookie_id}】准备启动后台任务 - 当前状态: heartbeat={self.heartbeat_task}, token_refresh={self.token_refresh_task}, cleanup={self.cleanup_task}, cookie_refresh={self.cookie_refresh_task}")
                             
-                            # 如果存在心跳任务引用，先清理（心跳任务依赖WebSocket，必须重启）
-                            if self.heartbeat_task:
-                                logger.warning(f"【{self.cookie_id}】检测到旧心跳任务引用，先清理...")
-                                self._reset_background_tasks()
-
-                            # 启动心跳任务（依赖WebSocket，每次重连都需要重启）
-                            logger.info(f"【{self.cookie_id}】启动心跳任务...")
-                            self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(websocket))
+                            self._start_heartbeat()
 
                             # 启动其他后台任务（不依赖WebSocket，只在首次连接时启动）
                             tasks_started = []
@@ -8081,6 +9699,7 @@ class XianyuLive:
                             # 注意：async with 会自动关闭 WebSocket，但我们需要清理引用
                             if self.ws == websocket:
                                 self.ws = None
+                                await self._stop_heartbeat()
                                 logger.info(f"【{self.cookie_id}】WebSocket连接已退出，引用已清理")
 
                 except Exception as e:
@@ -8189,12 +9808,6 @@ class XianyuLive:
                         if self.current_token:
                             logger.warning(f"【{self.cookie_id}】清空当前token，重新连接时将重新获取")
                             self.current_token = None
-
-                        # 直接重置任务引用，不等待取消（快速重连方案）
-                        # 这样可以避免等待任务取消导致的阻塞问题
-                        logger.info(f"【{self.cookie_id}】准备重置后台任务引用（快速重连模式）...")
-                        self._reset_background_tasks()
-                        logger.info(f"【{self.cookie_id}】后台任务引用已重置，可以立即重连")
 
                         # 等待后重试 - 使用可中断的sleep，并定期输出日志证明进程还活着
                         logger.info(f"【{self.cookie_id}】开始等待 {retry_delay} 秒...")
@@ -8356,7 +9969,7 @@ class XianyuLive:
         params = {
             'jsv': '2.7.2',
             'appKey': '34839810',
-            't': str(int(time.time()) * 1000),
+            't': str(int(time.time() * 1000)),
             'sign': '',
             'v': '1.0',
             'type': 'originaljson',
@@ -8570,6 +10183,10 @@ class XianyuLive:
 
     async def send_image_msg(self, ws, cid, toid, image_url, width=800, height=600, card_id=None):
         """发送图片消息"""
+        import delivery_reliability as dr
+
+        if ws is None:
+            raise dr.DeliverySubmissionNotAttempted("WebSocket 不存在，图片消息未提交")
         try:
             # 检查图片URL是否需要上传到CDN
             original_url = image_url
@@ -8684,8 +10301,14 @@ class XianyuLive:
                 ]
             }
 
-            await ws.send(json.dumps(msg))
-            logger.info(f"【{self.cookie_id}】图片消息发送成功: {image_url}")
+            payload = json.dumps(msg)
+            try:
+                await ws.send(payload)
+            except Exception as exc:
+                raise dr.DeliverySubmissionUnknown(
+                    f"WebSocket 图片写入结果未知：{self._safe_str(exc)}"
+                ) from exc
+            logger.info(f"【{self.cookie_id}】图片消息已提交到连接: {image_url}")
 
         except Exception as e:
             logger.error(f"【{self.cookie_id}】发送图片消息失败: {self._safe_str(e)}")

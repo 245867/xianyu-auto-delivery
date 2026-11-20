@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>回复发件箱</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b23; --line:#242c38; --txt:#e6edf3;
+    --dim:#8b98a9; --acc:#3fb950; --warn:#d29922; --err:#f85149; --blue:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:24px 20px 60px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 12px;font-weight:600}
+  .kv{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .kv span{background:#0d1117;border:1px solid var(--line);border-radius:6px;
+           padding:3px 10px;font-size:12px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:500;font-size:12px}
+  button{background:#21262d;color:var(--txt);border:1px solid var(--line);
+         border-radius:6px;padding:4px 11px;font:12px inherit;cursor:pointer}
+  button:hover{border-color:#3d4756}
+  button.okbtn{color:var(--acc);border-color:#1d4429}
+  button.warnbtn{color:var(--warn);border-color:#4a3a12}
+  .muted{color:var(--dim)} .ok{color:var(--acc)} .err{color:var(--err)} .warn{color:var(--warn)}
+  .hint{color:var(--dim);font-size:12px;margin-top:8px}
+  .note{background:#0f1620;border-left:3px solid var(--blue);padding:10px 14px;
+        border-radius:0 6px 6px 0;font-size:13px;color:#c3d0e0;margin-bottom:14px}
+  .note b{color:#fff}
+  .mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+  #toast{position:fixed;right:20px;bottom:20px;background:#21262d;border:1px solid var(--line);
+         border-radius:8px;padding:10px 16px;font-size:13px;opacity:0;transition:opacity .2s;
+         pointer-events:none;max-width:420px}
+  #toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>回复发件箱</h1>
+  <div class="sub">每一条自动回复在发出去之前先登记一行，(账号 + 消息ID) 唯一。</div>
+
+  <div class="note">
+    <b>为什么需要这张表：</b>内存里的去重字典重启就没了。断线重连后平台会把最近的消息重推一遍，
+    以前会再回一条一样的；更糟的是"生成完了、还没发就崩了"，日志里既没有已发也没有没发。
+    现在：<b>pending</b> 表示一个字节都没发出去 → 心跳会自动补；<b>unknown</b> 表示发送中断、
+    不知道到没到 → <b>永不自动补</b>，请你看一眼聊天记录，收没收到自己点。
+  </div>
+
+  <div class="card">
+    <h2>运行状态</h2>
+    <div class="kv" id="kv"><span class="muted">加载中…</span></div>
+    <button id="btnRefresh">刷新</button>
+    <div class="hint">补发挂在账号心跳上（约每 10 分钟一次），这里只是手动看看。</div>
+  </div>
+
+  <div class="card">
+    <h2>待补发 <span class="muted">（pending：还没发出去过）</span></h2>
+    <div id="pendWrap"><span class="muted">暂无</span></div>
+  </div>
+
+  <div class="card">
+    <h2>需要人看一眼 <span class="muted">（unknown / failed）</span></h2>
+    <div id="holdWrap"><span class="muted">暂无</span></div>
+  </div>
+
+  <div class="card">
+    <h2>扣下待确认 <span class="muted">（draft：售后 / 退款 / 承诺类，默认不发）</span></h2>
+    <div id="draftWrap"><span class="muted">暂无</span></div>
+    <div class="hint">这些回复没有发送失败，是"答错了要赔"的那类（退款 / 补发 / 保证 / 发票…），
+      所以只登记、不自动发。确认这句话可以发 → <b>放行</b>（下一次心跳发出去）；不想发 → <b>不用发了</b>。
+      确需退回"照发、只标注"，把环境变量 <span class="mono">REPLY_TIER_ENFORCE</span> 设为 0。</div>
+  </div>
+</div>
+
+<div id="toast"></div>
+<script>
+const $ = id => document.getElementById(id);
+function toast(msg, isErr){
+  const t = $('toast'); t.textContent = msg;
+  t.style.borderColor = isErr ? '#5a2226' : '#1d4429';
+  t.classList.add('show'); clearTimeout(t._t); t._t = setTimeout(()=>t.classList.remove('show'), 2600);
+}
+async function api(path, opts){ const r = await fetch(path, opts); return r.json(); }
+const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function load(){
+  const d = await api('/api/reply/outbox');
+  if(!d.ok){ $('kv').innerHTML = '<span class="err">加载失败：'+esc(d.error||'')+'</span>'; return; }
+  const s = d.stats || {};
+  $('kv').innerHTML = [
+    `已发 <b class="ok">${s.sent||0}</b>`,
+    `待补 <b>${s.pending||0}</b>`,
+    `未知 <b class="warn">${s.unknown||0}</b>`,
+    `失败 <b class="err">${s.failed||0}</b>`,
+    `跳过 <b class="muted">${s.skipped||0}</b>`,
+    `扣下待确认 <b class="warn">${s.tier_draft||0}</b>`,
+    `违规拦截 <b class="err">${s.tier_block||0}</b>`
+  ].map(x=>`<span>${x}</span>`).join('');
+  renderPending(d.pending || []);
+  renderHold(d.hold || []);
+  renderDraft(d.draft || []);
+}
+
+// 三档里的 draft（拆解 39 §八-3）：默认扣下不发（status=held）。
+// 加闸之前已经发出去的老行会显示"早已发出"——不装作它没发生。
+const TIER_STATUS = {held:'待确认', pending:'已放行·等心跳', sending:'正在发',
+                     sent:'已发出', failed:'发送失败', unknown:'结果未知', skipped:'已弃用'};
+function renderDraft(rows){
+  const box = $('draftWrap');
+  if(!box) return;
+  if(!rows.length){ box.innerHTML = '<span class="muted">没有扣下的回复</span>'; return; }
+  const head = `<tr><th>账号</th><th>会话</th><th>状态</th><th>内容</th><th>命中</th><th>时间</th><th>操作</th></tr>`;
+  const body = rows.map(r=>{
+    const st = r.status || '';
+    const cls = st==='held' ? 'warn' : (st==='sent' ? 'ok' : (st==='failed' ? 'err' : 'muted'));
+    const act = st==='held'
+      ? `<button class="okbtn" data-act="release" data-t="draft" data-ck="${esc(r.cookie_id)}" data-k="${esc(r.source_msg_id)}">放行发送</button>
+         <button class="warnbtn" data-act="skip" data-t="draft" data-ck="${esc(r.cookie_id)}" data-k="${esc(r.source_msg_id)}">不用发了</button>`
+      : '<span class="muted">—</span>';
+    return `<tr>
+      <td class="mono">${esc(r.cookie_id)}</td>
+      <td class="mono">${esc(r.chat_id)}</td>
+      <td class="${cls}">${esc(TIER_STATUS[st] || st)}</td>
+      <td class="muted">${esc((r.reply_text||'').slice(0,80))}</td>
+      <td class="warn">${esc((r.last_error||'') || '售后/承诺类')}</td>
+      <td class="muted mono">${esc((r.updated_at||'').replace('T',' '))}</td>
+      <td>${act}</td></tr>`;
+  }).join('');
+  box.innerHTML = `<table>${head}${body}</table>`;
+}
+
+function renderPending(rows){
+  if(!rows.length){ $('pendWrap').innerHTML = '<span class="muted">没有待补发的回复 🎉</span>'; return; }
+  const head = `<tr><th>账号</th><th>会话</th><th>内容</th><th>时间</th></tr>`;
+  const body = rows.map(r=>`<tr>
+      <td class="mono">${esc(r.cookie_id)}</td>
+      <td class="mono">${esc(r.chat_id)}</td>
+      <td class="muted">${esc((r.reply_text||'').slice(0,80))}</td>
+      <td class="muted mono">${esc((r.updated_at||'').replace('T',' '))}</td></tr>`).join('');
+  $('pendWrap').innerHTML = `<table>${head}${body}</table>`;
+}
+
+function renderHold(rows){
+  if(!rows.length){ $('holdWrap').innerHTML = '<span class="muted">没有需要确认的回复</span>'; return; }
+  const head = `<tr><th>账号</th><th>状态</th><th>内容</th><th>原因</th><th>时间</th><th>操作</th></tr>`;
+  const body = rows.map(r=>`<tr>
+      <td class="mono">${esc(r.cookie_id)}</td>
+      <td class="${r.status==='unknown'?'warn':'err'}">${esc(r.status)}</td>
+      <td class="muted">${esc((r.reply_text||'').slice(0,60))}</td>
+      <td class="muted">${esc((r.last_error||'').slice(0,60))}</td>
+      <td class="muted mono">${esc((r.updated_at||'').replace('T',' '))}</td>
+      <td>
+        <button class="okbtn" data-act="release" data-ck="${esc(r.cookie_id)}" data-k="${esc(r.source_msg_id)}">买家没收到，补发</button>
+        <button class="warnbtn" data-act="skip" data-ck="${esc(r.cookie_id)}" data-k="${esc(r.source_msg_id)}">买家收到了，别再发</button>
+      </td></tr>`).join('');
+  $('holdWrap').innerHTML = `<table>${head}${body}</table>`;
+}
+
+document.addEventListener('click', async ev=>{
+  const btn = ev.target.closest('button[data-act]');
+  if(!btn) return;
+  const act = btn.dataset.act;
+  const isDraft = btn.dataset.t === 'draft';
+  if(act==='skip' && !isDraft && !confirm('确认买家已经收到这条回复？标记后不会再发。')) return;
+  if(act==='release' && isDraft && !confirm('确认这句话可以发出去？放行后下一次心跳发送。')) return;
+  const d = await api('/api/reply/outbox/'+act, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({cookie_id: btn.dataset.ck, source_msg_id: btn.dataset.k})
+  });
+  toast(d.ok ? (act==='release' ? '已放行，下一次心跳补发' : '已标记为不再发送') : ('失败：'+(d.error||'')), !d.ok);
+  load();
+});
+$('btnRefresh').onclick = load;
+load();
+</script>
+</body>
+</html>

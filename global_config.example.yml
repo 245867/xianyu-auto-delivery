@@ -106,3 +106,151 @@ WEBSOCKET_HEADERS:
   User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
     like Gecko) Chrome/133.0.0.0 Safari/537.36
 WEBSOCKET_URL: wss://wss-goofish.dingtalk.com/
+SUPPLIERS:
+  91kami:
+    enabled: false
+    merchant_id: ''
+    api_secret: ''
+    base_url: "https://mai.91kami.com/api"
+    timeout: 15
+    retry: 2
+
+  yiquanyi:
+    enabled: false
+    app_id: ''
+    secret: ''
+    base_url: "https://www.yiquanyi.com/open"
+    timeout: 15
+    retry: 2
+
+  fulu:
+    enabled: false
+    app_key: ''
+    app_secret: ''
+    base_url: "https://open.fulu.com/open/api"
+    timeout: 15
+    retry: 2
+
+NOTIFY:
+  enabled: true
+  wecom: ''
+  dingtalk: ''
+  feishu: ''
+  bark: ''
+  custom: ''
+  timeout: 8
+  events:
+    polish: true
+    risk: true
+    publish: true
+    account: true
+    diagnosis: true
+
+# ============================================================
+# 捡漏雷达与多模态价值评估配置 (MONITOR_RADAR)
+# 吸收 Usagi-org/ai-goofish-monitor 与 Craft-Anything 视觉生成
+# ============================================================
+MONITOR_RADAR:
+  enabled: true                     # 是否开启捡漏雷达
+  min_profit_rate: 0.25             # 触发捡漏报警的最低预估利润率 (0.25 即 25%)
+  min_profit_amount: 30.0           # 触发捡漏报警的最低预估净利润 (元)
+  auto_generate_posters: true       # 发现 strong_buy 高价值商品时，是否自动调用 Craft-Anything 生成转售图
+  vision_detail: "low"              # 多模态审图精度 ("low" 省 token / "high" 高清识别划痕)
+  poll_jitter_seconds: 5            # 轮询抖动防风控 (秒)
+
+PRICE_LADDER:
+  enabled: false
+  callback_base: ''
+  global_policy: null
+  products: {}
+
+PRICE_RANK_GUARD:
+  enabled: false
+  callback_base: ''                  # 公开 HTTPS 回调域名，用于接收平台改价确认
+  account_id: ''                     # 竞品搜索使用的本地账号 ID
+  scan_interval_seconds: 300         # 竞品盯盘扫描间隔
+  max_daily_revisions: 5             # 单商品单日最大自动改价次数
+  search_rows: 30                    # 每次竞品搜索拉取条数
+
+PICKUP_PORTAL:
+  enabled: false
+  public_url: ''                     # 独立自提 H5 部署外网地址 (例: https://pickup.yourdomain.com/pickup)
+  signing_key: ''                    # 提货令牌签名私钥 (至少 32 字符)
+
+ACCOUNT_NURTURING:
+  enabled: false
+  exposure_stats_enabled: false
+  daily_view_count: [15, 35]         # 每日随机拟态浏览篇数区间
+  daily_like_count: [3, 8]           # 每日随机超赞/点赞次数区间
+  action_delay_range: [4, 18]        # 单次动作拟人滑动停留秒数区间
+
+ITEM_FISSION:
+  enabled: false
+
+VOUCHER_ASYNC:
+  enabled: false
+  timeout_seconds: 1800
+  item_channels: {}
+  seller_eids: {}
+  refund_refuse_reason: ''
+
+DROPSHIP:
+  enabled: false
+  mtop_ship_version: '1.0'          # 实物发货协议版本，留空停用面单回传
+  minimum_margin: '2.00'            # 规格代拍每件最低毛利，单位为元
+  refund_refuse_reason: ''          # 填写该售后单支持的官方拒绝原因
+  seller_eids: {}                   # 本地账号 ID 到闲管家售后详情中的 seller_eid
+
+AUTO_REVIEW:
+  enabled: false
+  scan_interval_seconds: 600        # 已完成订单的回评扫描间隔
+  max_per_scan: 50                  # 单轮最多处理的订单数
+  feedback: '感谢支持，非常爽快的好买家！'
+
+BARGAIN_CLOSER:
+  enabled: false
+  ttl_seconds: 900                  # 议价会话有效期（15 分钟）
+  scan_interval_seconds: 60         # 到期检查与成交联动扫描间隔
+
+FINANCIAL_PROFIT:
+  enabled: false
+  scan_interval_seconds: 300        # 利润账本重算/结算扫描间隔
+  scan_days: 30                     # 参与核算的订单时间窗口（天）
+  platform_fee_rate: 0.0            # 平台手续费率，按收入比例计提；0 表示不计提
+  shipping_cost_per_order: 0.0      # 每单固定运费成本（元）；0 表示不自带运费成本
+
+ORDER_CHASER:
+  enabled: false
+  scan_interval_seconds: 60         # 待付款催付扫描间隔（秒）
+  stage_1_delay_min: 3.0            # 第 1 阶柔和提醒延迟（分钟）
+  stage_2_delay_min: 10.0           # 第 2 阶紧迫感催付延迟（分钟）
+  timeout_expire_min: 30.0          # 超时结案并释放预占库存阈值（分钟）
+  max_chase_attempts: 2             # 单单最大催付次数
+  quiet_start_hour: 23              # 夜间免打扰开始小时（含）
+  quiet_end_hour: 8                 # 夜间免打扰结束小时（不含）
+
+REFUND_DISPUTE:
+  enabled: false
+  scan_interval_seconds: 60         # 退款争议取证扫描间隔（秒）
+  auto_refuse: true                 # 证据充分时自动驳回退款
+  max_per_scan: 50                  # 单轮最多处理的退款订单数
+  refuse_reason: ''                 # 必须填写平台支持的拒绝原因；留空则只取证告警，不自动驳回
+  refuse_explanation: '商品已实际发货/已核销，买家已实际获得商品或服务'
+
+PLATFORM_GUARD:
+  enabled: true
+  state_dir: ''                     # 留空使用 data/platform_guard.{cookie_id}.json
+  hourly_budget: 1200               # 单账号每小时请求预算上限
+  daily_budget: 12000               # 单账号每日请求预算上限
+  throttle_cooldown_seconds: 300    # 首次 429/限流后的降速窗口
+  cooling_cooldown_seconds: 900     # 风控冷却期，进程重启后仍按绝对时间生效
+  block_cooldown_seconds: 3600      # 冷却期内再次触发风控的硬拦截时长
+  corrupt_hold_seconds: 900         # 状态文件损坏时的保守拦截时长
+  jitter_min_seconds: 0.05          # 请求前随机抖动下限
+  jitter_max_seconds: 0.15          # 请求前随机抖动上限
+
+SESSION_RENEWAL:
+  enabled: true
+  interval_hours: 4                 # 静默续期后台巡检间隔（小时）
+  lead_seconds: 21600               # 距离过期不足 6 小时也触发续期
+  timeout_seconds: 20               # Passport 请求超时（秒）

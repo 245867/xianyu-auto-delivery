@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>买家提问 · FAQ</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b23; --line:#242c38; --txt:#e6edf3;
+    --dim:#8b98a9; --acc:#3fb950; --warn:#d29922; --err:#f85149; --blue:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:24px 20px 60px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 12px;font-weight:600}
+  .kv{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .kv span{background:#0d1117;border:1px solid var(--line);border-radius:6px;
+           padding:3px 10px;font-size:12px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:500;font-size:12px}
+  button,select,input,textarea{background:#21262d;color:var(--txt);border:1px solid var(--line);
+         border-radius:6px;padding:4px 11px;font:12px inherit}
+  button{cursor:pointer} button:hover{border-color:#3d4756}
+  button.okbtn{color:var(--acc);border-color:#1d4429}
+  .muted{color:var(--dim)} .ok{color:var(--acc)} .err{color:var(--err)} .warn{color:var(--warn)}
+  .hint{color:var(--dim);font-size:12px;margin-top:8px}
+  .note{background:#0f1620;border-left:3px solid var(--blue);padding:10px 14px;
+        border-radius:0 6px 6px 0;font-size:13px;color:#c3d0e0;margin-bottom:14px}
+  .note b{color:#fff}
+  .mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+  .big{font-size:22px;font-weight:600}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+  .tile{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  .tile .k{color:var(--dim);font-size:12px}
+  #toast{position:fixed;right:20px;bottom:20px;background:#21262d;border:1px solid var(--line);
+         border-radius:8px;padding:10px 16px;font-size:13px;opacity:0;transition:opacity .2s;
+         pointer-events:none;max-width:460px}
+  #toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>买家提问 · FAQ</h1>
+  <div class="sub">每条买家消息都先记下来，再决定怎么回 —— 包括被关键词挡下的那些。</div>
+
+  <div class="note">
+    <b>为什么以前看不到这些：</b>对话记录只在 AI 生成回复时写入。关键词越答得上的问题，
+    越不会留下任何痕迹，于是"该补哪条词条"只能靠猜。现在每条提问都落盘并记下结果：
+    <b>关键词 / AI / 默认 / 没回复</b>。下面只做两件事——算覆盖率、把没人答上的问题按字面聚成建议。
+    <b>价格类问题不会进建议</b>：关键词的优先级高于 AI，一旦命中就把议价护栏整条绕过去了。
+  </div>
+
+  <div class="card">
+    <h2>看哪个账号</h2>
+    <select id="account"><option value="">全部账号</option></select>
+    <select id="days">
+      <option value="7">近 7 天</option>
+      <option value="30" selected>近 30 天</option>
+      <option value="90">近 90 天</option>
+    </select>
+    <button id="btnRefresh">刷新</button>
+    <div class="hint">词条是按账号存的；选具体账号，"建议"才会剔除该账号已有的词条。</div>
+  </div>
+
+  <div class="card">
+    <h2>覆盖率</h2>
+    <div class="grid" id="kpi"><span class="muted">加载中…</span></div>
+    <div class="kv" id="sources" style="margin-top:12px"></div>
+  </div>
+
+  <div class="card">
+    <h2>建议补的词条</h2>
+    <div id="sugWrap"><span class="muted">加载中…</span></div>
+    <div class="hint">聚类只看字面，不懂语义；点「采用」会弹框让你写回复，写什么由你决定。</div>
+  </div>
+
+  <div class="card">
+    <h2>最近没答上的问题</h2>
+    <div id="recentWrap"><span class="muted">加载中…</span></div>
+  </div>
+
+  <div class="card">
+    <h2>起手词条</h2>
+    <div id="starterWrap"><span class="muted">加载中…</span></div>
+    <button id="btnStarter" style="margin-top:10px">导入起手词条（只补缺）</button>
+    <div class="hint">虚拟商品的通用问答，<b>导入后请按自己的货改一遍</b>。不会覆盖你已有的词条。</div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let TOAST_T = null;
+function toast(msg, bad){
+  const t = $('#toast'); t.textContent = msg;
+  t.style.borderColor = bad ? 'var(--err)' : 'var(--line)';
+  t.classList.add('show'); clearTimeout(TOAST_T);
+  TOAST_T = setTimeout(()=>t.classList.remove('show'), 2600);
+}
+async function api(url, opt){
+  try{
+    const r = await fetch(url, opt);
+    return await r.json();
+  }catch(e){ return {ok:false, error:String(e)}; }
+}
+
+async function loadAccounts(){
+  const d = await api('/cookies/details');
+  const rows = Array.isArray(d) ? d : (d && d.cookies) || [];
+  const sel = $('#account');
+  rows.forEach(c=>{
+    const o = document.createElement('option');
+    o.value = c.id || '';
+    o.textContent = (c.nickname || c.remark || (c.id||'').slice(0,8));
+    sel.appendChild(o);
+  });
+}
+
+function renderKpi(st){
+  if(!st || !st.ok){ $('#kpi').innerHTML = '<span class="err">统计失败：'+esc((st&&st.error)||'')+'</span>'; return; }
+  const pct = (st.coverage*100).toFixed(1);
+  $('#kpi').innerHTML = `
+    <div class="tile"><div class="k">买家提问</div><div class="big">${st.total}</div></div>
+    <div class="tile"><div class="k">答上了</div><div class="big ok">${st.answered}</div></div>
+    <div class="tile"><div class="k">覆盖率</div><div class="big ${st.coverage>=0.8?'ok':'warn'}">${pct}%</div></div>
+    <div class="tile"><div class="k">没人管</div><div class="big ${((st.by_outcome&&st.by_outcome.none)||0)>0?'err':''}">${(st.by_outcome&&st.by_outcome.none)||0}</div></div>`;
+  const by = st.by_outcome || {}, lb = st.labels || {};
+  $('#sources').innerHTML = Object.keys(by).map(k=>
+    `<span>${esc(lb[k]||k)}：${by[k]}</span>`).join('') || '<span class="muted">还没有数据</span>';
+}
+
+function renderSug(list){
+  if(!list || !list.length){ $('#sugWrap').innerHTML = '<span class="muted">没有需要补的词条（要么数据还少，要么都答上了）</span>'; return; }
+  const head = `<tr><th>问题片段</th><th>问了几次</th><th>原话</th><th>操作</th></tr>`;
+  const body = list.map((s,i)=>`<tr>
+    <td><b>${esc(s.phrase)}</b></td>
+    <td class="mono">${s.count}</td>
+    <td class="muted">${(s.examples||[]).map(e=>esc(e)).join('<br>')}</td>
+    <td><button class="okbtn" data-i="${i}">采用</button></td></tr>`).join('');
+  $('#sugWrap').innerHTML = `<table>${head}${body}</table>`;
+  $('#sugWrap').querySelectorAll('button[data-i]').forEach(b=>{
+    b.onclick = ()=> adopt(list[+b.dataset.i]);
+  });
+}
+
+async function adopt(s){
+  const cid = $('#account').value;
+  if(!cid){ toast('先在上面选一个具体账号：词条是按账号存的', true); return; }
+  const keyword = prompt('词条关键词（买家话里出现它就自动回复）：', s.phrase);
+  if(!keyword) return;
+  const reply = prompt('回复内容（不要写微信/手机号，会被合规闸拦下）：', '');
+  if(!reply) return;
+  const d = await api('/api/faq/add_keyword', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({cookie_id: cid, keyword, reply})});
+  toast(d.ok ? '已加到词条库' : ('失败：'+(d.error||'')), !d.ok);
+  load();
+}
+
+function renderRecent(rows){
+  if(!rows || !rows.length){ $('#recentWrap').innerHTML = '<span class="muted">没有未命中的提问</span>'; return; }
+  const head = `<tr><th>原话</th><th>结果</th><th>时间</th></tr>`;
+  const body = rows.map(r=>`<tr>
+    <td>${esc(r.raw)}</td>
+    <td class="muted">${esc(r.outcome||'none')}</td>
+    <td class="muted mono">${esc(r.created_at)}</td></tr>`).join('');
+  $('#recentWrap').innerHTML = `<table>${head}${body}</table>`;
+}
+
+function renderStarter(list){
+  if(!list || !list.length){ $('#starterWrap').innerHTML = '<span class="muted">无</span>'; return; }
+  const head = `<tr><th>关键词</th><th>回复</th></tr>`;
+  const body = list.map(s=>`<tr><td class="mono">${esc(s.keyword)}</td>
+    <td class="muted">${esc(s.reply)}</td></tr>`).join('');
+  $('#starterWrap').innerHTML = `<table>${head}${body}</table>`;
+}
+
+async function load(){
+  const cid = $('#account').value, days = $('#days').value;
+  const d = await api('/api/faq?days='+encodeURIComponent(days)+'&cookie_id='+encodeURIComponent(cid));
+  if(!d.ok){ toast('加载失败：'+(d.error||''), true); return; }
+  renderKpi(d.stats); renderSug(d.suggestions); renderRecent(d.recent); renderStarter(d.starter);
+}
+
+$('#btnRefresh').onclick = load;
+$('#account').onchange = load;
+$('#days').onchange = load;
+$('#btnStarter').onclick = async ()=>{
+  const cid = $('#account').value;
+  if(!cid){ toast('先选一个具体账号', true); return; }
+  if(!confirm('把起手词条补进这个账号？只补缺，不覆盖已有词条。导入后请按自己的货改一遍。')) return;
+  const d = await api('/api/faq/import_starter', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({cookie_id: cid})});
+  toast(d.ok ? ('已补 '+ (d.added||[]).length +' 条') : ('失败：'+(d.error||'')), !d.ok);
+};
+loadAccounts().then(load);
+</script>
+</body>
+</html>

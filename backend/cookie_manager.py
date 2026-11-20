@@ -270,6 +270,13 @@ class CookieManager:
                 self.keywords[cookie_id] = original_keywords
                 self.cookie_status[cookie_id] = original_status
 
+                # 账号处于暂停（禁用）状态时，换 Cookie 只更新值，**不起任务**。
+                # 否则换一次 Cookie 就把"暂停"悄悄解除了：显式停掉的东西不该被
+                # 一次无关操作重新拉起来（与启动时"跳过禁用账号"保持同一口径）。
+                if not original_status:
+                    logger.info(f"【{cookie_id}】账号已暂停，仅更新 Cookie，不启动任务")
+                    return
+
                 # 重新启动任务
                 task = self.loop.create_task(self._run_xianyu(cookie_id, new_value, original_user_id))
                 self.tasks[cookie_id] = task
@@ -320,6 +327,13 @@ class CookieManager:
             else:
                 # 禁用账号：停止任务
                 self._stop_cookie_task(cookie_id)
+            # 暂停/恢复都要推一条：暂停期间自动回复和发货都停着，页面不看就没人知道。
+            try:
+                from notify_service import notify_account_state
+                notify_account_state(cookie_id, "resumed" if enabled else "paused",
+                                     "操作员在账号页" + ("启用" if enabled else "停用"))
+            except Exception:
+                pass
 
     def get_cookie_status(self, cookie_id: str) -> bool:
         """获取Cookie的启用状态"""

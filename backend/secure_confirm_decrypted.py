@@ -9,6 +9,7 @@ import time
 import aiohttp
 from loguru import logger
 from utils.xianyu_utils import generate_sign, trans_cookies
+from mtop_response import is_success, retry_policy, policy_text
 
 
 class SecureConfirm:
@@ -102,7 +103,7 @@ class SecureConfirm:
         params = {
             'jsv': '2.7.2',
             'appKey': '34839810',
-            't': str(int(time.time()) * 1000),
+            't': str(int(time.time() * 1000)),   # 拆解 9：毫秒在括号里，末三位不能恒为 0
             'sign': '',
             'v': '1.0',
             'type': 'originaljson',
@@ -158,14 +159,28 @@ class SecureConfirm:
                 logger.info(f"【{self.cookie_id}】自动确认发货响应: {res_json}")
 
                 # 检查响应结果
-                if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
+                ret_list = res_json.get('ret') or []
+                ret_text = (' | '.join(str(x) for x in ret_list)
+                            if isinstance(ret_list, list) else str(ret_list))
+                if ret_list and is_success(str(ret_list[0])):
                     logger.info(f"【{self.cookie_id}】✅ 自动确认发货成功，订单ID: {order_id}")
-                    return {"success": True, "order_id": order_id}
-                else:
-                    error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
-                    logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
+                    return {"success": True, "order_id": order_id, "ret": ret_text}
 
+                error_msg = ret_text or '未知错误'
+                policy = retry_policy(error_msg)
+                logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}"
+                               f"（处置：{policy_text(policy)}）")
+                # 拆解 9：原来的错误码在这里就被丢掉了 —— 盲目重试三次之后，
+                # 上层只能拿到"重试次数过多"，再想按错误类型决定策略也无从谈起。
+                # 现在：原始 ret 原样带回；stop / refresh 两类当场返回，不再烧重试次数
+                # （订单已发货还反复点确认，等于持续骚扰平台的状态机）。
+                if policy in ('stop', 'refresh'):
+                    return {"success": False, "error": error_msg, "ret": ret_text,
+                            "policy": policy, "order_id": order_id}
+                if retry_count < 2:
                     return await self.auto_confirm(order_id, item_id, retry_count + 1)
+                return {"success": False, "error": error_msg, "ret": ret_text,
+                        "policy": policy, "order_id": order_id}
 
 
         except Exception as e:

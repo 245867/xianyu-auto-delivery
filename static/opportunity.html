@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>选品工作台（复刻自 xianyu-pilot-pro）</title>
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --ink:#1f2329; --muted:#8a919f; --line:#e8eaed; --brand:#1f6feb; --ok:#1a7f37; --warn:#9a6700; --bad:#cf222e; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+.wrap { max-width: 1080px; margin: 0 auto; padding: 24px 16px 80px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 15px; margin: 28px 0 12px; }
+.sub { color: var(--muted); margin-bottom: 20px; }
+.row { display: flex; gap: 10px; align-items: center; }
+input, textarea, select, button { font: inherit; }
+input[type=text], textarea, select { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); }
+input[type=text]:focus, textarea:focus { outline: 2px solid #dcebff; border-color: var(--brand); }
+button { padding: 8px 14px; border: 0; border-radius: 8px; background: var(--brand); color:#fff; cursor: pointer; }
+button:hover { filter: brightness(1.1); }
+button.ghost { background: var(--card); color: var(--brand); border:1px solid var(--brand); }
+button:disabled { opacity:.5; cursor: default; }
+.card { background: var(--card); border:1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+.muted { color: var(--muted); }
+.tag { display:inline-block; padding: 2px 8px; border-radius: 999px; font-size:12px; border:1px solid var(--line); }
+.tag.hot { background:#ffebe9; color:var(--bad); border-color:#ffc9c7; }
+.tag.watch { background:#fff8c5; color:var(--warn); border-color:#f0e6a0; }
+.tag.ok { background:#dafbe1; color:var(--ok); border-color:#a7f3b6; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px,1fr)); gap: 10px; }
+.item { border:1px solid var(--line); border-radius:10px; padding:10px; background:#fff; }
+.item .title { font-weight:600; }
+.item .meta { color: var(--muted); font-size: 12px; }
+.score { font-weight:700; color: var(--brand); }
+table { width:100%; border-collapse: collapse; }
+th,td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align: top; }
+.hidden { display: none !important; }
+.err { color: var(--bad); }
+.ok-msg { color: var(--ok); }
+details { margin-top: 6px; }
+pre { background:#f6f8fa; padding:10px; border-radius:8px; overflow:auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>选品工作台 <span class="tag ok">复刻 · 自动评分</span></h1>
+  <div class="sub muted">发售流程：搜关键词 → AI 评分排序 → 一键改写 → 一键发布。本页只连本机后端 8080，无外网依赖。</div>
+
+  <h2>① 关键词搜索 + 机会评分</h2>
+  <div class="card">
+    <div class="row">
+      <input type="text" id="keyword" placeholder="例如：PPT 模板 / 手机壁纸 / 考研资料" style="flex:1">
+      <label class="muted" style="white-space:nowrap"><input type="checkbox" id="visionCheck"> AI看图(前3个)</label>
+      <button id="btnAnalyze">搜索评分</button>
+      <button id="btnGuardReset" class="ghost" style="display:none">解除搜索冷却</button>
+    </div>
+    <div id="guardLine" class="muted" style="margin-top:6px"></div>
+    <div id="marketLine" class="muted" style="margin-top:4px"></div>
+    <div id="coverageLine" class="muted" style="margin-top:4px"></div>
+    <details>
+      <summary>本页关键词样本对比</summary>
+      <ul id="sampleComparison"><li>搜索后显示有效样本和价格中位数。</li></ul>
+    </details>
+    <div style="height:10px"></div>
+    <table>
+      <thead><tr><th>标题</th><th>价格</th><th>想要</th><th>机会分</th><th>价格历史</th><th>意见</th><th></th></tr></thead>
+      <tbody id="listBody"><tr><td colspan="7" class="muted">尚无数据</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card hidden" id="visionCard">
+    <h2 style="margin-top:0">AI 看图结论</h2>
+    <div id="visionOut"></div>
+  </div>
+
+  <h2>② 一键改写（AI 文案 + 润色脱敏 + 相似度校验）</h2>
+  <div class="card">
+    <div class="row">
+      <input type="text" id="rewriteTitle" placeholder="原标题" style="flex:1">
+      <button id="btnRewrite" class="ghost">AI 改写</button>
+    </div>
+    <div style="height:8px"></div>
+    <textarea id="rewriteSource" rows="2" placeholder="原文案（可留空，AI 会参考标题）"></textarea>
+    <div style="height:10px"></div>
+    <div id="rewriteOut"></div>
+  </div>
+
+  <h2>③ 一键发布到闲鱼</h2>
+  <div class="card">
+    <div class="row">
+      <input type="text" id="pubTitle" placeholder="商品标题" style="flex:2">
+      <input type="number" id="pubPrice" placeholder="价格 元" style="width:100px">
+      <input type="number" id="pubQuantity" placeholder="数量" style="width:90px">
+    </div>
+    <div style="height:8px"></div>
+    <textarea id="pubDesc" rows="4" placeholder="商品描述（标题和描述都必填）"></textarea>
+    <div style="height:8px"></div>
+    <textarea id="pubImages" rows="2" placeholder="图片：本地文件绝对路径 或 图片URL，每行一张（1–9 张）。会自动上传到闲鱼 CDN 再发布"></textarea>
+    <div style="height:8px"></div>
+    <div class="row">
+      <button class="primary" id="btnGenImage" style="background:#2563eb;color:#fff;border:none;">🪄 智能生成主图</button>
+      <button class="ghost" id="btnGenSet" title="生成主图+流程图+质保图">生成3张全套图</button>
+      <select id="pubMaterial" style="max-width:200px">
+        <option value="">或从素材库选一组图</option>
+      </select>
+      <button class="ghost" id="btnUseMaterial">套用素材</button>
+      <span class="muted" style="font-size:12px">选素材或点智能生成配图自动填入路径</span>
+    </div>
+    <div id="pubImagePreview" style="display:none;gap:8px;margin-top:8px;"></div>
+    <div style="height:8px"></div>
+    <div class="row">
+      <select id="pubDelivery">
+        <option value="无需邮寄" selected>无需邮寄（虚拟商品）</option>
+        <option value="包邮">包邮</option>
+        <option value="按距离计费">按距离计费</option>
+        <option value="一口价">一口价运费</option>
+      </select>
+      <input type="number" id="pubPostPrice" placeholder="运费 元（一口价时）" style="width:150px">
+      <input type="text" id="pubCookie" placeholder="Cookie ID（账号管理页可查）" style="width:240px">
+      <button id="btnPreviewPublish" class="ghost">预览草稿</button>
+      <button id="btnPublish">一键发布</button>
+    </div>
+    <div style="height:6px"></div>
+    <div id="pubResult" class="muted" role="status"></div>
+  </div>
+
+  <h2>④ 未知发布人工核对（单条）</h2>
+  <div class="card">
+    <div class="row">
+      <button class="ghost" onclick="loadUnknown()">刷新未知记录</button>
+      <span class="muted" style="font-size:12px">提交阶段断网/超时/无编号的记录会停在这里。必须人工到闲鱼「我发布的」核对后再选择结果；同标题同价格只作辅助，不是判据。</span>
+    </div>
+    <div id="unknownBox" class="muted" style="margin-top:10px">（加载中…）</div>
+  </div>
+
+  <h2>最近记录</h2>
+  <div class="card">
+    <button class="ghost" onclick="loadHistory()">刷新</button>
+    <pre id="historyBox" class="muted" style="margin-top:8px">（加载中…）</pre>
+  </div>
+</div>
+
+<script>
+let lastItems = [];
+const $ = id => document.getElementById(id);
+
+async function call(path, body) {
+  const token = localStorage.getItem('auth_token');
+  const headers = {'Content-Type': 'application/json'};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const resp = await fetch(path, {
+    method: body ? 'POST' : 'GET',
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return await resp.json();
+}
+
+async function loadGuard() {
+  const r = await call('/api/opportunity/guard-status');
+  if (r.cooldown_active) {
+    const mins = Math.ceil(r.cooldown_remain_seconds / 60);
+    $('guardLine').innerHTML = `<span class="err">搜索冷却中（约 ${mins} 分钟）：${escapeHtml(r.last_reason || '连续失败')}　连续失败 ${r.consecutive_fail} 次</span>`;
+    $('btnGuardReset').style.display = '';
+  } else {
+    $('guardLine').innerHTML = r.consecutive_fail > 0
+      ? `<span class="muted">上次搜索失败（连续 ${r.consecutive_fail} 次，达 ${r.fail_threshold} 次进入冷却）</span>`
+      : '';
+    $('btnGuardReset').style.display = 'none';
+  }
+}
+
+$('btnGuardReset').onclick = async () => {
+  await call('/api/opportunity/guard-reset');
+  loadGuard();
+};
+
+$('btnAnalyze').onclick = async () => {
+  const keyword = $('keyword').value.trim();
+  if (!keyword) return;
+  $('btnAnalyze').disabled = true;
+  const vision = $('visionCheck').checked;
+  $('listBody').innerHTML = `<tr><td colspan="7">搜索中${vision ? '（含 AI 看图，稍慢）' : ''}…</td></tr>`;
+  try {
+    const r = await call('/api/opportunity/analyze', {keyword: keyword, top_n: 50, vision});
+    if (!r.ok) {
+      alert(r.error || '搜索失败');
+      loadGuard();
+      return;
+    }
+    lastItems = r.items || [];
+    renderList(r.items, r.summary);
+    renderMarket(r.summary);
+    renderCoverage(r.summary);
+    renderSampleComparison(keyword, r.summary);
+    loadGuard();
+  } catch (e) {
+    alert('请求失败：' + e);
+  } finally {
+    $('btnAnalyze').disabled = false;
+  }
+};
+
+function renderMarket(summary) {
+  const m = (summary || {}).price_market || {};
+  const s = (summary || {}).price_suggestion || {};
+  const d = (summary || {}).detail_enrich || {};
+  const dtext = d.requested
+    ? `　<span class="muted">详情补数 ${d.success}/${d.requested}${d.failed ? `（${d.failed} 个失败）` : ''}</span>`
+    : (d.error ? `　<span class="muted">${escapeHtml(d.error)}</span>` : '');
+  if (!m.sample_items) { $('marketLine').innerHTML = dtext; return; }
+  $('marketLine').innerHTML =
+    `市场水位（近 ${m.window_days} 天 ${m.sample_items} 个商品）：最低 ¥${m.min_price}　P25 ¥${m.p25_price}　中位 ¥${m.median_price}　均价 ¥${m.avg_price}` +
+    (s.suggested_price ? `　<b>建议定价 ¥${s.suggested_price}</b>` : '') + dtext;
+}
+
+const comparisonSamples = new Map();
+function renderSampleComparison(keyword, summary) {
+  const sample = (summary || {}).score_meta || {};
+  const line = $('sampleComparison');
+  if (!sample.n) return;
+  const market = summary.price_market || {};
+  comparisonSamples.set(keyword, {
+    total: sample.n,
+    want: (sample.coverage_counts || {}).want || 0,
+    median: market.median_price,
+    window: market.window_days,
+  });
+  if (comparisonSamples.size > 8) {
+    comparisonSamples.delete(comparisonSamples.keys().next().value);
+  }
+  line.replaceChildren(...Array.from(comparisonSamples, ([word, row]) => {
+    const item = document.createElement('li');
+    const median = row.median == null ? '价格样本不足' : '近 ' + row.window + ' 天价格中位数 ¥' + row.median;
+    item.textContent = word + ' · 有想要数据 ' + row.want + '/' + row.total + ' · ' + median;
+    return item;
+  }));
+}
+
+// B4 覆盖率：分数是"在已知数据上算的"，缺字段的维度按中性 0.5 计。
+// 不把覆盖率摆出来，用户会以为 60 分是"这批都算过"的 60 分。
+function renderCoverage(summary) {
+  const m = (summary || {}).score_meta || {};
+  if (!m.n) { $('coverageLine').innerHTML = ''; return; }
+  const pct = v => Math.round(Number(v === undefined ? 0 : v) * 100);
+  const c = m.coverage_counts || {};
+  const parts = [
+    `浏览 ${pct(m.view_coverage)}%（${c.view || 0}/${m.n}）`,
+    `想要 ${pct(m.want_coverage)}%（${c.want || 0}/${m.n}）`,
+    `成交 ${pct(m.deal_coverage)}%（${c.deal || 0}/${m.n}）`,
+  ];
+  let s = `数据覆盖：${parts.join('　')}`;
+  if (m.supply_truncated) {
+    s += `　<span class="tag watch">样本触顶 ${m.supply_sampled}/${m.supply_cap || 30}</span>`;
+  }
+  if (pct(m.want_coverage) < 100 || pct(m.deal_coverage) < 100 || pct(m.view_coverage) < 100) {
+    s += `　<span class="muted">缺失维度按中性 0.5 计，理由写在每条下方</span>`;
+  }
+  // 拆解 39 §八-5：一个数字不给口径，就会被读成精确值。
+  // 平台展示值 / 本机计算 / 下限 三类分开标，来源与备注放 title 里。
+  const prov = (m.provenance || {}).metrics || {};
+  const pick = kind => Object.keys(prov).filter(k => prov[k].kind === kind)
+    .map(k => prov[k].label).join('、');
+  const groups = [
+    ['displayed', '平台展示值（快照）'],
+    ['computed', '本机计算（估算）'],
+    ['lower_bound', '仅为下限'],
+  ].filter(([k]) => pick(k));
+  if (groups.length) {
+    const detail = Object.keys(prov).map(k => {
+      const p = prov[k];
+      return `${p.label}：${p.source}${p.note ? '（' + p.note + '）' : ''}`;
+    }).join('\n');
+    s += `<div class="muted" style="margin-top:4px" title="${escapeHtml(detail)}">口径：`
+      + groups.map(([k, label]) => `${pick(k)}=${label}`).join('　') + '</div>';
+  }
+  $('coverageLine').innerHTML = s;
+}
+
+function renderHist(it) {
+  if (!it.hist_samples) return '<span class="muted">首次见</span>';
+  const trendTag = it.hist_trend === '降价' ? 'ok' : (it.hist_trend === '涨价' ? 'hot' : '');
+  const vs = it.price_vs_low_pct == null ? '' : `（较低点 ${it.price_vs_low_pct > 0 ? '+' : ''}${it.price_vs_low_pct}%）`;
+  const heat = (it.want_per_day != null && it.want_per_day > 0)
+    ? `　<span class="tag ok">想要 +${it.want_per_day}/天</span>` : '';
+  return `<div>低 ¥${it.hist_low} · 均 ¥${it.hist_avg}${heat}</div>
+    <div class="meta"><span class="tag ${trendTag}">${it.hist_trend || '平稳'}</span> ${it.hist_samples}天${vs}${it.momentum_bonus ? `　热度 +${it.momentum_bonus}分` : ''}</div>`;
+}
+
+// v2 的每一条排名都必须能解释。没有理由的分数不可调试，
+// 所以这里把后端算出来的 reasons 原样列出（不超过 3 条，多了折叠）。
+function renderReasons(it) {
+  const rs = it.reasons || [];
+  if (!rs.length) return '';
+  const head = rs.slice(0, 3).map(s => `<div>· ${escapeHtml(s)}</div>`).join('');
+  const rest = rs.length > 3
+    ? `<details><summary class="muted" style="font-size:12px">还有 ${rs.length - 3} 条</summary>${
+        rs.slice(3).map(s => `<div>· ${escapeHtml(s)}</div>`).join('')}</details>`
+    : '';
+  const conf = it.confidence ? `<span class="tag" style="font-size:11px">${escapeHtml(it.confidence)}置信</span>` : '';
+  const rank = it.rank_in_batch ? `<span class="muted" style="font-size:11px">　批内第 ${it.rank_in_batch} 名</span>` : '';
+  return `<div class="meta" style="margin-top:4px;line-height:1.5">${head}${rest}</div>
+    <div class="meta">${conf}${rank}</div>`;
+}
+
+function renderList(items, summary) {
+  const tbody = $('listBody');
+  if (!items.length) { tbody.innerHTML = '<tr><td colspan="7" class="muted">无结果</td></tr>'; return; }
+  tbody.innerHTML = items.map((it, i) => `<tr>
+    <td>
+      <div class="title">${escapeHtml(it.title)}</div>
+      <div class="meta">${escapeHtml(it.area || '')} ${escapeHtml(it.seller || '')}${it.vision && it.score_base ? `　<span class="muted">(看图修正 ${it.opportunity_score - it.score_base > 0 ? '+' : ''}${(it.opportunity_score - it.score_base).toFixed(1)})</span>` : ''}</div>
+      ${it.vision ? `<div class="meta">📷 成色 ${it.vision.condition_score}/10 · 相符 ${it.vision.match_score}/10 · 风险 ${it.vision.authenticity_risk}</div>` : ''}
+      ${renderReasons(it)}
+    </td>
+    <td>${it.price || '-'}</td>
+    <td>${it.want_source === 'detail'
+      ? `${it.want_count ?? 0}${it.browse_count != null ? `<span class="muted"> / 浏览 ${it.browse_count}</span>` : ''}`
+      : '<span class="muted" title="搜索列表不返回真实想要数，本次也没补到详情">—</span>'}</td>
+    <td class="score">${it.opportunity_score}</td>
+    <td style="font-size:12px">${renderHist(it)}</td>
+    <td><span class="tag ${it.opinion==='推荐关注'?'hot':(it.opinion==='可观察'?'watch':'')}">${it.opinion || '-'}</span></td>
+    <td style="white-space:nowrap">
+      <button class="ghost" style="font-size:12px;padding:3px 8px" onclick="reuseItem(${i})">采用</button>
+      <button class="ghost" style="font-size:12px;padding:3px 8px" onclick="viewVision(${i})">看图</button>
+    </td>
+  </tr>`).join('');
+}
+
+async function viewVision(i) {
+  const it = lastItems[i];
+  if (!it) return;
+  if (!it.imageUrl) { alert('该商品没有图片 URL'); return; }
+  const card = $('visionCard');
+  card.classList.remove('hidden');
+  $('visionOut').innerHTML = `<span class="muted">AI 看图分析中……</span>`;
+  const r = await call('/api/opportunity/vision', {
+    item_id: it.itemId, title: it.title, price: it.price, imageUrl: it.imageUrl
+  });
+  if (!r.ok) {
+    $('visionOut').innerHTML = `<span class="err">${escapeHtml(r.error||'分析失败')}</span>`;
+    return;
+  }
+  const a = r.analysis;
+  it.vision = a;
+  $('visionOut').innerHTML = `
+    <div><b>${escapeHtml(it.title)}</b> ${r.cached ? '<span class="tag">缓存</span>' : ''}</div>
+    <div style="height:6px"></div>
+    <div>成色：<b>${a.condition_score}/10</b>　图文相符：<b>${a.match_score}/10</b>　仿货/货不对板风险：<span class="tag ${a.authenticity_risk==='high'?'hot':(a.authenticity_risk==='medium'?'watch':'ok')}">${a.authenticity_risk}</span>　评分修正：<b>${a.bonus > 0 ? '+' : ''}${a.bonus}</b></div>
+    <div style="height:6px"></div>
+    <div>结论：${escapeHtml(a.comment||'-')}</div>
+    <div>建议：${escapeHtml(a.resale_advice||'-')}</div>`;
+}
+
+function escapeHtml(s) {
+  return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function reuseItem(i) {
+  const it = lastItems[i];
+  if (!it) return;
+  $('rewriteTitle').value = it.title;
+  $('rewriteSource').value = it.description || '';
+  $('pubTitle').value = it.title;
+  $('pubPrice').value = it.price || '';
+  $('pubDesc').value = it.description || '';
+  $('pubImages').value = it.imageUrl || '';
+  $('pubResult').textContent = '已填入下发表单';
+  // 市场定价建议（价格历史）
+  const kw = $('keyword').value.trim();
+  if (kw) {
+    try {
+      const r = await call('/api/opportunity/price-history?keyword=' + encodeURIComponent(kw));
+      if (r.ok && r.suggestion && r.suggestion.suggested_price) {
+        $('pubPrice').value = r.suggestion.suggested_price;
+        $('pubResult').innerHTML = `已填入；<b>建议价 ¥${r.suggestion.suggested_price}</b>（中位 ¥${r.suggestion.median}，P25 ¥${r.suggestion.p25}，最低 ¥${r.suggestion.min}）`;
+      }
+    } catch (e) { /* 忽略，保留原价 */ }
+  }
+}
+
+let rewriteLast = null;
+$('btnRewrite').onclick = async () => {
+  const title = $('rewriteTitle').value.trim();
+  if (!title) { alert('请先填标题'); return; }
+  const description = $('rewriteSource').value.trim();
+  $('btnRewrite').disabled = true;
+  $('rewriteOut').innerHTML = '<span class="muted">AI 改写中…</span>';
+  try {
+    const r = await call('/api/opportunity/rewrite', {
+      title: title, description: description, keyword: $('keyword').value.trim()
+    });
+    if (!r.ok) { $('rewriteOut').innerHTML = `<span class="err">改写失败：${escapeHtml(r.error||'')}</span>`; return; }
+    const d = r.data;
+    rewriteLast = d;
+    const flag = d.needs_review ? '<span class="tag watch">需人工复核</span>' : '<span class="tag ok">通过</span>';
+    $('rewriteOut').innerHTML = `<div>${flag} <span class="muted">相似度 ${d.similarity}</span></div>
+      <div style="height:8px"></div>
+      <div><b>标题：</b>${escapeHtml(d.title)}</div>
+      <pre>${escapeHtml(d.description)}</pre>
+      <div><b>标签：</b>${(d.tags||[]).join('、') || '-'}</div>
+      ${d.forbidden_hits && d.forbidden_hits.length ? `<div class="err">命中禁止词：${d.forbidden_hits.join('、')}（已脱敏）</div>` : ''}
+      <div style="height:10px"></div>
+      <button onclick="applyRewrite()">采用到发布表单</button>`;
+  } catch (e) {
+    $('rewriteOut').innerHTML = `<span class="err">请求失败：${escapeHtml(e)}</span>`;
+  } finally {
+    $('btnRewrite').disabled = false;
+  }
+};
+
+function applyRewrite() {
+  if (!rewriteLast) return;
+  $('pubTitle').value = rewriteLast.title;
+  $('pubDesc').value = rewriteLast.description;
+  $('pubResult').textContent = '已应用，等待你点发布';
+}
+
+$('btnPreviewPublish').onclick = () => {
+  const sections = [
+    ['标题', $('pubTitle').value.trim() || '待填写'],
+    ['正文', $('pubDesc').value.trim() || '待填写'],
+    ['价格', $('pubPrice').value ? '¥' + $('pubPrice').value : '待填写'],
+    ['交付方式', $('pubDelivery').value],
+  ];
+  $('pubResult').replaceChildren(...sections.map(([label, value]) => {
+    const section = document.createElement('p');
+    section.textContent = label + '　' + value;
+    return section;
+  }));
+};
+
+$('btnPublish').onclick = async () => {
+  const title = $('pubTitle').value.trim();
+  const desc = $('pubDesc').value.trim();
+  const images = $('pubImages').value.split(/\n/).map(s => s.trim()).filter(Boolean);
+  const price = $('pubPrice').value;
+  const quantity = $('pubQuantity').value || 1;
+  const cookie_id = $('pubCookie').value.trim();
+  const delivery = $('pubDelivery').value;
+  const postPrice = Number($('pubPostPrice').value || 0);
+  $('btnPublish').disabled = true;
+  $('pubResult').innerHTML = '<span class="muted">发布中（上传图片 → 识别类目 → 提交）…最长可能 1 分钟</span>';
+  try {
+    const r = await call('/api/opportunity/publish', {
+      title, desc, imageUrls: images, price: Number(price||0),
+      quantity: Number(quantity||1), cookie_id, delivery, postPrice
+    });
+    if (r.ok) {
+      $('pubResult').innerHTML = `<span class="ok-msg">发布已受理（itemId: ${escapeHtml(r.itemId||'待回读')}）。请到闲鱼「我发布的」核对是否上架。</span>`;
+    } else if (r.status === 'submission_unknown') {
+      $('pubResult').innerHTML = `<span class="err">⚠ 发布结果未知：${escapeHtml(r.error||'')}</span>`;
+      if (r.readback) {
+        const matches = r.readback.matches || [];
+        const detail = document.createElement('p');
+        detail.textContent = r.readback.ok
+          ? (matches.length
+            ? '前两页在售商品中同标题、同价格的编号：' + matches.map(item => item.item_id).join('、')
+            : '前两页在售商品中未找到同标题、同价格的条目。请继续核对待审核及其余商品。')
+          : '暂时无法读取在售商品，请到闲鱼核对。';
+        $('pubResult').append(detail);
+      }
+      loadGuard();
+      loadUnknown();
+    } else {
+      $('pubResult').innerHTML = `<span class="err">发布失败（${escapeHtml(r.stage||'准备')}阶段）：${escapeHtml(r.error||'')}</span>`;
+      if (r.guard) loadGuard();
+    }
+  } catch (e) {
+    $('pubResult').innerHTML = `<span class="err">请求失败：${escapeHtml(e)}</span>`;
+  } finally {
+    $('btnPublish').disabled = false;
+  }
+};
+
+async function loadHistory() {
+  const r = await call('/api/opportunity/history');
+  const records = r.records || [];
+  $('historyBox').textContent = records.length ? JSON.stringify(records, null, 2) : '（暂无记录）';
+}
+
+const OUTCOME_LABELS = {
+  confirmed: '确认同一笔已上架',
+  not_received: '平台确认未收到（允许重发）',
+  still_unknown: '仍未核对清楚（保持禁止重发）',
+};
+
+async function loadUnknown() {
+  const box = $('unknownBox');
+  box.textContent = '（加载中…）';
+  try {
+    const r = await call('/api/opportunity/idempotency?action=&limit=80');
+    const unknown = (r.unknown || []);
+    const logs = {};
+    for (const l of (r.verify_log || [])) { (logs[l.key] = logs[l.key] || []).push(l); }
+    if (!unknown.length) {
+      box.innerHTML = '<span class="muted">没有待核对的未知发布记录。</span>';
+      return;
+    }
+    box.replaceChildren(...unknown.map(rec => renderUnknownRow(rec, logs[rec.key] || [])));
+  } catch (e) {
+    box.innerHTML = `<span class="err">加载失败：${escapeHtml(e)}</span>`;
+  }
+}
+
+function renderUnknownRow(rec, history) {
+  const card = document.createElement('div');
+  card.className = 'item';
+  card.style.marginBottom = '10px';
+
+  const head = document.createElement('div');
+  const title = document.createElement('div');
+  title.className = 'title';
+  title.textContent = (rec.note || '（无标题摘要）') + '　';
+  const tag = document.createElement('span');
+  tag.className = 'tag watch';
+  tag.textContent = rec.action || 'publish';
+  head.appendChild(title);
+  head.appendChild(tag);
+  card.appendChild(head);
+
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  meta.textContent = `提交于 ${rec.updated_at || rec.created_at || '?'}　key: ${rec.key}`;
+  card.appendChild(meta);
+
+  if (history.length) {
+    const h = document.createElement('div');
+    h.className = 'meta';
+    h.textContent = '核对留痕：' + history.slice(0, 3).map(l =>
+      `${l.created_at} ${OUTCOME_LABELS[l.outcome] || l.outcome}（${l.reason}）`).join('；');
+    card.appendChild(h);
+  }
+
+  const form = document.createElement('div');
+  form.style.marginTop = '8px';
+
+  const sel = document.createElement('select');
+  for (const [value, label] of Object.entries(OUTCOME_LABELS)) {
+    const opt = document.createElement('option');
+    opt.value = value; opt.textContent = label;
+    sel.appendChild(opt);
+  }
+
+  const itemInput = document.createElement('input');
+  itemInput.type = 'text';
+  itemInput.placeholder = '匹配到的商品编号（确认已上架时填，可留空）';
+  itemInput.style.marginLeft = '8px';
+  itemInput.style.width = '300px';
+
+  const reason = document.createElement('input');
+  reason.type = 'text';
+  reason.placeholder = '核对理由（必填，例如：我发布的第2页看到同标题，编号xxx）';
+  reason.style.marginTop = '6px';
+  reason.style.width = '100%';
+
+  const btn = document.createElement('button');
+  btn.textContent = '提交核对';
+  btn.style.marginTop = '6px';
+
+  const out = document.createElement('div');
+  out.className = 'meta';
+
+  btn.onclick = async () => {
+    const outcome = sel.value;
+    const text = reason.value.trim();
+    if (!text) { out.innerHTML = '<span class="err">请填写核对理由</span>'; return; }
+    if (outcome === 'not_received' &&
+        !confirm('确认平台没有收到这笔发布？释放后同样的内容可以重新发布。')) return;
+    btn.disabled = true;
+    try {
+      const r = await call('/api/opportunity/idempotency/verify', {
+        key: rec.key, outcome, reason: text, matched_item_id: itemInput.value.trim(),
+      });
+      if (!r.ok) { out.innerHTML = `<span class="err">${escapeHtml(r.error || '核对失败')}</span>`; }
+      else {
+        out.innerHTML = `<span class="ok-msg">已记录（${escapeHtml(r.new_status)}）。</span>`;
+        loadUnknown();
+      }
+    } catch (e) {
+      out.innerHTML = `<span class="err">请求失败：${escapeHtml(e)}</span>`;
+    } finally {
+      btn.disabled = false;
+    }
+  };
+
+  form.appendChild(sel);
+  form.appendChild(itemInput);
+  form.appendChild(document.createElement('br'));
+  form.appendChild(reason);
+  form.appendChild(document.createElement('br'));
+  form.appendChild(btn);
+  form.appendChild(out);
+  card.appendChild(form);
+  return card;
+}
+
+async function loadMaterials() {
+  try {
+    const r = await call('/api/materials?kind=image&limit=200');
+    const sel = $('pubMaterial');
+    if (!r.ok || !r.items || !r.items.length) {
+      sel.innerHTML = '<option value="">素材库还没有图片素材</option>';
+      return;
+    }
+    sel.innerHTML = '<option value="">从素材库选一组图（可选）</option>' + r.items.map(m =>
+      `<option value="${m.id}">${escapeHtml(m.name)}（${m.file_count} 张）</option>`).join('');
+  } catch (e) { /* 素材库未启用时静默 */ }
+}
+
+$('btnUseMaterial').onclick = async () => {
+  const id = $('pubMaterial').value;
+  if (!id) { alert('先在下拉框里选一组素材'); return; }
+  const r = await call('/api/materials/' + id + '/paths');
+  if (!r.ok) { alert(r.error || '取不到素材路径'); return; }
+  $('pubImages').value = r.paths.join('\n');
+  $('pubResult').innerHTML = `<span class="ok-msg">已套用素材「${escapeHtml(r.name)}」的 ${r.count} 张图（发布时自动上传 CDN）</span>`;
+};
+
+async function doGenerateImage(count) {
+  const title = $('pubTitle').value.trim();
+  if (!title) { alert('请先填写商品标题'); return; }
+  const price = Number($('pubPrice').value || 0);
+  const btn = count === 1 ? $('btnGenImage') : $('btnGenSet');
+  const oldText = btn.textContent;
+  btn.textContent = '生成中...';
+  btn.disabled = true;
+  try {
+    const r = await call('/api/opportunity/generate-image', {
+      method: 'POST',
+      body: JSON.stringify({ title, price, count, mode: 'auto' })
+    });
+    if (!r.ok) { alert(r.error || '生图失败'); return; }
+    $('pubImages').value = r.paths.join('\n');
+    $('pubResult').innerHTML = `<span class="ok-msg">${escapeHtml(r.message)}，已填入发布图列表</span>`;
+    const previewBox = $('pubImagePreview');
+    if (r.urls && r.urls.length) {
+      previewBox.style.display = 'flex';
+      previewBox.innerHTML = r.urls.map((u, i) =>
+        `<div style="width:70px;height:70px;border-radius:6px;overflow:hidden;border:1px solid #ccc;position:relative">
+           <img src="${u}" style="width:100%;height:100%;object-fit:cover">
+           <span style="position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,0.6);color:#fff;font-size:9px;text-align:center;display:block">${i===0?'主图':i===1?'流程':'质保'}</span>
+         </div>`
+      ).join('');
+    }
+  } catch (e) {
+    alert('生图异常：' + e.message);
+  } finally {
+    btn.textContent = oldText;
+    btn.disabled = false;
+  }
+}
+$('btnGenImage').onclick = () => doGenerateImage(1);
+$('btnGenSet').onclick = () => doGenerateImage(3);
+
+loadHistory();
+loadGuard();
+loadMaterials();
+loadUnknown();
+</script>
+</body>
+</html>

@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 议价护栏</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b23; --line:#242c38; --txt:#e6edf3;
+    --dim:#8b98a9; --acc:#3fb950; --warn:#d29922; --err:#f85149; --blue:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:24px 20px 60px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 12px;font-weight:600}
+  .row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+  label.f{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+  input[type=text],input[type=number],select,textarea{
+    background:#0d1117;border:1px solid var(--line);color:var(--txt);
+    border-radius:6px;padding:6px 9px;font:13px/1.5 inherit;min-width:140px}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--blue)}
+  textarea{min-width:100%;min-height:56px;resize:vertical}
+  button{background:#21262d;color:var(--txt);border:1px solid var(--line);
+         border-radius:6px;padding:6px 13px;font:13px inherit;cursor:pointer}
+  button:hover{border-color:#3d4756;background:#262d36}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+  button.primary:hover{background:#388bfd}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
+        border:1px solid var(--line)}
+  .on{color:var(--acc);border-color:#1d4429;background:#0f2417}
+  .dr{color:var(--warn);border-color:#4a3a12;background:#241d09}
+  .bad{color:var(--err);border-color:#5a2226;background:#2a1618}
+  .bl{color:var(--blue);border-color:#1a3a5f;background:#0c1a29}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:500;font-size:12px}
+  .muted{color:var(--dim)} .err{color:var(--err)} .ok{color:var(--acc)}
+  .num{font-variant-numeric:tabular-nums;text-align:right}
+  .note{background:#0c1a29;border:1px solid #1a3a5f;border-radius:8px;
+        padding:10px 14px;font-size:12.5px;color:#a8c7e8;margin-bottom:14px}
+  .note b{color:var(--blue)}
+  .warnbox{background:#241d09;border:1px solid #4a3a12;border-radius:8px;
+           padding:10px 14px;font-size:12.5px;color:#e3c07a;margin-bottom:14px}
+  .warnbox b{color:var(--warn)}
+  .kv{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .kv span{background:#0d1117;border:1px solid var(--line);border-radius:6px;
+           padding:3px 10px;font-size:12px}
+  code{background:#0b0f14;border:1px solid var(--line);border-radius:4px;
+       padding:1px 5px;font-size:12px}
+  pre{background:#0b0f14;border:1px solid var(--line);border-radius:8px;
+      padding:12px;font:12px/1.7 ui-monospace,Consolas,monospace;
+      white-space:pre-wrap;word-break:break-all;margin:8px 0 0}
+  .res{border-left:3px solid var(--line);padding:8px 0 8px 12px;margin-top:10px}
+  .res.accept{border-left-color:var(--acc)}
+  .res.counter{border-left-color:var(--blue)}
+  .res.reject{border-left-color:var(--err)}
+  .res.escalate{border-left-color:var(--warn)}
+  .res .t{font-weight:600}
+  .res .d{color:var(--dim);font-size:12px;margin-top:2px}
+  #toast{position:fixed;right:20px;bottom:20px;background:#21262d;border:1px solid var(--line);
+         border-radius:8px;padding:10px 16px;font-size:13px;opacity:0;transition:opacity .2s;
+         pointer-events:none;max-width:380px}
+  #toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AI 议价护栏</h1>
+  <div class="sub">把「底价」从提示词里的一句话，变成代码里的一个数。默认关闭。</div>
+
+  <div class="note">
+    <b>为什么需要这一层</b>
+    改造前的议价是把「最多让 10%、最多让 100 元、最多 3 轮」写进提示词，然后由模型自由发挥——
+    <b>模型说「给你便宜 200」照样发得出去，代码层一个校验都没有</b>。提示词只能建议，不能阻止。
+    这里的做法是：价格由代码算，模型只负责把话说得像人；模型写完之后<b>再扫一遍数字</b>，
+    低于底价就改写，改不掉就整条拦下来转人工。
+  </div>
+
+  <div class="warnbox" id="diagBox" style="display:none">
+    <b>你的底价 vs 市场常态</b>
+    <div id="diagText" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card">
+    <h2>开关与参数</h2>
+    <div class="row">
+      <label class="f">启用议价护栏
+        <select id="enabled">
+          <option value="0">关闭（默认）</option>
+          <option value="1">开启</option>
+        </select>
+      </label>
+      <label class="f">最多议价轮数<input type="number" id="rounds" min="1" max="20"></label>
+      <label class="f">让价上限 %<input type="number" id="pct" min="0" max="100"></label>
+      <label class="f">让价上限 元<input type="number" id="amt" min="0" max="100000"></label>
+      <label class="f">全局绝对底价（0=不启用）<input type="number" id="abs" min="0" max="1000000"></label>
+      <div style="align-self:flex-end"><button class="primary" onclick="saveCfg()">保存</button></div>
+    </div>
+    <div class="muted" style="font-size:12px">
+      让价上限的 <b>百分比</b> 和 <b>金额</b> 是<b>同时生效、取更严的那个</b>。
+      例：160 元商品设 10% / 100 元 → 10% 是 144，减 100 是 60，取 144。
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>试算：买家这句话会得到什么价</h2>
+    <div class="row">
+      <label class="f">商品标价<input type="number" id="tp" value="160" min="1"></label>
+      <label class="f" style="flex:1;min-width:280px">买家消息
+        <input type="text" id="tm" value="130行不行" style="min-width:100%">
+      </label>
+      <div style="align-self:flex-end"><button onclick="tryDecide()">算一下</button></div>
+    </div>
+    <div class="muted" style="font-size:12px">试算用的是独立会话，<b>不会消耗真实买家的议价轮数</b>。</div>
+    <div id="decideRes"></div>
+  </div>
+
+  <div class="card">
+    <h2>试算：这句话能不能发出去</h2>
+    <div class="row">
+      <label class="f">底价<input type="number" id="cf" value="144" min="1"></label>
+      <label class="f">标价<input type="number" id="cl" value="160" min="1"></label>
+    </div>
+    <textarea id="cr" placeholder="把模型生成的回复粘进来，例如：行吧，130元就130元，交个朋友">行吧，130元就130元，交个朋友</textarea>
+    <div class="row" style="margin-top:10px"><button onclick="tryCheck()">过一遍保险丝</button></div>
+    <div id="checkRes"></div>
+  </div>
+
+  <div class="card" id="statCard" style="display:none">
+    <h2>近 30 天</h2>
+    <div class="kv" id="statKv"></div>
+    <table>
+      <thead><tr><th>时间</th><th>动作</th><th class="num">标价</th><th class="num">出价</th>
+                 <th class="num">砍幅</th><th class="num">还价</th><th>说明</th></tr></thead>
+      <tbody id="logRows"></tbody>
+    </table>
+  </div>
+
+  <div id="toast"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+
+function toast(msg, isErr){
+  const t = $('#toast');
+  t.textContent = msg;
+  t.style.borderColor = isErr ? 'var(--err)' : 'var(--line)';
+  t.classList.add('show');
+  clearTimeout(t._h);
+  t._h = setTimeout(()=>t.classList.remove('show'), 3200);
+}
+const jget = u => fetch(u).then(r=>r.json());
+const jpost = (u,b) => fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
+                                body:JSON.stringify(b||{})}).then(r=>r.json());
+
+async function boot(){
+  try{
+    const st = await jget('/api/bargain/status');
+    if(!st.ok){ toast(st.error||'读取失败', true); return; }
+    const c = st.config || {};
+    $('#enabled').value = c.enabled ? '1' : '0';
+    $('#rounds').value = c.max_rounds ?? 3;
+    $('#pct').value = c.max_discount_percent ?? 10;
+    $('#amt').value = c.max_discount_amount ?? 100;
+    $('#abs').value = c.floor_absolute ?? 0;
+    renderDiag(st.diagnosis);
+    renderStats(st);
+  }catch(e){ toast('初始化失败：'+e, true); }
+}
+
+function renderDiag(d){
+  if(!d) return;
+  $('#diagBox').style.display = 'block';
+  const tight = d.tight;
+  $('#diagText').innerHTML =
+    `按 160 元商品算，你最多让 <b>${d.allowed_amount} 元</b>（${(d.allowed_ratio*100).toFixed(0)}%）；` +
+    `而文档里买家的习惯性开口是砍 <b>${d.market_typical}</b>。<br>` +
+    `<span style="color:${tight?'var(--warn)':'var(--acc)'}">${esc(d.verdict)}</span><br>` +
+    `<span class="muted" style="font-size:12px">${esc(d.note)}</span>`;
+}
+
+function renderStats(st){
+  $('#statCard').style.display = 'block';
+  const kv = $('#statKv'); kv.innerHTML='';
+  const b = st.by_action || {};
+  [['会话', st.sessions ?? 0], ['已转人工', st.escalated ?? 0],
+   ['接受', b.accept ?? 0], ['还价', b.counter ?? 0],
+   ['拒绝', b.reject ?? 0], ['超界', b.escalate ?? 0],
+   ['改写', b.rewritten ?? 0], ['拦截', b.blocked ?? 0]
+  ].forEach(([k,v])=>{
+    const s = document.createElement('span'); s.textContent = `${k} ${v}`; kv.appendChild(s);
+  });
+  const tb = $('#logRows'); tb.innerHTML='';
+  (st.recent||[]).forEach(r=>{
+    const tr = document.createElement('tr');
+    const cls = {accept:'ok', reject:'err', escalate:'', counter:''}[r.action] || '';
+    tr.innerHTML = `<td class="muted">${esc(r.at||'')}</td>
+      <td class="${cls}">${esc(r.action||'')}</td>
+      <td class="num">${fmt(r.list_price)}</td>
+      <td class="num">${fmt(r.offer)}</td>
+      <td class="num">${r.cut_ratio!=null ? (r.cut_ratio*100).toFixed(0)+'%' : '—'}</td>
+      <td class="num">${fmt(r.reply_price)}</td>
+      <td class="muted" style="font-size:12px">${esc(r.note||'')}</td>`;
+    tb.appendChild(tr);
+  });
+  if(!(st.recent||[]).length){
+    tb.innerHTML = '<tr><td colspan="7" class="muted">还没有记录。开启后，每次真实议价都会留一条。</td></tr>';
+  }
+}
+
+async function saveCfg(){
+  const body = {
+    enabled: $('#enabled').value === '1',
+    max_rounds: parseInt($('#rounds').value||'3',10),
+    max_discount_percent: parseFloat($('#pct').value||'10'),
+    max_discount_amount: parseFloat($('#amt').value||'100'),
+    floor_absolute: parseFloat($('#abs').value||'0')
+  };
+  const r = await jpost('/api/bargain/config', body);
+  if(r.ok){ toast('已保存'); renderDiag(r.diagnosis); }
+  else toast(r.error||'保存失败', true);
+}
+
+async function tryDecide(){
+  const r = await jpost('/api/bargain/test', {
+    message: $('#tm').value, list_price: parseFloat($('#tp').value||'0')
+  });
+  const box = $('#decideRes');
+  if(!r.ok){ box.innerHTML = `<div class="res reject"><div class="t">失败</div>
+    <div class="d">${esc(r.error||'')}</div></div>`; return; }
+  const d = r.decision;
+  const cls = d.action;
+  const actionText = {accept:'接受', counter:'还价', reject:'拒绝',
+                      escalate:'转人工', no_offer:'不报价'}[d.action] || d.action;
+  box.innerHTML = `
+    <div class="res ${cls}">
+      <div class="t">${actionText}　${d.target_price!=null?'报到 '+d.target_price+' 元':'—'}</div>
+      <div class="d">出价 ${d.offer ?? '—'}　底价 ${d.floor}　砍幅
+        ${d.cut_ratio!=null?(d.cut_ratio*100).toFixed(0)+'%':'—'}　档位 ${esc(d.tier_label||'')}</div>
+      <div class="d">${esc(d.note||'')}</div>
+    </div>
+    <pre>${esc(r.prompt_block||'')}</pre>`;
+}
+
+async function tryCheck(){
+  const r = await jpost('/api/bargain/check-reply', {
+    reply: $('#cr').value, floor: parseFloat($('#cf').value||'0'),
+    list_price: parseFloat($('#cl').value||'0')
+  });
+  const box = $('#checkRes');
+  if(!r.ok){ box.innerHTML = `<div class="res reject"><div class="t">失败</div>
+    <div class="d">${esc(r.error||'')}</div></div>`; return; }
+  const bad = (r.violations||[]).length > 0;
+  box.innerHTML = `
+    <div class="res ${r.ok?(bad?'escalate':'accept'):'reject'}">
+      <div class="t">${r.ok ? (bad?'已改写，可发送':'合规，原样发送') : '已拦截'}</div>
+      <div class="d">原文：${esc($('#cr').value)}</div>
+      <div class="d">发出：${esc(r.reply||'（空）')}</div>
+      ${bad?`<div class="d err">${esc((r.violations||[]).join('；'))}</div>`:''}
+    </div>`;
+}
+
+function fmt(v){ return (v===null||v===undefined)?'—':v; }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+boot();
+</script>
+</body>
+</html>

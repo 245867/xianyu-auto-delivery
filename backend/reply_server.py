@@ -26,6 +26,19 @@ from db_manager import db_manager
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
 from config import config
+from monitor_api import create_monitor_router, monitor_lifespan
+from contextlib import asynccontextmanager
+from pickup_service import create_pickup_router
+from price_ladder import create_price_router, run_scheduler as run_price_ladder
+from price_rank_guard import (
+    create_price_rank_guard_callback_router,
+    run_scheduler as run_price_rank_guard,
+)
+from price_rank_guard_api import create_price_rank_guard_router
+from session_renewal import run_scheduler as run_session_renewal
+from account_nurturing import AccountNurtureScheduler
+from item_fission_api import create_fission_router
+from item_fission_matrix import ItemFissionMatrix, run_scheduler as run_fission_scheduler
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
@@ -352,13 +365,101 @@ class ResponseModel(BaseModel):
     data: ResponseData
 
 
+item_fission = ItemFissionMatrix(db_manager)
+
+
+@asynccontextmanager
+async def service_lifespan(app):
+    async with monitor_lifespan(app):
+        stop = asyncio.Event()
+        schedulers = []
+        if config.get("ACCOUNT_NURTURING.exposure_stats_enabled") is True:
+            schedulers.append(asyncio.create_task(
+                AccountNurtureScheduler(db_manager).run_seller_stats(stop), name="seller-exposure-stats",
+            ))
+        if config.get("ITEM_FISSION.enabled") is True:
+            schedulers.append(asyncio.create_task(run_fission_scheduler(item_fission, stop), name="item-fission"))
+        if config.get("PRICE_LADDER.enabled", False):
+            schedulers.append(asyncio.create_task(run_price_ladder(db_manager.db_path, stop), name="price-ladder"))
+        if config.get("PRICE_RANK_GUARD.enabled") is True:
+            schedulers.append(asyncio.create_task(
+                run_price_rank_guard(db_manager, stop), name="price-rank-guard",
+            ))
+        if config.get("DROPSHIP.enabled", False):
+            from dropshipping import run_scheduler as run_dropship_scheduler
+            schedulers.append(asyncio.create_task(
+                run_dropship_scheduler(db_manager, stop, config.get("DROPSHIP")), name="dropshipping",
+            ))
+        if config.get("VOUCHER_ASYNC.enabled") is True:
+            from voucher_async_reconcile import VoucherAsyncReconcile
+
+            voucher = VoucherAsyncReconcile(
+                db_manager, getattr(app.state, "voucher_adapters", {}),
+                timeout_seconds=config.get("VOUCHER_ASYNC.timeout_seconds", 1800),
+                item_channels=config.get("VOUCHER_ASYNC.item_channels", {}),
+            )
+            app.state.voucher_reconcile = voucher
+            schedulers.append(asyncio.create_task(voucher.run(
+                stop, config.get("VOUCHER_ASYNC.seller_eids", {}),
+                config.get("VOUCHER_ASYNC.refund_refuse_reason", ""),
+            ), name="voucher-async-reconcile"))
+        if config.get("AUTO_REVIEW.enabled") is True:
+            from auto_review import run_scheduler as run_auto_review
+
+            schedulers.append(asyncio.create_task(
+                run_auto_review(db_manager, stop), name="auto-review",
+            ))
+        if config.get("BARGAIN_CLOSER.enabled") is True:
+            from bargain_closer import (build_platform_channels,
+                                        run_scheduler as run_bargain_closer)
+
+            schedulers.append(asyncio.create_task(
+                run_bargain_closer(db_manager, stop, **build_platform_channels()),
+                name="bargain-closer",
+            ))
+        if config.get("FINANCIAL_PROFIT.enabled") is True:
+            from financial_profit import run_scheduler as run_financial_profit
+
+            schedulers.append(asyncio.create_task(
+                run_financial_profit(db_manager, stop), name="financial-profit",
+            ))
+        if config.get("ORDER_CHASER.enabled") is True:
+            from order_chase_scheduler import run_scheduler as run_order_chase
+
+            schedulers.append(asyncio.create_task(
+                run_order_chase(db_manager, stop), name="order-chase",
+            ))
+        if config.get("REFUND_DISPUTE.enabled") is True:
+            from refund_dispute_scheduler import run_scheduler as run_refund_dispute
+
+            schedulers.append(asyncio.create_task(
+                run_refund_dispute(db_manager, stop), name="refund-dispute",
+            ))
+        if config.get("SESSION_RENEWAL.enabled") is True:
+            schedulers.append(asyncio.create_task(
+                run_session_renewal(db_manager, stop), name="session-renewal",
+            ))
+        try:
+            yield
+        finally:
+            stop.set()
+            await asyncio.gather(*schedulers)
+
+
 app = FastAPI(
     title="Xianyu Auto Reply API",
     version="1.0.0",
     description="闲鱼自动回复系统API",
+    lifespan=service_lifespan,
     docs_url="/docs" if config.get('WEB_SECURITY.docs_enabled', False) else None,
     redoc_url="/redoc" if config.get('WEB_SECURITY.docs_enabled', False) else None
 )
+app.include_router(create_monitor_router(require_admin))
+app.include_router(create_fission_router(item_fission, require_admin))
+app.include_router(create_price_rank_guard_router(db_manager, require_admin))
+app.include_router(create_pickup_router(db_manager.db_path))
+app.include_router(create_price_router(db_manager.db_path))
+app.include_router(create_price_rank_guard_callback_router(db_manager))
 
 # 添加 CORS 中间件支持前端跨域请求
 app.add_middleware(
@@ -382,6 +483,229 @@ if CAPTCHA_ROUTER_AVAILABLE and config.get('WEB_SECURITY.remote_captcha_enabled'
     logger.info("✅ 已注册刮刮乐远程控制路由: /api/captcha")
 else:
     logger.info("远程验证码控制路由未启用")
+
+# 注册选品工作台路由（复刻自 xianyu-pilot-pro，GitHub项目复刻方案 v9）
+OPPORTUNITY_ROUTER_AVAILABLE = False
+try:
+    from opportunity_api import router as opportunity_router
+    OPPORTUNITY_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ opportunity_api 未找到，选品工作台功能不可用: {_e}")
+if OPPORTUNITY_ROUTER_AVAILABLE:
+    app.include_router(opportunity_router)
+    logger.info("✅ 已注册选品工作台路由: /api/opportunity + /opportunity 页面")
+
+# 发布后履约编排：持久化任务 → 发布 → 准确 itemId 回读 → 商品同步
+# → 卡密绑定 → 库存复检。供应商采购适配层仍等待真实接口契约。
+FULFILLMENT_ROUTER_AVAILABLE = False
+try:
+    from opportunity_fulfillment_api import create_router as create_fulfillment_router
+    app.include_router(create_fulfillment_router(get_current_user))
+    FULFILLMENT_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ opportunity_fulfillment_api 未找到，履约编排不可用: {_e}")
+if FULFILLMENT_ROUTER_AVAILABLE:
+    logger.info("✅ 已注册履约编排路由: /api/opportunity/fulfillment")
+
+# 注册自动擦亮路由（移植自 zhinianboke/xianyu-auto-reply polish_task，补齐①）
+POLISH_ROUTER_AVAILABLE = False
+try:
+    from polish_api import router as polish_router
+    POLISH_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ polish_api 未找到，自动擦亮功能不可用: {_e}")
+if POLISH_ROUTER_AVAILABLE:
+    app.include_router(polish_router)
+    logger.info("✅ 已注册自动擦亮路由: /api/polish + /polish 页面（每日定时 + 手动触发）")
+
+# 注册通知推送路由（互联网侧吸收：嗷嗷鱼/Ydisks 多渠道通知）
+NOTIFY_ROUTER_AVAILABLE = False
+try:
+    from notify_api import router as notify_router
+    NOTIFY_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ notify_api 未找到，通知推送不可用: {_e}")
+if NOTIFY_ROUTER_AVAILABLE:
+    app.include_router(notify_router)
+    logger.info("✅ 已注册通知推送路由: /api/notify + /notify 页面（企微/钉钉/飞书/Bark/自定义）")
+
+# 注册登录态保活路由（A1：心跳 + 随机换 token）
+TOKEN_ROUTER_AVAILABLE = False
+try:
+    from token_api import router as token_router
+    TOKEN_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ token_api 未找到，登录态保活不可用: {_e}")
+if TOKEN_ROUTER_AVAILABLE:
+    app.include_router(token_router)
+    logger.info("✅ 已注册登录态保活路由: /api/token + /token 页面（只读心跳，10 分钟）")
+
+# 注册素材库路由（A4：图片资产，本地 SQLite + 磁盘，不上传第三方）
+MATERIAL_ROUTER_AVAILABLE = False
+try:
+    from material_api import router as material_router
+    MATERIAL_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ material_api 未找到，素材库功能不可用: {_e}")
+if MATERIAL_ROUTER_AVAILABLE:
+    app.include_router(material_router)
+    logger.info("✅ 已注册素材库路由: /api/materials + /materials 页面（本地图片资产）")
+
+# 注册商品模板与批量发布路由（A5：占位符模板 + 队列批量发布）
+TEMPLATE_ROUTER_AVAILABLE = False
+try:
+    from template_api import router as template_router
+    TEMPLATE_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ template_api 未找到，模板批量发布不可用: {_e}")
+if TEMPLATE_ROUTER_AVAILABLE:
+    app.include_router(template_router)
+    logger.info("✅ 已注册模板批量发布路由: /api/templates + /templates 页面（默认演练）")
+
+# 注册售罄自动上架路由（A6：白名单巡检 + 模板重建，默认关闭+演练）
+SOLD_OUT_ROUTER_AVAILABLE = False
+try:
+    from sold_out_relist_api import router as sold_out_router
+    SOLD_OUT_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ sold_out_relist_api 未找到，售罄自动上架不可用: {_e}")
+if SOLD_OUT_ROUTER_AVAILABLE:
+    app.include_router(sold_out_router)
+    logger.info("✅ 已注册售罄自动上架路由: /api/sold-out + /sold_out 页面（默认关闭）")
+
+# 注册僵尸链接重发路由（C2：长期零出单 → 模板重建 + 人工下架，默认关闭+演练）
+STALE_ROUTER_AVAILABLE = False
+try:
+    from stale_relist_api import router as stale_router
+    STALE_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ stale_relist_api 未找到，僵尸链接重发不可用: {_e}")
+if STALE_ROUTER_AVAILABLE:
+    app.include_router(stale_router)
+    logger.info("✅ 已注册僵尸链接重发路由: /api/stale + /stale_relist 页面"
+                "（半自动：重建自动、下架人工）")
+
+# 注册发货可靠性路由（C3：逐卡记账 + 补发 + 人工收口）
+DELIVERY_REL_ROUTER_AVAILABLE = False
+try:
+    from delivery_reliability_api import router as delivery_rel_router
+    DELIVERY_REL_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ delivery_reliability_api 未找到，发货补发不可用: {_e}")
+if DELIVERY_REL_ROUTER_AVAILABLE:
+    app.include_router(delivery_rel_router)
+    logger.info("✅ 已注册发货可靠性路由: /api/delivery + /delivery_reliability 页面")
+
+# 注册闲管家开放平台路由（D1：官方授权通道，默认关闭，未配 AppKey 不启用）
+OPEN_PLATFORM_ROUTER_AVAILABLE = False
+try:
+    from open_platform_api import router as open_platform_router
+    OPEN_PLATFORM_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ open_platform_api 未找到，开放平台通道不可用: {_e}")
+if OPEN_PLATFORM_ROUTER_AVAILABLE:
+    app.include_router(open_platform_router)
+    logger.info("✅ 已注册闲管家开放平台路由: /api/open-platform + /open_platform 页面（默认关闭）")
+
+# 注册热搜词/爆款词榜路由（B1：只读搜索 + 标题挖掘，默认不自动扫）
+HOT_KEYWORD_ROUTER_AVAILABLE = False
+try:
+    from hot_keyword_api import router as hot_keyword_router
+    HOT_KEYWORD_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ hot_keyword_api 未找到，热搜词榜不可用: {_e}")
+if HOT_KEYWORD_ROUTER_AVAILABLE:
+    app.include_router(hot_keyword_router)
+    logger.info("✅ 已注册热搜词榜路由: /api/hot-keywords + /hot_keywords 页面（只读，默认不自动扫）")
+
+# 注册店铺复盘/限流归因路由（B2：全只读，不发布不改价）
+SHOP_DIAGNOSIS_ROUTER_AVAILABLE = False
+try:
+    from shop_diagnosis_api import router as shop_diagnosis_router
+    SHOP_DIAGNOSIS_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ shop_diagnosis_api 未找到，店铺复盘不可用: {_e}")
+if SHOP_DIAGNOSIS_ROUTER_AVAILABLE:
+    app.include_router(shop_diagnosis_router)
+    logger.info("✅ 已注册店铺复盘路由: /api/shop-diagnosis + /shop_diagnosis 页面（只读）")
+
+# 注册 AI 议价护栏路由（B3：底价由代码算，默认关闭）
+BARGAIN_ROUTER_AVAILABLE = False
+try:
+    from bargain_api import router as bargain_router
+    BARGAIN_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ bargain_api 未找到，AI 议价护栏不可用: {_e}")
+if BARGAIN_ROUTER_AVAILABLE:
+    app.include_router(bargain_router)
+    logger.info("✅ 已注册议价护栏路由: /api/bargain + /bargain 页面（默认关闭）")
+
+# C1 交易后自动动作：自动评价 / 求小红花 / 收货致谢
+# （三个真实 MTOP 接口；评价前必须先读待评价列表，见 care_message.py 顶部说明）
+CARE_ROUTER_AVAILABLE = False
+try:
+    from care_api import router as care_router
+    CARE_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ care_api 未找到，交易后动作不可用: {_e}")
+if CARE_ROUTER_AVAILABLE:
+    app.include_router(care_router)
+    logger.info("✅ 已注册交易后动作路由: /api/care + /care 页面（默认关闭+演练）")
+
+# 回复发件箱（拆解 10）：按 source_msg_id 落盘幂等，停止态留人工出口
+REPLY_OUTBOX_ROUTER_AVAILABLE = False
+try:
+    from reply_outbox_api import router as reply_outbox_router
+    REPLY_OUTBOX_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ reply_outbox_api 未找到，回复落盘幂等不可用: {_e}")
+if REPLY_OUTBOX_ROUTER_AVAILABLE:
+    app.include_router(reply_outbox_router)
+    logger.info("✅ 已注册回复发件箱路由: /api/reply/outbox + /reply_outbox 页面")
+
+# 买家提问观测 / FAQ 覆盖率（方向三）：先落盘再回复，建议只给不写
+FAQ_ROUTER_AVAILABLE = False
+try:
+    from faq_api import router as faq_router
+    FAQ_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ faq_api 未找到，买家提问观测不可用: {_e}")
+if FAQ_ROUTER_AVAILABLE:
+    app.include_router(faq_router)
+    logger.info("✅ 已注册买家提问路由: /api/faq + /faq 页面")
+
+# 退款后处置账本（方向一）：只记账，不自动拉黑
+REFUND_ROUTER_AVAILABLE = False
+try:
+    from refund_api import router as refund_router
+    REFUND_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ refund_api 未找到，退款账本不可用: {_e}")
+if REFUND_ROUTER_AVAILABLE:
+    app.include_router(refund_router)
+    logger.info("✅ 已注册退款账本路由: /api/refund + /refund 页面")
+
+# 服务型商品复盘（P2）：咨询量/答上率/复购/缺失字段，只读
+SERVICE_REVIEW_ROUTER_AVAILABLE = False
+try:
+    from service_review_api import router as service_review_router
+    SERVICE_REVIEW_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ service_review_api 未找到，服务型复盘不可用: {_e}")
+if SERVICE_REVIEW_ROUTER_AVAILABLE:
+    app.include_router(service_review_router)
+    logger.info("✅ 已注册服务型复盘路由: /api/service/review + /service_review 页面")
+
+# 后台任务停滞检测（L2-2）：只读心跳状态；检测线程由各任务 register 时自启
+WATCHDOG_ROUTER_AVAILABLE = False
+try:
+    from watchdog_api import router as watchdog_router
+    WATCHDOG_ROUTER_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"⚠️ watchdog_api 未找到，后台任务停滞状态不可见: {_e}")
+if WATCHDOG_ROUTER_AVAILABLE:
+    app.include_router(watchdog_router)
+    logger.info("✅ 已注册后台任务状态路由: /api/watchdog/status")
 
 # 初始化文件日志收集器
 setup_file_logging()
@@ -420,7 +744,8 @@ async def log_requests(request, call_next):
         "img-src 'self' data: blob:; font-src 'self' data:; "
         "connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     )
-    if request.url.path in {'/login', '/verify', '/auth/mode'} or 'settings' in request.url.path:
+    if (request.url.path in {'/login', '/verify', '/auth/mode', '/pickup'}
+            or request.url.path.startswith('/api/pickup/') or 'settings' in request.url.path):
         response.headers['Cache-Control'] = 'no-store'
 
     return response
@@ -449,50 +774,33 @@ if not os.path.exists(uploads_dir):
 
 # 健康检查端点
 @app.get('/health')
-async def health_check():
+def health_check():
     """健康检查端点，用于Docker健康检查和负载均衡器"""
+    manager_status = "ok" if cookie_manager.manager is not None else "error"
+    db_status = "ok"
     try:
-        # 检查Cookie管理器状态
-        manager_status = "ok" if cookie_manager.manager is not None else "error"
+        db_manager.check_connection()
+    except Exception as exc:
+        logger.warning("数据库健康检查失败: {}", exc)
+        db_status = "error"
 
-        # 检查数据库连接
-        from db_manager import db_manager
-        try:
-            db_manager.get_all_cookies()
-            db_status = "ok"
-        except Exception:
-            db_status = "error"
+    import psutil
 
-        # 获取系统状态
-        import psutil
-        cpu_percent = psutil.cpu_percent(interval=1)
-        memory_info = psutil.virtual_memory()
-
-        status = {
-            "status": "healthy" if manager_status == "ok" and db_status == "ok" else "unhealthy",
-            "timestamp": time.time(),
-            "services": {
-                "cookie_manager": manager_status,
-                "database": db_status
-            },
-            "system": {
-                "cpu_percent": cpu_percent,
-                "memory_percent": memory_info.percent,
-                "memory_available": memory_info.available
-            }
+    memory_info = psutil.virtual_memory()
+    healthy = manager_status == "ok" and db_status == "ok"
+    return JSONResponse(status_code=200 if healthy else 503, content={
+        "status": "healthy" if healthy else "unhealthy",
+        "timestamp": time.time(),
+        "services": {
+            "cookie_manager": manager_status,
+            "database": db_status
+        },
+        "system": {
+            "cpu_percent": psutil.cpu_percent(),
+            "memory_percent": memory_info.percent,
+            "memory_available": memory_info.available
         }
-
-        if status["status"] == "unhealthy":
-            raise HTTPException(status_code=503, detail=status)
-
-        return status
-
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "timestamp": time.time(),
-            "error": str(e)
-        }
+    })
 
 
 # 服务 React 前端 SPA - 所有前端路由都返回 index.html
@@ -1381,12 +1689,23 @@ def _build_account_profile(cookie_id: str, cookie_value: str, remark: str = '') 
     }
 
 
+def _account_connection_state(cookie_id: str) -> Optional[str]:
+    from XianyuAutoAsync import ConnectionState, XianyuLive
+
+    if cookie_manager.manager is None:
+        return None
+    instance = XianyuLive.get_instance(cookie_id)
+    if instance is None:
+        return ConnectionState.DISCONNECTED.value
+    state = instance.connection_state
+    if state is ConnectionState.CONNECTED and (instance.ws is None or instance.ws.closed):
+        return ConnectionState.DISCONNECTED.value
+    return state.value
+
+
 @app.get("/cookies/details")
 def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取所有Cookie的详细信息（包括值和状态）"""
-    if cookie_manager.manager is None:
-        return []
-
     # 获取当前用户的cookies
     user_id = current_user['user_id']
     from db_manager import db_manager
@@ -1394,7 +1713,8 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
 
     result = []
     for cookie_id, cookie_value in user_cookies.items():
-        cookie_enabled = cookie_manager.manager.get_cookie_status(cookie_id)
+        manager = cookie_manager.manager
+        cookie_enabled = manager.get_cookie_status(cookie_id) if manager else db_manager.get_cookie_status(cookie_id)
         auto_confirm = db_manager.get_auto_confirm(cookie_id)
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)
@@ -1405,6 +1725,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'id': cookie_id,
             'value': cookie_value,
             'enabled': cookie_enabled,
+            'connection_state': _account_connection_state(cookie_id),
             'auto_confirm': auto_confirm,
             'remark': remark,
             'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10,
@@ -4023,8 +4344,8 @@ def delete_keyword_by_index(cid: str, index: int, current_user: Dict[str, Any] =
 def debug_keywords_table_info(current_user: Dict[str, Any] = Depends(get_current_user)):
     """调试：检查keywords表结构"""
     try:
-        import sqlite3
-        conn = sqlite3.connect(db_manager.db_path)
+        from sqlite_runtime import connect_sqlite
+        conn = connect_sqlite(db_manager.db_path)
         cursor = conn.cursor()
 
         # 获取表结构信息
@@ -4075,6 +4396,8 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
         if is_multi_spec:
             if not card_data.get('spec_name') or not card_data.get('spec_value'):
                 raise HTTPException(status_code=400, detail="多规格卡券必须提供规格名称和规格值")
+            if bool(card_data.get('spec_name_2')) != bool(card_data.get('spec_value_2')):
+                raise HTTPException(status_code=400, detail="第二维规格必须同时提供规格名称和规格值")
 
         card_id = db_manager.create_card(
             name=card_data.get('name'),
@@ -4091,6 +4414,8 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
             is_multi_spec=is_multi_spec,
             spec_name=card_data.get('spec_name') if is_multi_spec else None,
             spec_value=card_data.get('spec_value') if is_multi_spec else None,
+            spec_name_2=card_data.get('spec_name_2') if is_multi_spec else None,
+            spec_value_2=card_data.get('spec_value_2') if is_multi_spec else None,
             user_id=user_id
         )
 
@@ -4128,6 +4453,8 @@ def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = De
         if is_multi_spec:
             if not card_data.get('spec_name') or not card_data.get('spec_value'):
                 raise HTTPException(status_code=400, detail="多规格卡券必须提供规格名称和规格值")
+            if bool(card_data.get('spec_name_2')) != bool(card_data.get('spec_value_2')):
+                raise HTTPException(status_code=400, detail="第二维规格必须同时提供规格名称和规格值")
 
         success = db_manager.update_card(
             card_id=card_id,
@@ -4138,13 +4465,15 @@ def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = De
             data_content=card_data.get('data_content'),
             image_url=card_data.get('image_url'),
             description=card_data.get('description'),
-            enabled=card_data.get('enabled', True),
+            enabled=card_data.get('enabled'),
             delay_seconds=card_data.get('delay_seconds'),
             after_delivery_enabled=card_data.get('after_delivery_enabled'),
             after_delivery_message=card_data.get('after_delivery_message'),
             is_multi_spec=is_multi_spec,
             spec_name=card_data.get('spec_name'),
-            spec_value=card_data.get('spec_value')
+            spec_value=card_data.get('spec_value'),
+            spec_name_2=card_data.get('spec_name_2'),
+            spec_value_2=card_data.get('spec_value_2')
         )
         if success:
             return {"message": "卡券更新成功"}
@@ -4154,6 +4483,24 @@ def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = De
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/cards/{card_id}/inventory")
+def append_card_inventory(
+    card_id: int,
+    content: str = Body(..., embed=True),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """向当前用户的卡密分组追加内容。"""
+    from db_manager import db_manager
+
+    try:
+        updated = db_manager.append_card_inventory(card_id, current_user['user_id'], content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail="卡券不存在")
+    return {"message": "卡密已添加"}
 
 
 @app.put("/cards/{card_id}/image")
@@ -4168,6 +4515,8 @@ async def update_card_with_image(
     is_multi_spec: bool = Form(default=False),
     spec_name: str = Form(default=""),
     spec_value: str = Form(default=""),
+    spec_name_2: str = Form(default=""),
+    spec_value_2: str = Form(default=""),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """更新带图片的卡券"""
@@ -4183,6 +4532,8 @@ async def update_card_with_image(
         if is_multi_spec:
             if not spec_name or not spec_value:
                 raise HTTPException(status_code=400, detail="多规格卡券必须提供规格名称和规格值")
+            if bool(spec_name_2) != bool(spec_value_2):
+                raise HTTPException(status_code=400, detail="第二维规格必须同时提供规格名称和规格值")
 
         # 读取图片数据
         image_data = await image.read()
@@ -4211,7 +4562,9 @@ async def update_card_with_image(
             delay_seconds=delay_seconds,
             is_multi_spec=is_multi_spec,
             spec_name=spec_name if is_multi_spec else None,
-            spec_value=spec_value if is_multi_spec else None
+            spec_value=spec_value if is_multi_spec else None,
+            spec_name_2=spec_name_2 if is_multi_spec else None,
+            spec_value_2=spec_value_2 if is_multi_spec else None
         )
 
         if success:
@@ -5486,6 +5839,7 @@ def export_log_file(file: str, admin_user: Dict[str, Any] = Depends(require_admi
 @app.get('/admin/stats')
 def get_system_stats(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户的仪表盘统计信息。"""
+    from card_text import split_codes
     from db_manager import db_manager
     try:
         log_with_user('info', "查询仪表盘统计信息", current_user)
@@ -5498,16 +5852,20 @@ def get_system_stats(current_user: Dict[str, Any] = Depends(get_current_user)):
         all_cookies = db_manager.get_all_cookies(user_id)
         total_cookies = len(all_cookies)
         
-        # 活跃账号统计（启用状态的账号）
-        active_cookies = 0
-        for cookie_id in all_cookies.keys():
-            status = db_manager.get_cookie_status(cookie_id)
-            if status:
-                active_cookies += 1
+        # 在线账号使用实际连接状态。
+        active_cookies = sum(
+            _account_connection_state(cookie_id) == "connected" for cookie_id in all_cookies
+        )
 
         # 卡券统计
         all_cards = db_manager.get_all_cards(user_id)
         total_cards = len(all_cards) if all_cards else 0
+        available_cards = len({
+            code
+            for card in all_cards or []
+            if card["type"] == "data" and card["enabled"]
+            for code in split_codes(card["data_content"])
+        })
 
         # 关键词统计
         all_keywords = db_manager.get_all_keywords(user_id)
@@ -5528,6 +5886,7 @@ def get_system_stats(current_user: Dict[str, Any] = Depends(get_current_user)):
             "total_cookies": total_cookies,
             "active_cookies": active_cookies,
             "total_cards": total_cards,
+            "available_cards": available_cards,
             "total_keywords": total_keywords,
             "total_orders": total_orders
         }
@@ -6264,6 +6623,52 @@ class RefundBlacklistUpdate(BaseModel):
     model_config = {'extra': 'forbid'}
 
 
+class CrossShopBlacklistCreate(BaseModel):
+    buyer_id: str = Field(min_length=1, max_length=200)
+    trigger_account_id: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=500)
+    refund_amount: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+
+    model_config = {'extra': 'forbid'}
+
+
+@app.post("/cross-shop-blacklist", status_code=201)
+def create_cross_shop_blacklist(
+    payload: CrossShopBlacklistCreate,
+    _: Dict[str, Any] = Depends(require_admin),
+):
+    try:
+        saved = db_manager.record_cross_shop_blacklist(
+            payload.buyer_id, payload.trigger_account_id, payload.reason, payload.refund_amount,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not saved:
+        raise HTTPException(status_code=404, detail="来源账号不存在")
+    return {"item": db_manager.get_cross_shop_blacklist_entry(payload.buyer_id)}
+
+
+@app.get("/cross-shop-blacklist")
+def get_cross_shop_blacklist(
+    buyer_id: str = Query(min_length=1, max_length=200),
+    _: Dict[str, Any] = Depends(require_admin),
+):
+    entry = db_manager.get_cross_shop_blacklist_entry(buyer_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="跨店黑名单记录不存在")
+    return {"item": entry}
+
+
+@app.delete("/cross-shop-blacklist")
+def delete_cross_shop_blacklist(
+    buyer_id: str = Query(min_length=1, max_length=200),
+    _: Dict[str, Any] = Depends(require_admin),
+):
+    if not db_manager.delete_cross_shop_blacklist_entry(buyer_id):
+        raise HTTPException(status_code=404, detail="跨店黑名单记录不存在")
+    return {"message": "跨店黑名单记录已删除"}
+
+
 def _current_user_cookie_ids(current_user: Dict[str, Any]) -> List[str]:
     return list(db_manager.get_all_cookies(current_user['user_id']).keys())
 
@@ -6546,40 +6951,32 @@ async def refresh_single_order(
         if result.get('error'):
             raise HTTPException(status_code=500, detail=f"刷新失败: {result.get('error')}")
 
-        # 状态码映射
-        order_status = result.get('order_status', 'unknown')
-        if order_status and str(order_status).isdigit():
-            status_mapping = {
-                '1': 'processing',
-                '2': 'pending_ship',
-                '3': 'shipped',
-                '4': 'completed',
-                '5': 'refunding',
-                '6': 'cancelled',
-                '7': 'refunding',
-                '8': 'cancelled',
-                '9': 'refunding',
-                '10': 'cancelled',
-                '11': 'completed',
-                '12': 'cancelled',
-            }
-            order_status = status_mapping.get(str(order_status), order_status)
+        # 状态码 → 状态：唯一来源 order_status_rules
+        from order_status_rules import normalize_status
+        order_status = normalize_status(result.get('order_status', 'unknown'))
 
         # 更新数据库
-        db_manager.insert_or_update_order(
+        saved = db_manager.insert_or_update_order(
             order_id=order_id,
             item_id=result.get('item_id') or None,
             buyer_id=result.get('buyer_id') or None,
             spec_name=result.get('spec_name') or None,
             spec_value=result.get('spec_value') or None,
+            spec_name_2=result.get('spec_name_2') or None,
+            spec_value_2=result.get('spec_value_2') or None,
             quantity=result.get('quantity') or None,
             amount=result.get('amount') or None,
             order_status=order_status,
             cookie_id=cookie_id,
+            created_at=result.get('order_time') or None,
             receiver_name=result.get('receiver_name') or None,
             receiver_phone=result.get('receiver_phone') or None,
             receiver_address=result.get('receiver_address') or None,
         )
+        if not saved:
+            raise HTTPException(status_code=500, detail="订单详情写入失败")
+        saved_order = db_manager.get_order_by_id(order_id) or {}
+        order_status = saved_order.get('order_status', order_status)
 
         log_with_user('info', f"订单刷新成功: {order_id}, 新状态: {order_status}", current_user)
         return JSONResponse({
@@ -6677,22 +7074,9 @@ async def update_order(
                     if complete_result:
                         log_with_user('info', f"成功获取订单 {order_id} 的完整数据（一次浏览器调用）", current_user)
 
-                        # 状态码映射（如果需要转换）
-                        order_status = complete_result.get('order_status', 'unknown')
-                        if order_status and isinstance(order_status, str) and order_status.isdigit():
-                            status_mapping = {
-                                '1': 'processing',
-                                '2': 'pending_ship',
-                                '3': 'shipped',
-                                '4': 'completed',
-                                '5': 'refunding',
-                                '6': 'cancelled',
-                                '7': 'refunding',
-                                '8': 'cancelled',
-                                '9': 'refunding',
-                                '10': 'cancelled',
-                            }
-                            order_status = status_mapping.get(order_status, order_status)
+                        # 状态码 → 状态：唯一来源 order_status_rules
+                        from order_status_rules import normalize_status
+                        order_status = normalize_status(complete_result.get('order_status', 'unknown'))
 
                         # 构建要更新的完整数据
                         refresh_data = {
@@ -6702,6 +7086,8 @@ async def update_order(
                             'order_status': order_status or order.get('order_status'),
                             'spec_name': complete_result.get('spec_name') or None,
                             'spec_value': complete_result.get('spec_value') or None,
+                            'spec_name_2': complete_result.get('spec_name_2') or None,
+                            'spec_value_2': complete_result.get('spec_value_2') or None,
                             'quantity': complete_result.get('quantity') or None,
                             'amount': complete_result.get('amount') or None,
                             'created_at': complete_result.get('order_time') or None,
@@ -6778,6 +7164,63 @@ async def update_order(
     except Exception as e:
         log_with_user('error', f"更新订单失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=f"更新订单失败: {str(e)}")
+
+
+@app.post('/api/orders/sync')
+async def sync_platform_orders(
+    cookie_id: Optional[str] = Form(None),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """同步卖家订单列表，登记漏单并核对已有订单状态。"""
+    from order_reconcile import reconcile
+
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    if cookie_id:
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=404, detail="账号不存在或无权访问")
+        user_cookies = {cookie_id: user_cookies[cookie_id]}
+    if not user_cookies:
+        return {"success": False, "message": "请先添加闲鱼账号", "results": []}
+
+    results = []
+    notes = []
+    for account_id, cookie in user_cookies.items():
+        report = await asyncio.to_thread(
+            reconcile, cookie, account_id, pages=5, rows_per_page=20, days=None, notify_missing=False
+        )
+        result = {
+            "cookie_id": account_id,
+            "fetched": report.get("platform_count", 0),
+            "registered": report.get("registered", 0),
+            "refreshed": report.get("refreshed", 0),
+            "failed": report.get("failed", 0),
+            "failed_pages": report.get("failed_pages", []),
+            "has_more": report.get("has_more", False),
+        }
+        if not report["ok"]:
+            result["error"] = report["error"]
+            notes.append(f"{account_id}：{result['error']}")
+        if result["failed_pages"]:
+            pages = "、".join(str(page) for page in result["failed_pages"])
+            notes.append(f"{account_id}：第 {pages} 页读取失败")
+        if result["has_more"]:
+            notes.append(f"{account_id}：仅读取最近五页，还有历史订单")
+        results.append(result)
+
+    fetched = sum(result["fetched"] for result in results)
+    registered = sum(result["registered"] for result in results)
+    refreshed = sum(result["refreshed"] for result in results)
+    failed = sum(result["failed"] for result in results)
+    message = f"拉取 {fetched} 单，新增 {registered} 单，更新状态 {refreshed} 单"
+    if failed:
+        notes.append(f"{failed} 条订单解析或写入失败")
+    if notes:
+        message += "。" + "；".join(notes)
+    return {
+        "success": not failed and all(not result["failed_pages"] and "error" not in result for result in results),
+        "message": message,
+        "results": results,
+    }
 
 
 @app.post('/api/orders/refresh')
@@ -6898,24 +7341,9 @@ async def refresh_orders_status(
                     dom_status = result.get('dom_status', 'N/A')
                     log_with_user('debug', f"订单 {order_id} - API状态: {api_status}, DOM状态: {dom_status}", current_user)
 
-                    # 状态码映射
-                    order_status = result.get('order_status', 'unknown')
-                    if order_status and str(order_status).isdigit():
-                        status_mapping = {
-                            '1': 'processing',
-                            '2': 'pending_ship',
-                            '3': 'shipped',
-                            '4': 'completed',
-                            '5': 'refunding',
-                            '6': 'cancelled',
-                            '7': 'refunding',
-                            '8': 'cancelled',
-                            '9': 'refunding',
-                            '10': 'cancelled',
-                            '11': 'completed',  # 交易完成
-                            '12': 'cancelled',  # 交易关闭
-                        }
-                        order_status = status_mapping.get(str(order_status), order_status)
+                    # 状态码 → 状态：唯一来源 order_status_rules
+                    from order_status_rules import normalize_status
+                    order_status = normalize_status(result.get('order_status', 'unknown'))
 
                     # 更新数据库
                     success = db_manager.insert_or_update_order(
@@ -6924,6 +7352,8 @@ async def refresh_orders_status(
                         buyer_id=result.get('buyer_id') or None,
                         spec_name=result.get('spec_name') or None,
                         spec_value=result.get('spec_value') or None,
+                        spec_name_2=result.get('spec_name_2') or None,
+                        spec_value_2=result.get('spec_value_2') or None,
                         quantity=result.get('quantity') or None,
                         amount=result.get('amount') or None,
                         order_status=order_status if order_status != current_status else None,
@@ -6935,6 +7365,9 @@ async def refresh_orders_status(
                     )
 
                     if success:
+                        if order_status != current_status:
+                            saved_order = db_manager.get_order_by_id(order_id)
+                            order_status = (saved_order or {}).get('order_status', current_status)
                         # 检查是否有更新
                         has_changes = (
                             order_status != current_status or
@@ -7006,36 +7439,12 @@ async def refresh_orders_status(
                             new_status_code = status_result.get('order_status')
                             new_status_text = status_result.get('status_text', '')
 
-                            # 将状态码转换为数据库状态
-                            # 完整的订单状态码映射（基于闲鱼API）
-                            status_mapping = {
-                                1: 'processing',      # 处理中
-                                2: 'pending_ship',    # 待发货
-                                3: 'shipped',         # 已发货
-                                4: 'completed',       # 已完成/交易成功
-                                5: 'refunding',       # 退款中
-                                6: 'cancelled',       # 已取消/已关闭
-                                7: 'refunding',       # 退款申请中
-                                8: 'cancelled',       # 退款成功（订单关闭）
-                                9: 'refunding',       # 退款协商中
-                                10: 'cancelled',      # 退款关闭
-                            }
-                            new_status = status_mapping.get(new_status_code, 'unknown')
-
-                            # 特殊处理：根据状态文本智能识别（优先检查最终状态）
-                            if new_status == 'unknown':
-                                # 优先级1: 检查"退款成功"（最终状态）
-                                if '退款' in new_status_text and '成功' in new_status_text:
-                                    new_status = 'cancelled'  # 退款成功=订单关闭
-                                # 优先级2: 检查"关闭"或"取消"（最终状态）
-                                elif '关闭' in new_status_text or '取消' in new_status_text or '超时' in new_status_text:
-                                    new_status = 'cancelled'
-                                # 优先级3: 检查"完成"或"交易成功"（最终状态）
-                                elif '完成' in new_status_text or '交易成功' in new_status_text or '确认收货' in new_status_text:
-                                    new_status = 'completed'
-                                # 优先级4: 检查"退款"（中间状态）
-                                elif '退款' in new_status_text:
-                                    new_status = 'refunding'
+                            # 状态归一化统一走 order_status_rules（顺序即语义）。
+                            # 这里原来是内联的 if/elif，优先级把「完成」排在「退款」前面，
+                            # 导致「退款完成，钱款已原路退返」被判成 completed —— 而 C1
+                            # 的自动评价正挂在 completed 上，等于给退款买家发好评。
+                            from order_status_rules import normalize_status
+                            new_status = normalize_status(new_status_code, new_status_text)
 
                             log_with_user('debug', f"订单 {order_id}: 状态码={new_status_code}, 状态文本={new_status_text}, 映射结果={new_status}", current_user)
 
@@ -7092,6 +7501,8 @@ async def refresh_orders_status(
                             buyer_id=buyer_id if buyer_id else None,
                             spec_name=spec_name if spec_name else None,
                             spec_value=spec_value if spec_value else None,
+                            spec_name_2=order_detail.get('spec_name_2') or None,
+                            spec_value_2=order_detail.get('spec_value_2') or None,
                             quantity=quantity if quantity else None,
                             amount=amount if amount else None,
                             order_status=new_status if new_status != current_status else None,
@@ -7228,6 +7639,102 @@ async def manual_ship_orders(
                 item_id = order.get('item_id')
                 buyer_id = order.get('buyer_id')
 
+                if order.get('dropship_status'):
+                    results.append({
+                        'order_id': order_id,
+                        'success': False,
+                        'blocked': True,
+                        'reason_code': 'physical_dropship',
+                        'message': '实物代拍订单须使用物流发货',
+                    })
+                    failed_count += 1
+                    continue
+
+                # ====== 发货前统一检查（与自动发货共用同一套判断） ======
+                # 历史教训：手动和自动是两条独立代码路径，曾经各写一套判断，
+                # 结果自动路径拦得住的单，人工在后台勾一下就能过去 ——
+                # 而人工去点发货，往往正是"自动没发出去"的时候。
+                # 这里所有检查都通过才允许继续；任何一条失败都 continue（不 return，
+                # 因为这是批量接口，一单被拦不该影响其他单）。
+                from order_status_rules import cross_shop_block_reason, delivery_check
+                dc = delivery_check(order.get('order_status'))
+                if not dc['ok']:
+                    results.append({
+                        'order_id': order_id,
+                        'success': False,
+                        'blocked': True,
+                        'reason_code': 'order_status',
+                        'message': f"已拦截：{dc['reason']}"
+                    })
+                    failed_count += 1
+                    continue
+
+                # 退款买家黑名单：全局开关或商品级开关任一开启即生效。
+                # 检查本身异常时**保守拦截**（宁可让买家等，也不能重发卡密）。
+                try:
+                    from db_manager import db_manager as _dbm
+                    shared_reason = cross_shop_block_reason(_dbm, buyer_id)
+                    if shared_reason:
+                        results.append({
+                            'order_id': order_id,
+                            'success': False,
+                            'blocked': True,
+                            'reason_code': 'cross_shop_blacklist',
+                            'message': shared_reason,
+                        })
+                        failed_count += 1
+                        continue
+                    if _dbm.should_block_refund_buyer_delivery(
+                            buyer_id=buyer_id, cookie_id=cookie_id, item_id=item_id):
+                        results.append({
+                            'order_id': order_id,
+                            'success': False,
+                            'blocked': True,
+                            'reason_code': 'refund_blacklist',
+                            'message': '已拦截：该买家在本店有退款记录，且退款拉黑已开启'
+                        })
+                        failed_count += 1
+                        continue
+                except Exception as _e:
+                    log_with_user('error', f"退款黑名单检查失败，保守拦截订单 {order_id}: {_e}", current_user)
+                    results.append({
+                        'order_id': order_id,
+                        'success': False,
+                        'blocked': True,
+                        'reason_code': 'refund_blacklist_error',
+                        'message': '已拦截：退款黑名单检查异常（保守策略，请人工核实）'
+                    })
+                    failed_count += 1
+                    continue
+
+                # 已经本机发过货的单，不允许再发一次（卡密不可撤回）。
+                # 这与 _auto_delivery 的 can_auto_delivery 是同一道闸门。
+                # **只对 full_delivery 生效**：status_only 不碰卡密，只是补标平台状态，
+                # 而"已发过卡密但平台没标"正是 status_only 的典型用途，拦了它等于堵死补救路径。
+                try:
+                    from db_manager import db_manager as _dbm2
+                    if ship_mode == 'full_delivery' and _dbm2.is_order_system_shipped(order_id):
+                        results.append({
+                            'order_id': order_id,
+                            'success': False,
+                            'blocked': True,
+                            'reason_code': 'already_shipped',
+                            'message': '已拦截：本机已对该订单发过货，避免重复发送卡密'
+                        })
+                        failed_count += 1
+                        continue
+                except Exception as _e:
+                    log_with_user('error', f"重复发货检查失败，保守拦截订单 {order_id}: {_e}", current_user)
+                    results.append({
+                        'order_id': order_id,
+                        'success': False,
+                        'blocked': True,
+                        'reason_code': 'already_shipped_error',
+                        'message': '已拦截：重复发货检查异常（保守策略，请人工核实）'
+                    })
+                    failed_count += 1
+                    continue
+
                 if ship_mode == 'status_only':
                     # ====== 仅修改闲鱼发货状态 ======
                     if not item_id:
@@ -7293,7 +7800,7 @@ async def manual_ship_orders(
                         failed_count += 1
 
                 elif ship_mode == 'full_delivery':
-                    # ====== 完整发货流程：匹配卡券 + 发送卡券 + 修改状态 ======
+                    # ====== 完整发货流程：匹配卡券、逐张发货和确认状态 ======
                     if not item_id:
                         results.append({
                             'order_id': order_id,
@@ -7345,92 +7852,24 @@ async def manual_ship_orders(
                         failed_count += 1
                         continue
 
-                    # 检查多数量发货
-                    quantity_to_send = 1
-                    multi_quantity_delivery = db_manager.get_item_multi_quantity_delivery_status(cookie_id, item_id)
-                    if multi_quantity_delivery:
-                        try:
-                            order_detail = await live_instance.fetch_order_detail_info(order_id, item_id, buyer_id)
-                            if order_detail and isinstance(order_detail, dict):
-                                qty = order_detail.get('quantity', 1)
-                                if isinstance(qty, int) and qty > 1:
-                                    quantity_to_send = qty
-                        except Exception as e:
-                            log_with_user('warning', f"获取订单数量失败，使用默认数量1: {str(e)}", current_user)
-
-                    # 调用_auto_delivery获取卡券内容（内部会调用auto_confirm）
-                    delivery_contents = []
-                    for i in range(quantity_to_send):
-                        try:
-                            delivery_content = await live_instance._auto_delivery(
-                                item_id, '', order_id, buyer_id
-                            )
-                            if delivery_content:
-                                delivery_contents.append(delivery_content)
-                        except Exception as e:
-                            log_with_user('error', f"获取第{i+1}个卡券失败: {str(e)}", current_user)
-
-                    if not delivery_contents:
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': '未匹配到发货规则或卡券获取失败'
-                        })
+                    # WebSocket 和自动发货的订单锁都由账号事件循环管理。
+                    manager = cookie_manager.manager
+                    loop = manager.loop if manager else asyncio.get_running_loop()
+                    if not loop.is_running():
+                        results.append({'order_id': order_id, 'success': False, 'message': '账号服务正在停止'})
                         failed_count += 1
                         continue
-
-                    # 发送卡券内容给买家
-                    send_success = True
-                    for idx, content in enumerate(delivery_contents):
-                        try:
-                            if content.startswith("__IMAGE_SEND__"):
-                                image_data = content.replace("__IMAGE_SEND__", "")
-                                card_id = None
-                                if "|" in image_data:
-                                    card_id_str, image_url = image_data.split("|", 1)
-                                    try:
-                                        card_id = int(card_id_str)
-                                    except ValueError:
-                                        card_id = None
-                                else:
-                                    image_url = image_data
-                                await live_instance.send_image_msg(
-                                    live_instance.ws, chat_id, buyer_id,
-                                    image_url, card_id=card_id
-                                )
-                            else:
-                                await live_instance.send_msg(
-                                    live_instance.ws, chat_id, buyer_id, content
-                                )
-
-                            # 多条消息之间间隔1秒
-                            if len(delivery_contents) > 1 and idx < len(delivery_contents) - 1:
-                                await asyncio.sleep(1)
-                        except Exception as e:
-                            log_with_user('error', f"发送第{idx+1}条卡券消息失败: {str(e)}", current_user)
-                            send_success = False
-
-                    # 更新本地数据库状态
-                    db_manager.insert_or_update_order(
-                        order_id=order_id,
-                        order_status='shipped',
-                        system_shipped=True
-                    )
-
-                    if send_success:
-                        results.append({
-                            'order_id': order_id,
-                            'success': True,
-                            'message': f'完整发货成功，已发送{len(delivery_contents)}条卡券信息给买家'
-                        })
+                    delivery = live_instance.deliver_order_manually(order_id, item_id, buyer_id, chat_id)
+                    if loop is asyncio.get_running_loop():
+                        result = await delivery
+                    else:
+                        task = asyncio.run_coroutine_threadsafe(delivery, loop)
+                        result = await asyncio.shield(asyncio.wrap_future(task))
+                    results.append({'order_id': order_id, **result})
+                    if result['success']:
                         success_count += 1
                     else:
-                        results.append({
-                            'order_id': order_id,
-                            'success': True,
-                            'message': f'发货状态已更新，但部分卡券消息发送失败（共{len(delivery_contents)}条）'
-                        })
-                        success_count += 1
+                        failed_count += 1
 
             except Exception as e:
                 results.append({
@@ -7481,101 +7920,58 @@ async def import_orders(
         failed_count = 0
         results = []
 
-        # 必需字段验证
         required_fields = ['order_id', 'cookie_id']
-        optional_fields = [
-            'item_id', 'item_title', 'item_price', 'item_image',
-            'buyer_id',
-            'receiver_name', 'receiver_phone', 'receiver_address', 'receiver_city',
-            'status', 'status_text', 'order_time', 'pay_time',
-            'quantity', 'amount'
-        ]
+        param_mapping = {
+            'item_id': 'item_id',
+            'buyer_id': 'buyer_id',
+            'receiver_name': 'receiver_name',
+            'receiver_phone': 'receiver_phone',
+            'receiver_address': 'receiver_address',
+            'status': 'order_status',
+            'order_time': 'created_at',
+            'quantity': 'quantity',
+            'amount': 'amount',
+        }
 
-        for order_data in orders:
+        for index, order_data in enumerate(orders, start=1):
+            order_id = str(order_data.get('order_id') or '').strip()
+            result = {'row': index, 'order_id': order_id, 'success': False}
             try:
-                # 验证必需字段
-                missing_fields = [f for f in required_fields if not order_data.get(f)]
+                missing_fields = [field for field in required_fields if not str(order_data.get(field) or '').strip()]
                 if missing_fields:
-                    results.append({
-                        'order_id': order_data.get('order_id', 'unknown'),
-                        'success': False,
-                        'message': f'缺少必需字段: {", ".join(missing_fields)}'
-                    })
-                    failed_count += 1
-                    continue
-
-                order_id = str(order_data['order_id'])
-                cookie_id = str(order_data['cookie_id'])
-
-                # 验证Cookie属于当前用户
+                    raise ValueError(f'缺少必需字段：{", ".join(missing_fields)}')
+                if isinstance(order_data['order_id'], (float, int)) and abs(order_data['order_id']) >= 10**15:
+                    raise ValueError('长订单号须在 Excel 单元格中使用文本格式')
+                cookie_id = str(order_data['cookie_id']).strip()
                 if cookie_id not in user_cookies:
-                    results.append({
-                        'order_id': order_id,
-                        'success': False,
-                        'message': '无权操作此账号的订单'
-                    })
-                    failed_count += 1
-                    continue
-
-                # 检查订单是否已存在
-                existing_order = db_manager.get_order_by_id(order_id)
-
-                # 准备订单数据，直接使用 insert_or_update_order 的参数名
-                # 构建参数字典，只传递非 None 的值
+                    raise ValueError('账号不存在或无权操作')
                 insert_params = {
-                    'order_id': order_id,
-                    'cookie_id': cookie_id
+                    target: str(order_data[field])
+                    for field, target in param_mapping.items()
+                    if order_data.get(field) is not None and str(order_data[field]).strip()
                 }
-
-                # 前端字段名 -> 数据库参数名映射
-                param_mapping = {
-                    'item_id': 'item_id',
-                    'buyer_id': 'buyer_id',
-                    'receiver_name': 'receiver_name',
-                    'receiver_phone': 'receiver_phone',
-                    'receiver_address': 'receiver_address',
-                    'receiver_city': 'receiver_city',
-                    'status': 'order_status',  # 注意：前端用 status，后端用 order_status
-                    'status_text': 'status_text',
-                    'order_time': 'order_time',
-                    'pay_time': 'pay_time',
-                    'quantity': 'quantity',
-                    'amount': 'amount',
-                    'item_title': 'item_title',
-                    'item_price': 'item_price',
-                    'item_image': 'item_image'
-                }
-
-                # 遍历订单数据，添加到参数字典
-                for field, value in order_data.items():
-                    if value is not None and field in param_mapping:
-                        param_name = param_mapping[field]
-                        insert_params[param_name] = value
-
-                # 使用 insert_or_update_order 统一处理
-                db_manager.insert_or_update_order(**insert_params)
-
-                results.append({
-                    'order_id': order_id,
-                    'success': True,
-                    'message': '订单已更新' if existing_order else '订单已导入'
-                })
-
+                with db_manager.lock:
+                    existing_order = db_manager.get_order_by_id(order_id)
+                    if existing_order and existing_order['cookie_id'] not in (None, '', cookie_id):
+                        raise ValueError('订单已归属其他账号')
+                    saved = db_manager.insert_or_update_order(order_id=order_id, cookie_id=cookie_id, **insert_params)
+                if not saved:
+                    raise ValueError('订单写入失败')
+                result.update(success=True, message='订单已更新' if existing_order else '订单已导入')
                 success_count += 1
-
-            except Exception as e:
-                results.append({
-                    'order_id': order_data.get('order_id', 'unknown'),
-                    'success': False,
-                    'message': str(e)
-                })
+            except ValueError as exc:
+                result['message'] = str(exc)
                 failed_count += 1
-                log_with_user('error', f"导入订单时发生异常: {str(e)}", current_user)
+            except Exception as exc:
+                result['message'] = '订单写入失败'
+                failed_count += 1
+                log_with_user('error', f"导入订单时发生异常: {exc}", current_user)
+            results.append(result)
 
         log_with_user('info', f"导入订单完成: 成功{success_count}个, 失败{failed_count}个", current_user)
 
         return {
-            "success": True,
+            "success": success_count > 0 and failed_count == 0,
             "message": f"导入完成: 成功{success_count}个, 失败{failed_count}个",
             "total": len(orders),
             "success_count": success_count,
@@ -7588,6 +7984,35 @@ async def import_orders(
     except Exception as e:
         log_with_user('error', f"导入订单失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=f"导入订单失败: {str(e)}")
+
+
+@app.post('/api/orders/import-excel')
+async def import_orders_excel(
+    file: UploadFile = File(...),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """读取订单工作表，并复用订单导入的所有权和写入检查。"""
+    if not file.filename or not file.filename.lower().endswith('.xlsx'):
+        raise HTTPException(status_code=400, detail='请选择 .xlsx 格式的 Excel 文件')
+
+    size_limit = 10 * 1024 * 1024
+    contents = await file.read(size_limit + 1)
+    if len(contents) > size_limit:
+        raise HTTPException(status_code=413, detail='Excel 文件不能超过 10 MB')
+    try:
+        frame = await asyncio.to_thread(
+            pd.read_excel, io.BytesIO(contents), engine='openpyxl', dtype=object, keep_default_na=False
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail='Excel 文件无法读取，请检查工作簿格式') from exc
+
+    missing_fields = [field for field in ('order_id', 'cookie_id') if field not in frame.columns]
+    if missing_fields:
+        raise HTTPException(status_code=400, detail=f'Excel 缺少列：{", ".join(missing_fields)}')
+    if frame.empty:
+        raise HTTPException(status_code=400, detail='Excel 工作表没有订单数据')
+
+    return await import_orders(frame.to_dict(orient='records'), current_user)
 
 
 # ==================== 前端 SPA Catch-All 路由 ====================

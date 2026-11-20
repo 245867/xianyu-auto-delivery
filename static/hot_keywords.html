@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>热搜词 / 爆款词榜</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b23; --line:#242c38; --txt:#e6edf3;
+    --dim:#8b98a9; --acc:#3fb950; --warn:#d29922; --err:#f85149; --blue:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:24px 20px 60px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 12px;font-weight:600}
+  .row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+  label.f{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+  input[type=text],input[type=number],select,textarea{
+    background:#0d1117;border:1px solid var(--line);color:var(--txt);
+    border-radius:6px;padding:6px 9px;font:13px/1.5 inherit;min-width:120px}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--blue)}
+  textarea{min-width:100%;min-height:64px;resize:vertical}
+  button{background:#21262d;color:var(--txt);border:1px solid var(--line);
+         border-radius:6px;padding:6px 13px;font:13px inherit;cursor:pointer}
+  button:hover{border-color:#3d4756;background:#262d36}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+  button.primary:hover{background:#388bfd}
+  button.small{padding:2px 9px;font-size:12px}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
+        border:1px solid var(--line)}
+  .on{color:var(--acc);border-color:#1d4429;background:#0f2417}
+  .off{color:var(--dim)}
+  .dr{color:var(--warn);border-color:#4a3a12;background:#241d09}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);
+        vertical-align:top}
+  th{color:var(--dim);font-weight:500;font-size:12px;white-space:nowrap}
+  td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  .w{font-weight:600}
+  .muted{color:var(--dim)}
+  .err{color:var(--err)}
+  .ok{color:var(--acc)}
+  .warn{color:var(--warn)}
+  .logs{font:12px/1.7 ui-monospace,Consolas,monospace;max-height:220px;overflow:auto;
+        background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:10px}
+  .logs div{border-bottom:1px dashed #1b222c;padding:2px 0}
+  #toast{position:fixed;right:20px;bottom:20px;background:#21262d;border:1px solid var(--line);
+         border-radius:8px;padding:10px 16px;font-size:13px;opacity:0;transition:opacity .2s;
+         pointer-events:none;max-width:380px}
+  #toast.show{opacity:1}
+  .hint{color:var(--dim);font-size:12px;margin-top:6px}
+  .kv{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .kv span{background:#0d1117;border:1px solid var(--line);border-radius:6px;
+           padding:3px 10px;font-size:12px}
+  .bar{height:6px;background:#0d1117;border:1px solid var(--line);border-radius:4px;
+       overflow:hidden;width:180px;display:inline-block;vertical-align:middle}
+  .bar i{display:block;height:100%;background:var(--blue)}
+  .score{display:inline-block;min-width:44px;text-align:right;font-weight:600}
+  .empty{padding:26px;text-align:center;color:var(--dim)}
+  .ex{color:var(--dim);font-size:12px;max-width:280px;overflow:hidden;
+      text-overflow:ellipsis;white-space:nowrap}
+  .tagrisk{color:var(--err);border:1px solid #5a2226;border-radius:8px;padding:0 6px;
+           font-size:11px;margin-left:4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>热搜词 / 爆款词榜 <span class="muted" style="font-size:13px;font-weight:400">供给热度（≠需求）</span></h1>
+  <div class="sub">
+    词从<b>真实搜索结果的标题</b>里挖出来：几个种子词各搜一遍，统计每个词覆盖多少商品、这些商品多热、
+    价格带在哪，再按透明公式排序。<b>它不是平台官方热搜榜</b>（闲鱼和闲管家都不提供这个接口），
+    是"数据推导榜"——好处是每个词都能点开验证，坏处是覆盖面取决于你给的种子词。
+    <br><b>这张榜衡量的是“供给侧有多热”，不是“买家有多想买”</b>：分数里 55% 来自供给词频，
+    想要数只占 8%，别把它当需求榜用。
+  </div>
+
+  <div class="card">
+    <h2>状态</h2>
+    <div class="kv" id="kv"><span class="muted">加载中…</span></div>
+    <div class="row">
+      <button class="primary" id="btnScan">开始扫描</button>
+      <button id="btnRefresh">刷新</button>
+      <span class="hint" id="scanHint">扫描走真实搜索，每个种子约 15–30 秒，6 个种子约 2–4 分钟；期间可以关掉页面。</span>
+    </div>
+    <div class="hint" id="progress"></div>
+  </div>
+
+  <div class="card">
+    <h2>配置</h2>
+    <div class="row">
+      <label class="f" style="flex:1;min-width:320px">种子词（逗号分隔，最多 10 个）
+        <textarea id="seeds" placeholder="手机, 蓝牙耳机, 机械键盘"></textarea>
+      </label>
+    </div>
+    <div class="row">
+      <label class="f">每日定时扫描
+        <select id="enabled"><option value="0">关闭</option><option value="1">开启</option></select>
+      </label>
+      <label class="f">扫描时间（点）<input type="number" id="scanHour" min="0" max="23" value="9"></label>
+      <label class="f">候选词最少覆盖商品数<input type="number" id="minFreq" min="2" max="10" value="2"></label>
+      <label class="f">榜单条数<input type="number" id="topN" min="10" max="100" value="50"></label>
+      <label class="f">补真实想要数
+        <select id="detailEnrich"><option value="0">不补（快）</option><option value="1">补（准）</option></select>
+      </label>
+      <label class="f">每个种子补几件<input type="number" id="detailLimit" min="0" max="10" value="3"></label>
+      <button id="btnSave">保存配置</button>
+    </div>
+    <div class="hint">补想要数会走详情接口（12 次/分钟），每个种子多花约 15 秒；不补的话想要数一栏会是空的——列表里的想要数自 2026 年起恒为 0，拿它算分会把榜带偏。</div>
+  </div>
+
+  <div class="card">
+    <h2>词榜 <span class="muted" id="boardDay" style="font-weight:400;font-size:12px"></span></h2>
+    <div id="board"><div class="empty">还没有榜单，先点上面的"开始扫描"。</div></div>
+  </div>
+
+  <div class="card">
+    <h2>词池 <span class="muted" id="poolCounts" style="font-weight:400;font-size:12px"></span></h2>
+    <div id="pool"><div class="empty">还没有词池数据，扫描一轮后开始积累。</div></div>
+    <div style="margin-top:10px">
+      <button class="small" id="btnSeedPool">用词池补种子词</button>
+      <span class="muted" style="font-size:12px">只填空位、不覆盖你手写的种子词</span>
+    </div>
+    <div class="hint">词池给"推导榜"加上记忆：新词先进 trial，连续上榜且均分够才转 active；
+    连续低分或连续没上榜就 retired。榜单本身每天重算，词池才是跨天的判断。
+    同一个词同一天重扫只更新分数、不重复计天。</div>
+  </div>
+
+  <div class="card" id="verifyCard" style="display:none">
+    <h2>单词验证 <span class="muted" id="verifyWord" style="font-weight:400"></span></h2>
+    <div id="verifyBody"></div>
+  </div>
+
+  <div class="card">
+    <h2>扫描日志</h2>
+    <div class="logs" id="logs"><div class="muted">暂无</div></div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let timer = null;
+
+function toast(msg, isErr){
+  const t = $('toast');
+  t.textContent = msg;
+  t.style.color = isErr ? 'var(--err)' : 'var(--txt)';
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 2600);
+}
+async function api(url, opts){
+  const r = await fetch(url, opts);
+  return await r.json();
+}
+function fmt(n, digits){
+  if (n === null || n === undefined || n === '') return '—';
+  const v = Number(n);
+  if (!isFinite(v)) return '—';
+  return digits === undefined ? String(v) : v.toFixed(digits);
+}
+function priceBand(a, b){
+  if (a === null || a === undefined) return '—';
+  return '¥' + fmt(a, 0) + '–' + fmt(b, 0);
+}
+
+async function loadStatus(){
+  const d = await api('/api/hot-keywords/status');
+  if (!d.ok){ $('kv').innerHTML = '<span class="err">' + (d.error || '读取失败') + '</span>'; return; }
+  const c = d.config || {};
+  const pills = [];
+  pills.push(d.running
+    ? '<span class="pill on">扫描中 ' + d.done + '/' + d.total + '</span>'
+    : '<span class="pill off">空闲</span>');
+  pills.push(d.board_today
+    ? '<span class="pill on">今日已有榜（' + d.board_count + ' 个词）</span>'
+    : '<span class="pill off">今日未扫</span>');
+  pills.push(c.enabled
+    ? '<span class="pill on">定时扫描开（每天 ' + c.scan_hour + ' 点）</span>'
+    : '<span class="pill off">定时扫描关</span>');
+  if (d.night_ban) pills.push('<span class="pill dr">夜间禁扫（23–08）</span>');
+  if (d.last_scan && d.last_scan.ts){
+    pills.push('<span class="pill">上次：' + d.last_scan.ts.replace('T',' ') + ' · ' +
+      (d.last_scan.items || 0) + ' 件 · ' + (d.last_scan.words || 0) + ' 词</span>');
+  }
+  $('kv').innerHTML = pills.join('');
+
+  $('btnScan').disabled = !!d.running || !!d.night_ban;
+  $('progress').textContent = d.running ? (d.progress || '扫描中…') : '';
+
+  // 配置只在首次或未编辑时回填，避免把用户正在改的输入覆盖掉
+  if (!loadStatus.filled){
+    loadStatus.filled = true;
+    $('seeds').value = (c.seeds || []).join(', ');
+    $('enabled').value = c.enabled ? '1' : '0';
+    $('scanHour').value = c.scan_hour;
+    $('minFreq').value = c.min_freq;
+    $('topN').value = c.top_n;
+    $('detailEnrich').value = c.detail_enrich ? '1' : '0';
+    $('detailLimit').value = c.detail_limit;
+  }
+  renderLogs(d.logs || []);
+
+  // 正在跑就 3 秒轮询一次
+  if (d.running){
+    clearTimeout(timer);
+    timer = setTimeout(async ()=>{ await loadStatus(); await loadBoard(); await loadPool(); }, 3000);
+  }
+}
+
+function renderLogs(logs){
+  if (!logs.length){ $('logs').innerHTML = '<div class="muted">暂无</div>'; return; }
+  $('logs').innerHTML = logs.map(l => {
+    const seeds = (l.seeds || []).join(' / ');
+    return '<div><span class="muted">' + (l.ts || '').replace('T',' ') + '</span> ' +
+      (l.ok ? '<span class="ok">✔</span>' : '<span class="err">✘</span>') + ' ' +
+      (l.message || '') + (seeds ? ' <span class="muted">[' + seeds + ']</span>' : '') + '</div>';
+  }).join('');
+}
+
+async function loadPool(){
+  const d = await api('/api/hot-keywords/pool?limit=60');
+  if (!d.ok){ $('pool').innerHTML = '<div class="empty err">' + (d.error || '读取失败') + '</div>'; return; }
+  const c = d.counts || {};
+  $('poolCounts').textContent = '· 试用 ' + (c.trial || 0) + ' · 在用 ' + (c.active || 0) +
+    ' · 已退役 ' + (c.retired || 0);
+  const words = d.words || [];
+  const logs = d.log || [];
+  if (!words.length && !logs.length){
+    $('pool').innerHTML = '<div class="empty">还没有词池数据，先点"开始扫描"。</div>';
+    return;
+  }
+  const stateTag = st => st === 'active' ? '<span class="pill on">在用</span>'
+    : (st === 'trial' ? '<span class="pill">试用</span>' : '<span class="pill off">退役</span>');
+  const rows = words.map(w => '<tr>' +
+      '<td class="w">' + w.word + '</td>' +
+      '<td>' + stateTag(w.state) + '</td>' +
+      '<td class="num">' + fmt(w.score_avg, 1) + '</td>' +
+      '<td class="num">' + fmt(w.score_last, 1) + '</td>' +
+      '<td class="num">' + (w.days_seen || 0) + '</td>' +
+      '<td class="num">' + (w.last_seen || '—') + '</td>' +
+      '<td class="ex">' + (w.retire_reason || '—') + '</td>' +
+      '<td>' + (w.state === 'retired'
+        ? '<button class="small" onclick="reviveWord(\'' + w.word.replace(/'/g, "\\'") + '\')">复活</button>'
+        : '') + '</td>' +
+    '</tr>').join('');
+  const logHtml = logs.length ? ('<div style="margin-top:10px"><div class="muted" style="font-size:12px">' +
+    '最近的状态变化</div>' + logs.slice(0, 12).map(l =>
+      '<div><span class="muted">' + (l.day || '') + '</span> ' + l.word + ' ' +
+      '<span class="muted">' + (l.from_s || '') + ' → ' + (l.to_s || '') + '</span> ' +
+      (l.why || '') + '</div>').join('') + '</div>') : '';
+  $('pool').innerHTML =
+    '<table><thead><tr><th>词</th><th>状态</th><th>均分</th><th>最近分</th>' +
+    '<th>上榜天数</th><th>最近上榜</th><th>退役原因</th><th>操作</th></tr></thead><tbody>' +
+    rows + '</tbody></table>' + logHtml;
+}
+
+async function seedFromPool(){
+  const d = await api('/api/hot-keywords/seed-from-pool', {method:'POST'});
+  if (!d.ok){ toast(d.error || '补种子失败', true); return; }
+  toast(d.message || '已更新种子词', false);
+  await loadStatus();
+  await loadPool();
+}
+
+async function reviveWord(word){
+  const d = await api('/api/hot-keywords/revive', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({word})
+  });
+  toast(d.ok ? ('已恢复：' + word) : (d.error || '恢复失败'), !d.ok);
+  if (d.ok) await loadPool();
+}
+
+async function loadBoard(){
+  const d = await api('/api/hot-keywords/board?limit=100');
+  if (!d.ok){ $('board').innerHTML = '<div class="empty err">' + (d.error || '读取失败') + '</div>'; return; }
+  const words = d.words || [];
+  $('boardDay').textContent = d.day ? ('· ' + d.day + ' · ' + words.length + ' 个词') : '';
+  if (!words.length){
+    $('board').innerHTML = '<div class="empty">还没有榜单，先点上面的"开始扫描"。</div>';
+    return;
+  }
+  const rows = words.map(w => {
+    const risk = (w.risk_hits || []).map(r => '<span class="tagrisk">' + r + '</span>').join('');
+    const ex = (w.examples || [])[0] || '';
+    const seeds = (w.seeds || []).join('、');
+    return '<tr>' +
+      '<td class="num">' + (w.rank || '') + '</td>' +
+      '<td class="w">' + w.word + risk + '</td>' +
+      '<td class="num"><span class="score">' + fmt(w.score, 1) + '</span>' +
+        '<span class="bar"><i style="width:' + Math.min(100, w.score) + '%"></i></span></td>' +
+      '<td class="num">' + w.freq + '</td>' +
+      '<td class="num">' + w.coverage + '</td>' +
+      '<td class="num">' + fmt(w.heat_avg, 0) + '</td>' +
+      '<td class="num">' + priceBand(w.price_min, w.price_max) + '</td>' +
+      '<td class="num">' + (w.want_avg ? fmt(w.want_avg, 1) : '<span class="muted">—</span>') + '</td>' +
+      '<td class="ex" title="' + (ex || '').replace(/"/g, '&quot;') + '">' + (ex || '—') + '</td>' +
+      '<td>' + '<button class="small" onclick="verifyWord(\'' + w.word.replace(/'/g, "\\'") + '\')">验证</button>' +
+        (seeds ? '<div class="muted" style="font-size:11px">' + seeds + '</div>' : '') + '</td>' +
+    '</tr>';
+  }).join('');
+  $('board').innerHTML =
+    '<table><thead><tr>' +
+    '<th>#</th><th>词</th><th>分数</th><th>覆盖商品</th><th>命中种子</th>' +
+    '<th>平均热度</th><th>价格带</th><th>平均想要</th><th>示例标题</th><th>操作</th>' +
+    '</tr></thead><tbody>' + rows + '</tbody></table>' +
+    '<div class="hint">分数 = 55×覆盖度 + 25×热度 + 12×跨种子 + 8×想要数 − 25×违禁词。' +
+    '覆盖商品数=有多少件商品的标题里出现这个词；命中种子=这个词横跨了几个种子词的搜索结果。' +
+    '55 是供给侧词频，所以这张榜是“供给热度榜”，不等于“需求榜”。</div>';
+}
+
+async function verifyWord(word){
+  $('verifyCard').style.display = 'block';
+  $('verifyWord').textContent = word;
+  $('verifyBody').innerHTML = '<div class="muted">正在真搜一次，约 20–40 秒（走限流 + 详情补数）…</div>';
+  $('verifyCard').scrollIntoView({behavior:'smooth', block:'nearest'});
+  const d = await api('/api/hot-keywords/verify', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({word})
+  });
+  if (!d.ok){ $('verifyBody').innerHTML = '<div class="err">' + (d.error || '验证失败') + '</div>'; return; }
+  const cls = d.gap >= 3 ? 'ok' : (d.gap >= 1 ? 'warn' : 'muted');
+  const sampled = (d.supply_sampled !== undefined) ? d.supply_sampled : d.supply;
+  const cap = d.supply_cap || 30;
+  const saturated = !!d.supply_saturated || !!d.supply_truncated;
+  const supplyText = saturated
+    ? ('在售样本 ' + sampled + ' / ' + cap + ' 件（已饱和，真实供给 ≥' + sampled + '）')
+    : ('在售样本 ' + sampled + ' / ' + cap + ' 件（已见底）');
+  $('verifyBody').innerHTML =
+    '<div class="kv">' +
+      '<span>' + supplyText + '</span>' +
+      '<span>补到想要数 ' + (d.want_sampled || 0) + ' 件</span>' +
+      '<span>想要数中位 ' + (d.want_source === 'detail' ? d.want_median : '无可信数据') + '</span>' +
+      '<span>最高想要 ' + (d.want_source === 'detail' ? d.want_max : '—') + '</span>' +
+      '<span>价格中位 ' + (d.price_median !== null ? '¥' + fmt(d.price_median, 0) : '—') + '</span>' +
+      '<span>价格带 ' + priceBand(d.price_min, d.price_max) + '</span>' +
+      '<span>均成交 ' + fmt(d.sold_avg, 1) + '</span>' +
+      '<span>样本想要/在售比 <b class="' + cls + '">' + fmt(d.gap, 2) + '</b></span>' +
+      (d.cached ? '<span class="muted">12 小时内缓存</span>' : '') +
+    '</div>' +
+    '<div class="' + cls + '">' + d.judgement + '</div>' +
+    '<div class="hint">样本想要/在售比 = 前几件补到的想要数中位 ÷ 第一页在售件数。' +
+    '第一页最多 ' + cap + ' 件，数满只说明真实供给 ≥' + cap + '，不代表市场总量；' +
+    '这只是方向判断，不当精确供需缺口用。</div>';
+}
+
+$('btnScan').onclick = async () => {
+  const seeds = $('seeds').value.split(/[,，\s]+/).map(s=>s.trim()).filter(Boolean);
+  $('btnScan').disabled = true;
+  const d = await api('/api/hot-keywords/scan', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(seeds.length ? {seeds} : {})
+  });
+  if (!d.ok){ toast(d.error || '启动失败', true); $('btnScan').disabled = false; return; }
+  toast('已开始扫描 ' + d.total + ' 个种子词');
+  await loadStatus();
+};
+
+$('btnSave').onclick = async () => {
+  const seeds = $('seeds').value.split(/[,，\s]+/).map(s=>s.trim()).filter(Boolean);
+  const d = await api('/api/hot-keywords/config', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      seeds,
+      enabled: $('enabled').value === '1',
+      scan_hour: Number($('scanHour').value),
+      min_freq: Number($('minFreq').value),
+      top_n: Number($('topN').value),
+      detail_enrich: $('detailEnrich').value === '1',
+      detail_limit: Number($('detailLimit').value)
+    })
+  });
+  if (!d.ok){ toast(d.error || '保存失败', true); return; }
+  $('seeds').value = (d.config.seeds || []).join(', ');
+  $('minFreq').value = d.config.min_freq;
+  $('topN').value = d.config.top_n;
+  $('scanHour').value = d.config.scan_hour;
+  $('detailLimit').value = d.config.detail_limit;
+  toast('已保存');
+  loadStatus();
+};
+
+$('btnRefresh').onclick = async () => { await loadStatus(); await loadBoard(); await loadPool(); };
+$('btnSeedPool').onclick = seedFromPool;
+
+(async () => { await loadStatus(); await loadBoard(); await loadPool(); })();
+</script>
+</body>
+</html>

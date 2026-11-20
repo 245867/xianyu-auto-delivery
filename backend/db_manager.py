@@ -3,6 +3,7 @@ import os
 import threading
 import hashlib
 import hmac
+import math
 import time
 import json
 import random
@@ -11,9 +12,11 @@ import aiohttp
 import io
 import base64
 from PIL import Image, ImageDraw, ImageFont
+from datetime import datetime, timezone
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
 from config import config
+from sqlite_runtime import connect_sqlite
 
 PASSWORD_HASH_SCHEME = 'pbkdf2_sha256'
 PASSWORD_HASH_ITERATIONS = 310000
@@ -95,7 +98,7 @@ class DBManager:
     def init_db(self):
         """初始化数据库表结构"""
         try:
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn = connect_sqlite(self.db_path, check_same_thread=False)
             cursor = self.conn.cursor()
             
             # 创建用户表
@@ -175,6 +178,55 @@ class DBManager:
             )
             ''')
 
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS account_nurture_state (
+                account_id TEXT PRIMARY KEY NOT NULL,
+                base_lat REAL,
+                base_lon REAL,
+                current_city TEXT,
+                daily_actions INTEGER NOT NULL DEFAULT 0,
+                health_score REAL NOT NULL DEFAULT 100.0,
+                is_silent_mode BOOLEAN NOT NULL DEFAULT 0,
+                last_warmed_at TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS account_nurture_health_daily (
+                account_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                exposure_penalized BOOLEAN NOT NULL DEFAULT 0,
+                platform_blocks INTEGER NOT NULL DEFAULT 0,
+                recovery_credit REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (account_id, day)
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS item_fission_matrix (
+                parent_item_id TEXT NOT NULL,
+                fission_id TEXT PRIMARY KEY NOT NULL,
+                variant_title TEXT NOT NULL,
+                cover_image_url TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                cookie_id TEXT NOT NULL,
+                child_item_id TEXT UNIQUE,
+                UNIQUE (cookie_id, parent_item_id, variant_title),
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS item_fission_stops (
+                cookie_id TEXT NOT NULL,
+                parent_item_id TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (cookie_id, parent_item_id),
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+
             # 创建AI回复配置表
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS ai_reply_settings (
@@ -239,6 +291,8 @@ class DBManager:
                 is_multi_spec BOOLEAN DEFAULT FALSE,
                 spec_name TEXT,
                 spec_value TEXT,
+                spec_name_2 TEXT,
+                spec_value_2 TEXT,
                 user_id INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -254,6 +308,8 @@ class DBManager:
                 buyer_id TEXT,
                 spec_name TEXT,
                 spec_value TEXT,
+                spec_name_2 TEXT,
+                spec_value_2 TEXT,
                 quantity TEXT,
                 amount TEXT,
                 order_status TEXT DEFAULT 'unknown',
@@ -265,6 +321,197 @@ class DBManager:
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
             )
             ''')
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS voucher_async_reconcile (
+                    order_id TEXT PRIMARY KEY NOT NULL REFERENCES orders(order_id),
+                    account_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    channel_code TEXT,
+                    channel_order_id TEXT,
+                    topup_status TEXT NOT NULL DEFAULT 'topping_up',
+                    charge_account TEXT NOT NULL,
+                    timeout_at TIMESTAMP,
+                    attempts INTEGER NOT NULL DEFAULT 1,
+                    channels_json TEXT NOT NULL,
+                    refund_state TEXT,
+                    failure_alerted INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS voucher_async_attempts (
+                    request_id TEXT PRIMARY KEY NOT NULL,
+                    order_id TEXT NOT NULL REFERENCES voucher_async_reconcile(order_id),
+                    channel_code TEXT NOT NULL,
+                    channel_order_id TEXT,
+                    status TEXT NOT NULL,
+                    timeout_at TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
+                    UNIQUE (order_id, channel_code),
+                    UNIQUE (channel_code, channel_order_id)
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_voucher_async_pending
+                ON voucher_async_reconcile(topup_status, timeout_at)
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS competitor_monitor_targets (
+                    item_id TEXT PRIMARY KEY NOT NULL,
+                    search_keyword TEXT NOT NULL,
+                    price_floor REAL NOT NULL,
+                    price_ceiling REAL NOT NULL,
+                    under_cut_delta REAL NOT NULL DEFAULT 0.1,
+                    daily_revision_count INTEGER NOT NULL DEFAULT 0,
+                    last_revised_at TIMESTAMP,
+                    is_active BOOLEAN NOT NULL DEFAULT 1
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS auto_review_records (
+                    order_id TEXT PRIMARY KEY NOT NULL,
+                    account_id TEXT NOT NULL DEFAULT '',
+                    buyer_id TEXT NOT NULL DEFAULT '',
+                    buyer_rate_status TEXT NOT NULL DEFAULT 'unrated',
+                    seller_rate_status TEXT NOT NULL DEFAULT 'unrated',
+                    invite_count INTEGER NOT NULL DEFAULT 0,
+                    last_invited_at TIMESTAMP,
+                    gift_sent BOOLEAN NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_auto_review_seller_status
+                ON auto_review_records(seller_rate_status)
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS bargain_sessions (
+                    session_id TEXT PRIMARY KEY NOT NULL,
+                    account_id TEXT NOT NULL,
+                    buyer_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    original_price REAL NOT NULL,
+                    concession_price REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    expires_at TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_bargain_sessions_active
+                ON bargain_sessions(status, expires_at)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_bargain_sessions_match
+                ON bargain_sessions(account_id, buyer_id, item_id)
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS unpaid_order_chases (
+                    order_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL DEFAULT '',
+                    item_id TEXT NOT NULL DEFAULT '',
+                    buyer_id TEXT NOT NULL DEFAULT '',
+                    order_amount REAL NOT NULL DEFAULT 0,
+                    chase_stage INTEGER NOT NULL DEFAULT 0,
+                    chase_state TEXT NOT NULL DEFAULT 'active',
+                    last_chased_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_unpaid_order_chases_state
+                ON unpaid_order_chases(chase_state, chase_stage)
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS financial_profit_records (
+                    order_id TEXT PRIMARY KEY,
+                    account_id TEXT,
+                    item_id TEXT,
+                    revenue REAL NOT NULL DEFAULT 0,
+                    upstream_cost REAL NOT NULL DEFAULT 0,
+                    shipping_cost REAL NOT NULL DEFAULT 0,
+                    platform_fee REAL NOT NULL DEFAULT 0,
+                    net_profit REAL NOT NULL DEFAULT 0,
+                    margin_rate REAL NOT NULL DEFAULT 0,
+                    settlement_status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    settled_at TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS refund_dispute_cases (
+                    order_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL DEFAULT '',
+                    item_id TEXT NOT NULL DEFAULT '',
+                    buyer_id TEXT NOT NULL DEFAULT '',
+                    refund_amount REAL NOT NULL DEFAULT 0,
+                    refund_reason TEXT,
+                    dispute_state TEXT NOT NULL DEFAULT 'evidence_collected',
+                    evidence_json TEXT NOT NULL DEFAULT '{}',
+                    statement_text TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_refund_dispute_state
+                ON refund_dispute_cases(dispute_state)
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS spec_mappings (
+                    item_id TEXT NOT NULL,
+                    spec_hash TEXT NOT NULL,
+                    spec_name TEXT NOT NULL,
+                    upstream_goods_id TEXT NOT NULL,
+                    upstream_sku_id TEXT NOT NULL,
+                    platform_sku_id TEXT NOT NULL DEFAULT '',
+                    stock_guard INTEGER NOT NULL DEFAULT 1,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (item_id, spec_hash)
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS dropship_tasks (
+                    order_id TEXT NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL,
+                    spec_hash TEXT NOT NULL,
+                    upstream_goods_id TEXT NOT NULL,
+                    upstream_sku_id TEXT NOT NULL,
+                    platform_sku_id TEXT NOT NULL DEFAULT '',
+                    stock_guard INTEGER NOT NULL,
+                    quantity INTEGER NOT NULL CHECK (quantity > 0),
+                    unit_price TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending_buy',
+                    upstream_order_id TEXT NOT NULL DEFAULT '',
+                    express_company TEXT NOT NULL DEFAULT '',
+                    express_no TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (order_id, position)
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS spec_stock_alerts (
+                    cookie_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    spec_hash TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    zeroed INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (cookie_id, item_id, spec_hash, reason)
+                )
+            """)
 
             # 退款买家黑名单：按店铺账号隔离，保留首次和最近一次退款凭证
             cursor.execute('''
@@ -308,6 +555,15 @@ class DBManager:
             CREATE INDEX IF NOT EXISTS idx_refund_blacklist_cookie_status
             ON refund_blacklist(cookie_id, is_whitelisted, enabled)
             ''')
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS global_cross_shop_blacklist (
+                buyer_id TEXT PRIMARY KEY NOT NULL,
+                trigger_account_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                refund_amount REAL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
 
             # 检查并添加 is_bargain 列（用于标记小刀订单）
             try:
@@ -334,6 +590,18 @@ class DBManager:
             except sqlite3.OperationalError:
                 self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN receiver_city TEXT DEFAULT ''")
                 logger.info("orders 表 receiver_city 列添加完成")
+
+            from migrate import ensure_columns
+            ensure_columns(cursor, "spec_mappings", {"platform_sku_id": "TEXT NOT NULL DEFAULT ''"})
+            ensure_columns(cursor, "dropship_tasks", {"platform_sku_id": "TEXT NOT NULL DEFAULT ''"})
+            cursor.execute("""CREATE UNIQUE INDEX IF NOT EXISTS spec_mappings_platform_sku
+                              ON spec_mappings(item_id, platform_sku_id) WHERE platform_sku_id<>''""")
+            ensure_columns(cursor, "orders", {
+                "upstream_order_id": "TEXT NOT NULL DEFAULT ''",
+                "express_no": "TEXT NOT NULL DEFAULT ''",
+                "express_company": "TEXT NOT NULL DEFAULT ''",
+                "dropship_status": "TEXT NOT NULL DEFAULT ''",
+            }, commit=False)
 
             # 检查并添加 version 列（用于乐观锁）
             try:
@@ -393,10 +661,13 @@ class DBManager:
                 item_detail TEXT,
                 item_image TEXT DEFAULT '',
                 is_multi_spec BOOLEAN DEFAULT FALSE,
+                spec_group_count INTEGER DEFAULT NULL,
+                spec_names TEXT,
                 ai_reply_enabled BOOLEAN DEFAULT NULL,
                 auto_delivery_enabled BOOLEAN DEFAULT TRUE,
                 delivery_card_id INTEGER DEFAULT NULL,
                 refund_blacklist_enabled BOOLEAN DEFAULT FALSE,
+                review_gift_card TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE,
@@ -420,6 +691,14 @@ class DBManager:
                 logger.info("正在为 item_info 表添加退款拉黑开关...")
                 self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN refund_blacklist_enabled BOOLEAN DEFAULT FALSE")
                 logger.info("item_info 表退款拉黑开关添加完成")
+
+            # 检查并添加好评赠品配置（默认空 = 不赠送）
+            try:
+                self._execute_sql(cursor, "SELECT review_gift_card FROM item_info LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 item_info 表添加好评赠品配置...")
+                self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN review_gift_card TEXT DEFAULT ''")
+                logger.info("item_info 表好评赠品配置列添加完成")
 
             # 创建自动发货规则表
             cursor.execute('''
@@ -742,6 +1021,8 @@ class DBManager:
                         is_multi_spec BOOLEAN DEFAULT FALSE,
                         spec_name TEXT,
                         spec_value TEXT,
+                        spec_name_2 TEXT,
+                        spec_value_2 TEXT,
                         user_id INTEGER NOT NULL DEFAULT 1,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -754,12 +1035,14 @@ class DBManager:
                     INSERT INTO cards_new (id, name, type, api_config, text_content, data_content, image_url,
                                           description, enabled, delay_seconds, after_delivery_enabled,
                                           after_delivery_message, is_multi_spec, spec_name, spec_value,
+                                          spec_name_2, spec_value_2,
                                           user_id, created_at, updated_at)
                     SELECT id, name, type, api_config, text_content, data_content, image_url,
                            description, enabled, delay_seconds,
                            COALESCE(after_delivery_enabled, 1),
                            COALESCE(after_delivery_message, '感谢购买，卡密已发送，请查收。'),
                            is_multi_spec, spec_name, spec_value,
+                           spec_name_2, spec_value_2,
                            user_id, created_at, updated_at
                     FROM cards
                     ''')
@@ -937,6 +1220,22 @@ class DBManager:
                     self._execute_sql(cursor, "ALTER TABLE cards ADD COLUMN spec_value TEXT")
                     logger.info("为cards表添加多规格字段")
 
+                # 为cards表添加第二维规格（拆解 26：双规格订单）
+                try:
+                    self._execute_sql(cursor, "SELECT spec_name_2 FROM cards LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE cards ADD COLUMN spec_name_2 TEXT")
+                    self._execute_sql(cursor, "ALTER TABLE cards ADD COLUMN spec_value_2 TEXT")
+                    logger.info("为cards表添加第二维规格字段")
+
+                # 为item_info表添加规格组数声明（发布侧写、发货侧读）
+                try:
+                    self._execute_sql(cursor, "SELECT spec_group_count FROM item_info LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN spec_group_count INTEGER DEFAULT NULL")
+                    self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN spec_names TEXT")
+                    logger.info("为item_info表添加规格组数字段")
+
                 # 为item_info表添加多规格字段（如果不存在）
                 try:
                     self._execute_sql(cursor, "SELECT is_multi_spec FROM item_info LIMIT 1")
@@ -1004,6 +1303,14 @@ class DBManager:
                     # system_shipped字段不存在，需要添加
                     self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN system_shipped INTEGER DEFAULT 0")
                     logger.info("为orders表添加system_shipped字段")
+
+                # 检查orders表是否有第二维规格字段
+                try:
+                    self._execute_sql(cursor, "SELECT spec_name_2 FROM orders LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN spec_name_2 TEXT")
+                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN spec_value_2 TEXT")
+                    logger.info("为orders表添加第二维规格字段")
 
                 # 处理keywords表的唯一约束问题
                 # 由于SQLite不支持直接修改约束，我们需要重建表
@@ -1393,7 +1700,7 @@ class DBManager:
     def get_connection(self):
         """获取数据库连接，如果已关闭则重新连接"""
         if self.conn is None:
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn = connect_sqlite(self.db_path, check_same_thread=False)
         return self.conn
 
     def _log_sql(self, sql: str, params: tuple = None, operation: str = "EXECUTE"):
@@ -1444,6 +1751,11 @@ class DBManager:
         return cursor.executemany(sql, params_list)
     
     # -------------------- Cookie操作 --------------------
+    def check_connection(self) -> None:
+        """检查账号表能否读取，不读取凭据，数据库错误交给调用方。"""
+        with self.lock:
+            self.conn.execute("SELECT 1 FROM cookies LIMIT 1").fetchone()
+
     def save_cookie(self, cookie_id: str, cookie_value: str, user_id: int = None) -> bool:
         """保存Cookie到数据库，如存在则更新"""
         with self.lock:
@@ -1515,6 +1827,32 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取Cookie失败: {e}")
                 return None
+
+    def update_cookie_value(self, cookie_id: str, cookie_value: str) -> bool:
+        """只原子更新 cookies.value，保留备注、暂停时长、用户名等其它列。
+
+        静默续期只拿到新 Cookie；用 INSERT OR REPLACE 会覆盖整行，
+        把账号备注等用户配置一起清空。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor_result = self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET value = ? WHERE id = ?",
+                    (cookie_value, cookie_id),
+                )
+                updated = cursor_result.rowcount
+                self.conn.commit()
+                if updated <= 0:
+                    logger.warning(f"更新Cookie值失败: {cookie_id} 不存在")
+                    return False
+                logger.info(f"Cookie值已原子更新: {cookie_id}")
+                return True
+            except Exception as e:
+                logger.error(f"更新Cookie值失败: {e}")
+                self.conn.rollback()
+                return False
     
     def get_all_cookies(self, user_id: int = None) -> Dict[str, str]:
         """获取所有Cookie（支持用户隔离）"""
@@ -2059,6 +2397,135 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取所有Cookie状态失败: {e}")
                 return {}
+
+    def get_account_nurture_state(self, account_id: str, *, when: datetime = None) -> Optional[dict]:
+        timestamp = self._account_nurture_timestamp(when)
+        with self.lock:
+            cursor = self.conn.execute('''
+                SELECT account_id, base_lat, base_lon, current_city,
+                       CASE WHEN date(last_warmed_at, '+8 hours') = date(?, '+8 hours')
+                            THEN daily_actions ELSE 0 END AS daily_actions,
+                       health_score, is_silent_mode, last_warmed_at, updated_at
+                FROM account_nurture_state WHERE account_id = ?
+            ''', (timestamp, account_id))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            state = dict(zip((column[0] for column in cursor.description), row))
+            state["is_silent_mode"] = bool(state["is_silent_mode"])
+            return state
+
+    def update_account_nurture_state(self, account_id: str, *, base_lat: float = None,
+                                    base_lon: float = None, current_city: str = None,
+                                    health_score: float = None, is_silent_mode: bool = None) -> None:
+        if not account_id:
+            raise ValueError("account_id 不能为空")
+        if base_lat is not None and not -90 <= base_lat <= 90:
+            raise ValueError("base_lat 必须在 -90 至 90 之间")
+        if base_lon is not None and not -180 <= base_lon <= 180:
+            raise ValueError("base_lon 必须在 -180 至 180 之间")
+        if health_score is not None and not 0 <= health_score <= 100:
+            raise ValueError("health_score 必须在 0 至 100 之间")
+        with self.lock, self.conn:
+            self.conn.execute('''
+                INSERT INTO account_nurture_state
+                    (account_id, base_lat, base_lon, current_city, health_score, is_silent_mode)
+                VALUES (?, ?, ?, ?, COALESCE(?, 100.0), COALESCE(?, 0))
+                ON CONFLICT(account_id) DO UPDATE SET
+                    base_lat = COALESCE(excluded.base_lat, base_lat),
+                    base_lon = COALESCE(excluded.base_lon, base_lon),
+                    current_city = COALESCE(excluded.current_city, current_city),
+                    health_score = COALESCE(?, health_score),
+                    is_silent_mode = COALESCE(?, is_silent_mode),
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (account_id, base_lat, base_lon, current_city, health_score, is_silent_mode,
+                  health_score, is_silent_mode))
+
+    def is_account_automation_silent(self, account_id: str) -> bool:
+        with self.lock:
+            row = self.conn.execute('''
+                SELECT is_silent_mode FROM account_nurture_state WHERE account_id = ?
+            ''', (account_id,)).fetchone()
+            return bool(row and row[0])
+
+    @staticmethod
+    def _account_nurture_timestamp(when: datetime = None) -> str:
+        when = when if when is not None else datetime.now(timezone.utc)
+        if when.utcoffset() is None:
+            raise ValueError("账号会话时间必须包含时区")
+        return when.astimezone(timezone.utc).isoformat(sep=" ", timespec="microseconds")
+
+    def record_account_nurture_session(self, account_id: str, when: datetime) -> bool:
+        timestamp = self._account_nurture_timestamp(when)
+        with self.lock, self.conn:
+            updated = self.conn.execute('''
+                UPDATE account_nurture_state
+                SET daily_actions = CASE
+                        WHEN date(last_warmed_at, '+8 hours') < date(?, '+8 hours')
+                             OR last_warmed_at IS NULL THEN 1
+                        ELSE daily_actions + 1 END,
+                    last_warmed_at = max(COALESCE(last_warmed_at, ?), ?),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE account_id = ?
+                    AND (last_warmed_at IS NULL
+                         OR date(last_warmed_at, '+8 hours') <= date(?, '+8 hours'))
+            ''', (timestamp, timestamp, timestamp, account_id, timestamp)).rowcount
+            if not updated:
+                return False
+            credited = self.conn.execute('''
+                INSERT INTO account_nurture_health_daily (account_id, day, recovery_credit)
+                SELECT account_id, date(?, '+8 hours'), 15.0
+                FROM account_nurture_state
+                WHERE account_id = ? AND daily_actions >= 3 AND is_silent_mode = 1 AND health_score < 80.0
+                ON CONFLICT(account_id, day) DO UPDATE SET recovery_credit = excluded.recovery_credit
+                WHERE platform_blocks = 0 AND recovery_credit = 0
+            ''', (timestamp, account_id)).rowcount
+            if credited:
+                self.conn.execute('''
+                    UPDATE account_nurture_state
+                    SET health_score = health_score + 15.0, is_silent_mode = health_score + 15.0 < 80.0
+                    WHERE account_id = ?
+                ''', (account_id,))
+            return True
+
+    def record_account_health_event(self, account_id: str, day: str, *, event: str) -> bool:
+        if event not in ("exposure_drop", "platform_block"):
+            raise ValueError("未知的账号健康事件")
+        with self.lock, self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO account_nurture_state (account_id) VALUES (?)",
+                              (account_id,))
+            self.conn.execute(
+                "INSERT OR IGNORE INTO account_nurture_health_daily (account_id, day) VALUES (?, ?)",
+                (account_id, day),
+            )
+            if event == "exposure_drop":
+                applied = self.conn.execute('''
+                    UPDATE account_nurture_health_daily SET exposure_penalized = 1
+                    WHERE account_id = ? AND day = ? AND exposure_penalized = 0
+                ''', (account_id, day)).rowcount
+                if not applied:
+                    return False
+                penalty, revoked_credit = 35.0, 0.0
+            else:
+                self.conn.execute('''
+                    UPDATE account_nurture_health_daily SET platform_blocks = platform_blocks + 1
+                    WHERE account_id = ? AND day = ?
+                ''', (account_id, day))
+                revoked_credit = self.conn.execute('''
+                    SELECT recovery_credit FROM account_nurture_health_daily
+                    WHERE account_id = ? AND day = ? AND platform_blocks = 1
+                ''', (account_id, day)).fetchone()
+                revoked_credit = revoked_credit[0] if revoked_credit else 0.0
+                penalty = 25.0 + revoked_credit
+            self.conn.execute('''
+                UPDATE account_nurture_state
+                SET health_score = max(0.0, health_score - ?),
+                    is_silent_mode = CASE WHEN health_score - ? < 60.0 OR ? > 0
+                                          THEN 1 ELSE is_silent_mode END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE account_id = ?
+            ''', (penalty, penalty, revoked_credit, account_id))
+            return True
 
     # -------------------- AI回复设置操作 --------------------
     def save_ai_reply_settings(self, cookie_id: str, settings: dict) -> bool:
@@ -3220,24 +3687,39 @@ class DBManager:
                    after_delivery_enabled: bool = True,
                    after_delivery_message: str = '感谢购买，卡密已发送，请查收。',
                    is_multi_spec: bool = False, spec_name: str = None, spec_value: str = None,
+                   spec_name_2: str = None, spec_value_2: str = None,
                    user_id: int = None):
-        """创建新卡券（支持多规格）"""
+        """创建新卡券（支持多规格，最多两维规格）"""
+        if not is_multi_spec:
+            # 非多规格卡券不该带规格字段，带了就清掉（否则唯一性/匹配都会出怪结果）
+            if spec_name or spec_value or spec_name_2 or spec_value_2:
+                logger.warning(f"非多规格卡券携带了规格字段，已忽略: {name}")
+            spec_name = spec_value = spec_name_2 = spec_value_2 = None
         with self.lock:
             try:
                 # 验证多规格参数
                 if is_multi_spec:
                     if not spec_name or not spec_value:
                         raise ValueError("多规格卡券必须提供规格名称和规格值")
+                    # 第二维要么都有、要么都没有，半截规格会让匹配永远对不上
+                    if bool(spec_name_2) != bool(spec_value_2):
+                        raise ValueError("第二维规格必须同时提供规格名称和规格值")
+                    if not spec_name_2:
+                        spec_name_2 = spec_value_2 = None
 
-                    # 检查唯一性：卡券名称+规格名称+规格值
+                    # 检查唯一性：卡券名称 + 两组规格（用 IS 比较，NULL 也参与相等判断）
                     cursor = self.conn.cursor()
                     cursor.execute('''
                     SELECT COUNT(*) FROM cards
-                    WHERE name = ? AND spec_name = ? AND spec_value = ? AND user_id = ?
-                    ''', (name, spec_name, spec_value, user_id))
+                    WHERE name = ? AND spec_name = ? AND spec_value = ?
+                      AND spec_name_2 IS ? AND spec_value_2 IS ? AND user_id = ?
+                    ''', (name, spec_name, spec_value, spec_name_2, spec_value_2, user_id))
 
                     if cursor.fetchone()[0] > 0:
-                        raise ValueError(f"卡券已存在：{name} - {spec_name}:{spec_value}")
+                        spec_desc = f"{spec_name}:{spec_value}"
+                        if spec_name_2:
+                            spec_desc += f";{spec_name_2}:{spec_value_2}"
+                        raise ValueError(f"卡券已存在：{name} - {spec_desc}")
                 else:
                     # 检查唯一性：仅卡券名称
                     cursor = self.conn.cursor()
@@ -3261,16 +3743,21 @@ class DBManager:
                 cursor.execute('''
                 INSERT INTO cards (name, type, api_config, text_content, data_content, image_url,
                                  description, enabled, delay_seconds, after_delivery_enabled,
-                                 after_delivery_message, is_multi_spec, spec_name, spec_value, user_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 after_delivery_message, is_multi_spec, spec_name, spec_value,
+                                 spec_name_2, spec_value_2, user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (name, card_type, api_config_str, text_content, data_content, image_url,
                       description, enabled, delay_seconds, after_delivery_enabled,
-                      after_delivery_message, is_multi_spec, spec_name, spec_value, user_id))
+                      after_delivery_message, is_multi_spec, spec_name, spec_value,
+                      spec_name_2, spec_value_2, user_id))
                 self.conn.commit()
                 card_id = cursor.lastrowid
 
                 if is_multi_spec:
-                    logger.info(f"创建多规格卡券成功: {name} - {spec_name}:{spec_value} (ID: {card_id})")
+                    spec_desc = f"{spec_name}:{spec_value}"
+                    if spec_name_2:
+                        spec_desc += f";{spec_name_2}:{spec_value_2}"
+                    logger.info(f"创建多规格卡券成功: {name} - {spec_desc} (ID: {card_id})")
                 else:
                     logger.info(f"创建卡券成功: {name} (ID: {card_id})")
                 return card_id
@@ -3288,7 +3775,7 @@ class DBManager:
                     SELECT id, name, type, api_config, text_content, data_content, image_url,
                            description, enabled, delay_seconds, after_delivery_enabled,
                            after_delivery_message, is_multi_spec, spec_name, spec_value,
-                           created_at, updated_at
+                           created_at, updated_at, spec_name_2, spec_value_2
                     FROM cards
                     WHERE user_id = ?
                     ORDER BY created_at DESC
@@ -3298,7 +3785,7 @@ class DBManager:
                     SELECT id, name, type, api_config, text_content, data_content, image_url,
                            description, enabled, delay_seconds, after_delivery_enabled,
                            after_delivery_message, is_multi_spec, spec_name, spec_value,
-                           created_at, updated_at
+                           created_at, updated_at, spec_name_2, spec_value_2
                     FROM cards
                     ORDER BY created_at DESC
                     ''')
@@ -3332,7 +3819,9 @@ class DBManager:
                         'spec_name': row[13],
                         'spec_value': row[14],
                         'created_at': row[15],
-                        'updated_at': row[16]
+                        'updated_at': row[16],
+                        'spec_name_2': row[17],
+                        'spec_value_2': row[18]
                     })
 
                 return cards
@@ -3350,7 +3839,7 @@ class DBManager:
                     SELECT id, name, type, api_config, text_content, data_content, image_url,
                            description, enabled, delay_seconds, after_delivery_enabled,
                            after_delivery_message, is_multi_spec, spec_name, spec_value,
-                           created_at, updated_at
+                           created_at, updated_at, spec_name_2, spec_value_2
                     FROM cards WHERE id = ? AND user_id = ?
                     ''', (card_id, user_id))
                 else:
@@ -3358,7 +3847,7 @@ class DBManager:
                     SELECT id, name, type, api_config, text_content, data_content, image_url,
                            description, enabled, delay_seconds, after_delivery_enabled,
                            after_delivery_message, is_multi_spec, spec_name, spec_value,
-                           created_at, updated_at
+                           created_at, updated_at, spec_name_2, spec_value_2
                     FROM cards WHERE id = ?
                     ''', (card_id,))
 
@@ -3391,7 +3880,9 @@ class DBManager:
                         'spec_name': row[13],
                         'spec_value': row[14],
                         'created_at': row[15],
-                        'updated_at': row[16]
+                        'updated_at': row[16],
+                        'spec_name_2': row[17],
+                        'spec_value_2': row[18]
                     }
                 return None
             except Exception as e:
@@ -3404,8 +3895,9 @@ class DBManager:
                    delay_seconds: int = None, after_delivery_enabled: bool = None,
                    after_delivery_message: str = None,
                    is_multi_spec: bool = None, spec_name: str = None,
-                   spec_value: str = None):
-        """更新卡券"""
+                   spec_value: str = None, spec_name_2: str = None,
+                   spec_value_2: str = None):
+        """更新卡券（支持最多两维规格）"""
         with self.lock:
             try:
                 # 处理api_config参数
@@ -3465,6 +3957,12 @@ class DBManager:
                 if spec_value is not None:
                     update_fields.append("spec_value = ?")
                     params.append(spec_value)
+                if spec_name_2 is not None:
+                    update_fields.append("spec_name_2 = ?")
+                    params.append(spec_name_2)
+                if spec_value_2 is not None:
+                    update_fields.append("spec_value_2 = ?")
+                    params.append(spec_value_2)
 
                 if not update_fields:
                     return True  # 没有需要更新的字段
@@ -3764,95 +4262,63 @@ class DBManager:
             except Exception as e:
                 logger.error(f"更新发货次数失败: {e}")
 
-    def get_delivery_rules_by_keyword_and_spec(self, keyword: str, spec_name: str = None, spec_value: str = None):
-        """根据关键字和规格信息获取匹配的发货规则（支持多规格）"""
+    def get_delivery_rules_by_keyword_and_spec(self, keyword: str, spec_name: str = None,
+                                               spec_value: str = None, spec_name_2: str = None,
+                                               spec_value_2: str = None):
+        """根据关键字和规格信息获取匹配的发货规则（支持最多两维规格）。
+
+        规格匹配的口径是"对不上就停"，不是"尽量找一张卡发出去"：
+        - 调用方给了规格 → 只返回多规格卡券，且规格组数必须与订单一致
+          （一维订单只落一维卡，两维订单只落两维卡）；
+        - 给了规格却匹配不到 → 返回空，**绝不**回落到普通非规格卡券（那是发错货）；
+        - 调用方没给规格 → 只返回普通非规格卡券，多规格卡不参与。
+        """
         with self.lock:
             try:
                 cursor = self.conn.cursor()
 
-                # 优先匹配：卡券名称+规格名称+规格值
-                if spec_name and spec_value:
-                    cursor.execute('''
-                    SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
-                           dr.description, dr.delivery_times,
-                           c.name as card_name, c.type as card_type, c.api_config,
-                           c.text_content, c.data_content, c.enabled as card_enabled,
-                           c.description as card_description, c.delay_seconds as card_delay_seconds,
-                           c.after_delivery_enabled, c.after_delivery_message,
-                           c.is_multi_spec, c.spec_name, c.spec_value
-                    FROM delivery_rules dr
-                    LEFT JOIN cards c ON dr.card_id = c.id
-                    WHERE dr.enabled = 1 AND c.enabled = 1
-                    AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
-                    AND c.is_multi_spec = 1 AND c.spec_name = ? AND c.spec_value = ?
-                    ORDER BY
-                        CASE
-                            WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
-                            ELSE LENGTH(dr.keyword) / 2
-                        END DESC,
-                        dr.delivery_times ASC
-                    ''', (keyword, keyword, spec_name, spec_value, keyword))
-
-                    rules = []
-                    for row in cursor.fetchall():
-                        # 解析api_config JSON字符串
-                        api_config = row[9]
-                        if api_config:
-                            try:
-                                import json
-                                api_config = json.loads(api_config)
-                            except (json.JSONDecodeError, TypeError):
-                                # 如果解析失败，保持原始字符串
-                                pass
-
-                        rules.append({
-                            'id': row[0],
-                            'keyword': row[1],
-                            'card_id': row[2],
-                            'delivery_count': row[3],
-                            'enabled': bool(row[4]),
-                            'description': row[5],
-                            'delivery_times': row[6] or 0,
-                            'card_name': row[7],
-                            'card_type': row[8],
-                            'api_config': api_config,
-                            'text_content': row[10],
-                            'data_content': row[11],
-                            'card_enabled': bool(row[12]),
-                            'card_description': row[13],
-                            'card_delay_seconds': row[14] or 0,
-                            'after_delivery_enabled': bool(row[15]) if row[15] is not None else True,
-                            'after_delivery_message': row[16] or '',
-                            'is_multi_spec': bool(row[17]),
-                            'spec_name': row[18],
-                            'spec_value': row[19]
-                        })
-
-                    if rules:
-                        logger.info(f"找到多规格匹配规则: {keyword} - {spec_name}:{spec_value}")
-                        return rules
-
-                # 兜底匹配：仅卡券名称
-                cursor.execute('''
+                select_sql = '''
                 SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                        dr.description, dr.delivery_times,
                        c.name as card_name, c.type as card_type, c.api_config,
                        c.text_content, c.data_content, c.enabled as card_enabled,
                        c.description as card_description, c.delay_seconds as card_delay_seconds,
                        c.after_delivery_enabled, c.after_delivery_message,
-                       c.is_multi_spec, c.spec_name, c.spec_value
+                       c.is_multi_spec, c.spec_name, c.spec_value,
+                       c.spec_name_2, c.spec_value_2
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
                 WHERE dr.enabled = 1 AND c.enabled = 1
                 AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
-                AND (c.is_multi_spec = 0 OR c.is_multi_spec IS NULL)
+                '''
+                params: list = [keyword, keyword]
+
+                has_spec = bool(spec_name and spec_value)
+                has_spec_2 = bool(spec_name_2 and spec_value_2)
+
+                if has_spec:
+                    select_sql += ' AND c.is_multi_spec = 1 AND c.spec_name = ? AND c.spec_value = ?'
+                    params.extend([spec_name, spec_value])
+                    if has_spec_2:
+                        select_sql += ' AND c.spec_name_2 = ? AND c.spec_value_2 = ?'
+                        params.extend([spec_name_2, spec_value_2])
+                    else:
+                        # 一维订单只能落一维卡券：两维卡的文本里带不出完整两组规格
+                        select_sql += " AND (c.spec_name_2 IS NULL OR c.spec_name_2 = '')"
+                else:
+                    select_sql += ' AND (c.is_multi_spec = 0 OR c.is_multi_spec IS NULL)'
+
+                select_sql += '''
                 ORDER BY
                     CASE
                         WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
                         ELSE LENGTH(dr.keyword) / 2
                     END DESC,
                     dr.delivery_times ASC
-                ''', (keyword, keyword, keyword))
+                '''
+                params.append(keyword)
+
+                cursor.execute(select_sql, params)
 
                 rules = []
                 for row in cursor.fetchall():
@@ -3886,10 +4352,20 @@ class DBManager:
                         'after_delivery_message': row[16] or '',
                         'is_multi_spec': bool(row[17]) if row[17] is not None else False,
                         'spec_name': row[18],
-                        'spec_value': row[19]
+                        'spec_value': row[19],
+                        'spec_name_2': row[20],
+                        'spec_value_2': row[21]
                     })
 
-                if rules:
+                if has_spec:
+                    spec_desc = f"{spec_name}:{spec_value}"
+                    if has_spec_2:
+                        spec_desc += f";{spec_name_2}:{spec_value_2}"
+                    if rules:
+                        logger.info(f"找到多规格匹配规则: {keyword} - {spec_desc}（{len(rules)} 条）")
+                    else:
+                        logger.warning(f"规格无匹配规则，不回落到普通卡券: {keyword} - {spec_desc}")
+                elif rules:
                     logger.info(f"找到兜底匹配规则: {keyword}")
                 else:
                     logger.info(f"未找到匹配规则: {keyword}")
@@ -3941,49 +4417,78 @@ class DBManager:
                 self.conn.rollback()
                 raise
 
+    def append_card_inventory(self, card_id: int, user_id: int, content: str) -> bool:
+        """按分组追加内容，不覆盖库存或分组状态。"""
+        from card_text import split_codes
+
+        content = content.strip()
+        if not content:
+            raise ValueError("请输入卡密内容")
+        with self.lock, self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            row = self.conn.execute(
+                "SELECT type, data_content, text_content, image_url FROM cards WHERE id = ? AND user_id = ?",
+                (card_id, user_id),
+            ).fetchone()
+            if not row:
+                return False
+            kind, data_content, text_content, image_url = row
+            if kind == "data":
+                column = "data_content"
+                codes = dict.fromkeys(split_codes(data_content) + split_codes(content))
+                updated = "\n".join(codes)
+            elif kind == "text":
+                column = "text_content"
+                updated = "\n".join(filter(None, ((text_content or "").strip(), content)))
+            elif kind == "image":
+                column = "image_url"
+                updated = "\n".join(filter(None, ((image_url or "").strip(), content)))
+            else:
+                raise ValueError("请到编辑分组中配置 API 卡券")
+            self.conn.execute(
+                f"UPDATE cards SET {column} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
+                (updated, card_id, user_id),
+            )
+            return True
+
+    def consume_batch_codes(self, card_id: int, quantity: int) -> Tuple[List[str], int]:
+        """库存足量时一次取出指定张数，返回卡密和操作前有效库存。"""
+        from card_text import split_codes
+
+        if quantity < 1:
+            raise ValueError("卡密数量必须大于零")
+        with self.lock, self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            row = self.conn.execute(
+                "SELECT data_content FROM cards WHERE id = ? AND type = 'data' AND enabled = 1",
+                (card_id,),
+            ).fetchone()
+            raw_codes = split_codes(row[0]) if row else []
+            codes = list(dict.fromkeys(raw_codes))
+            duplicates_removed = len(raw_codes) - len(codes)
+            available = len(codes)
+            if available < quantity:
+                return [], available
+            self.conn.execute(
+                "UPDATE cards SET data_content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                ("\n".join(codes[quantity:]), card_id),
+            )
+            if duplicates_removed:
+                logger.warning(
+                    f"消费批量数据时清理重复卡密: 卡券ID={card_id}, "
+                    f"重复={duplicates_removed}条"
+                )
+            logger.info(f"消费批量数据成功: 卡券ID={card_id}, 剩余={available - quantity}条")
+            return codes[:quantity], available
+
     def consume_batch_data(self, card_id: int):
-        """消费批量数据的第一条记录（线程安全）"""
-        with self.lock:
-            try:
-                cursor = self.conn.cursor()
-
-                # 获取卡券的批量数据
-                self._execute_sql(cursor, "SELECT data_content FROM cards WHERE id = ? AND type = 'data'", (card_id,))
-                result = cursor.fetchone()
-
-                if not result or not result[0]:
-                    logger.warning(f"卡券 {card_id} 没有批量数据")
-                    return None
-
-                data_content = result[0]
-                lines = [line.strip() for line in data_content.split('\n') if line.strip()]
-
-                if not lines:
-                    logger.warning(f"卡券 {card_id} 批量数据为空")
-                    return None
-
-                # 获取第一条数据
-                first_line = lines[0]
-
-                # 移除第一条数据，更新数据库
-                remaining_lines = lines[1:]
-                new_data_content = '\n'.join(remaining_lines)
-
-                cursor.execute('''
-                UPDATE cards
-                SET data_content = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                ''', (new_data_content, card_id))
-
-                self.conn.commit()
-
-                logger.info(f"消费批量数据成功: 卡券ID={card_id}, 剩余={len(remaining_lines)}条")
-                return first_line
-
-            except Exception as e:
-                logger.error(f"消费批量数据失败: {e}")
-                self.conn.rollback()
-                return None
+        """消费批量数据的第一条记录（线程安全）。"""
+        try:
+            codes, _ = self.consume_batch_codes(card_id, 1)
+            return codes[0] if codes else None
+        except Exception as e:
+            logger.error(f"消费批量数据失败: {e}")
+            return None
 
     # ==================== 商品信息管理 ====================
 
@@ -4257,6 +4762,77 @@ class DBManager:
             logger.error(f"获取商品多规格状态失败: {e}")
             return False
 
+    def update_item_spec_meta(self, cookie_id: str, item_id: str, spec_group_count: int,
+                              spec_names: Optional[List[str]] = None) -> bool:
+        """写入商品的"规格组数声明"（发布成功那一刻就是权威值）。
+
+        spec_group_count: 0=无规格，1=单组多规格，2=两组多规格。
+        写 0/1 之外的值会拒绝——平台最多两组，写错的组数比不写更危险。
+        """
+        if spec_group_count not in (0, 1, 2):
+            logger.error(f"非法的规格组数: {spec_group_count}（只允许 0/1/2）")
+            return False
+        try:
+            names_json = json.dumps(list(spec_names), ensure_ascii=False) if spec_names else None
+        except (TypeError, ValueError):
+            names_json = None
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                UPDATE item_info
+                SET spec_group_count = ?, spec_names = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE cookie_id = ? AND item_id = ?
+                ''', (spec_group_count, names_json, cookie_id, item_id))
+
+                if cursor.rowcount > 0:
+                    self.conn.commit()
+                    logger.info(f"更新商品规格声明成功: {item_id} -> {spec_group_count} 组")
+                    return True
+                logger.warning(f"商品不存在，无法写入规格声明: {item_id}")
+                return False
+        except Exception as e:
+            logger.error(f"更新商品规格声明失败: {e}")
+            self.conn.rollback()
+            return False
+
+    def get_item_spec_meta(self, cookie_id: str, item_id: str) -> Dict[str, Any]:
+        """读取商品的规格声明。
+
+        返回 spec_group_count = None 表示**未声明**（老商品或从未走过新发布链路）。
+        调用方必须把 None 当"不知道"，绝不能当成 1——当成 1 会把双规格订单
+        当成单规格去匹配，结果就是发错货。
+        """
+        result: Dict[str, Any] = {
+            'found': False,
+            'is_multi_spec': False,
+            'spec_group_count': None,
+            'spec_names': None,
+        }
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT is_multi_spec, spec_group_count, spec_names FROM item_info
+                WHERE cookie_id = ? AND item_id = ?
+                ''', (cookie_id, item_id))
+                row = cursor.fetchone()
+                if not row:
+                    return result
+                result['found'] = True
+                result['is_multi_spec'] = bool(row[0]) if row[0] is not None else False
+                result['spec_group_count'] = int(row[1]) if row[1] is not None else None
+                if row[2]:
+                    try:
+                        names = json.loads(row[2])
+                        result['spec_names'] = names if isinstance(names, list) else None
+                    except (json.JSONDecodeError, TypeError):
+                        result['spec_names'] = None
+                return result
+        except Exception as e:
+            logger.error(f"获取商品规格声明失败: {e}")
+            return result
+
     def update_item_multi_quantity_delivery_status(self, cookie_id: str, item_id: str, multi_quantity_delivery: bool) -> bool:
         """更新商品的多数量发货状态"""
         try:
@@ -4400,7 +4976,7 @@ class DBManager:
                     SELECT id, name, type, api_config, text_content, data_content,
                            image_url, description, enabled, delay_seconds,
                            after_delivery_enabled, after_delivery_message,
-                           is_multi_spec, spec_name, spec_value
+                           is_multi_spec, spec_name, spec_value, spec_name_2, spec_value_2
                     FROM cards WHERE id = ? AND user_id = ? AND enabled = 1
                 ''', (item_row[0], cookie_row[0]))
                 row = cursor.fetchone()
@@ -4423,6 +4999,7 @@ class DBManager:
                     'after_delivery_message': row[11] or '',
                     'is_multi_spec': bool(row[12]) if row[12] is not None else False,
                     'spec_name': row[13], 'spec_value': row[14],
+                    'spec_name_2': row[15], 'spec_value_2': row[16],
                     'enabled': True, 'delivery_count': 1, 'delivery_times': 0,
                 }
         except Exception as e:
@@ -4482,6 +5059,38 @@ class DBManager:
         except Exception as e:
             logger.error(f"检查退款买家黑名单失败: {e}")
             return False
+
+    def record_cross_shop_blacklist(self, buyer_id: str, trigger_account_id: str,
+                                    reason: str, refund_amount: Optional[float]) -> bool:
+        if not all(isinstance(value, str) and value and value == value.strip()
+                   for value in (buyer_id, trigger_account_id, reason)):
+            raise ValueError("买家 ID、来源账号和原因必须为非空文本")
+        if refund_amount is not None and (not math.isfinite(refund_amount) or refund_amount < 0):
+            raise ValueError("退款金额必须为有限的非负数")
+        with self.lock, self.conn:
+            return bool(self.conn.execute('''
+                INSERT INTO global_cross_shop_blacklist (buyer_id, trigger_account_id, reason, refund_amount)
+                SELECT ?, id, ?, ? FROM cookies WHERE id = ?
+                ON CONFLICT(buyer_id) DO UPDATE SET
+                    trigger_account_id = excluded.trigger_account_id,
+                    reason = excluded.reason,
+                    refund_amount = excluded.refund_amount
+            ''', (buyer_id, reason, refund_amount, trigger_account_id)).rowcount)
+
+    def get_cross_shop_blacklist_entry(self, buyer_id: str) -> Optional[dict]:
+        with self.lock:
+            cursor = self.conn.execute('''
+                SELECT buyer_id, trigger_account_id, reason, refund_amount, created_at
+                FROM global_cross_shop_blacklist WHERE buyer_id = ?
+            ''', (buyer_id,))
+            row = cursor.fetchone()
+            return dict(zip((column[0] for column in cursor.description), row)) if row else None
+
+    def delete_cross_shop_blacklist_entry(self, buyer_id: str) -> bool:
+        with self.lock, self.conn:
+            return bool(self.conn.execute(
+                "DELETE FROM global_cross_shop_blacklist WHERE buyer_id = ?", (buyer_id,),
+            ).rowcount)
 
     def should_block_refund_buyer_delivery(self, buyer_id: str, cookie_id: str, item_id: str) -> bool:
         """按“全局优先，否则商品开关”的规则判断是否阻止自动发货。"""
@@ -5159,6 +5768,7 @@ class DBManager:
 
     def insert_or_update_order(self, order_id: str, item_id: str = None, buyer_id: str = None,
                               spec_name: str = None, spec_value: str = None, quantity: str = None,
+                              spec_name_2: str = None, spec_value_2: str = None,
                               amount: str = None, order_status: str = None, cookie_id: str = None,
                               is_bargain: bool = None, created_at: str = None, receiver_name: str = None,
                               receiver_phone: str = None, receiver_address: str = None,
@@ -5198,15 +5808,40 @@ class DBManager:
                     if spec_value is not None:
                         update_fields.append("spec_value = ?")
                         update_values.append(spec_value)
+                    if spec_name_2 is not None:
+                        update_fields.append("spec_name_2 = ?")
+                        update_values.append(spec_name_2)
+                    if spec_value_2 is not None:
+                        update_fields.append("spec_value_2 = ?")
+                        update_values.append(spec_value_2)
                     if quantity is not None:
                         update_fields.append("quantity = ?")
                         update_values.append(quantity)
                     if amount is not None:
                         update_fields.append("amount = ?")
                         update_values.append(amount)
-                    if order_status is not None:
-                        update_fields.append("order_status = ?")
-                        update_values.append(order_status)
+                    if order_status is not None and order_status != 'unknown':
+                        # 详情未识别到状态时仍可补全订单字段。迟到的拍下或付款
+                        # 消息也不能覆盖已发货的订单，状态判断以落库时为准。
+                        if order_status in ('processing', 'pending_ship'):
+                            update_fields.append(
+                                "order_status = CASE WHEN system_shipped = 1 OR "
+                                "order_status IN ('shipped', 'completed', 'refunding', 'cancelled') "
+                                "THEN order_status ELSE ? END"
+                            )
+                            update_values.append(order_status)
+                        else:
+                            update_fields.append("order_status = ?")
+                            update_values.append(order_status)
+                        if order_status in ("refunding", "cancelled"):
+                            update_fields.append(
+                                "dropship_status = CASE dropship_status "
+                                "WHEN 'pending_buy' THEN CASE WHEN EXISTS ("
+                                "SELECT 1 FROM dropship_tasks WHERE dropship_tasks.order_id = orders.order_id"
+                                ") THEN 'refund_intercepted' ELSE 'cancelled' END "
+                                "WHEN 'placed' THEN 'refund_intercepted' "
+                                "ELSE dropship_status END"
+                            )
                     if cookie_id is not None:
                         update_fields.append("cookie_id = ?")
                         update_values.append(cookie_id)
@@ -5247,13 +5882,16 @@ class DBManager:
                             # 不使用乐观锁
                             where_clause = "order_id = ?"
                             update_values.append(order_id)
+                        if cookie_id is not None:
+                            where_clause += " AND (dropship_status = '' OR cookie_id = ?)"
+                            update_values.append(cookie_id)
 
                         sql = f"UPDATE orders SET {', '.join(update_fields)} WHERE {where_clause}"
                         cursor.execute(sql, update_values)
 
                         # 检查是否更新成功（乐观锁）
-                        if expected_version is not None and cursor.rowcount == 0:
-                            logger.warning(f"订单更新失败（版本冲突）: {order_id}, expected_version={expected_version}")
+                        if cursor.rowcount == 0:
+                            logger.warning(f"订单更新失败（版本或账号冲突）: {order_id}, expected_version={expected_version}")
                             return False
 
                         logger.info(f"更新订单信息: {order_id}")
@@ -5263,10 +5901,12 @@ class DBManager:
                         # 使用提供的创建时间
                         cursor.execute('''
                         INSERT INTO orders (order_id, item_id, buyer_id, spec_name, spec_value,
+                                          spec_name_2, spec_value_2,
                                           quantity, amount, order_status, cookie_id, is_bargain, created_at,
                                           receiver_name, receiver_phone, receiver_address, system_shipped, chat_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (order_id, item_id, buyer_id, spec_name, spec_value,
+                              spec_name_2, spec_value_2,
                               quantity, amount, order_status or 'unknown', cookie_id,
                               1 if is_bargain else 0, created_at,
                               receiver_name, receiver_phone, receiver_address,
@@ -5275,10 +5915,12 @@ class DBManager:
                         # 使用默认的创建时间（CURRENT_TIMESTAMP，UTC时间）
                         cursor.execute('''
                         INSERT INTO orders (order_id, item_id, buyer_id, spec_name, spec_value,
+                                          spec_name_2, spec_value_2,
                                           quantity, amount, order_status, cookie_id, is_bargain,
                                           receiver_name, receiver_phone, receiver_address, system_shipped, chat_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (order_id, item_id, buyer_id, spec_name, spec_value,
+                              spec_name_2, spec_value_2,
                               quantity, amount, order_status or 'unknown', cookie_id,
                               1 if is_bargain else 0,
                               receiver_name, receiver_phone, receiver_address,
@@ -5308,6 +5950,570 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
+    def save_spec_mapping(self, item_id: str, spec_hash: str, spec_name: str,
+                          upstream_goods_id: str, upstream_sku_id: str, *, stock_guard: bool = True,
+                          platform_sku_id: Optional[str] = None) -> None:
+        if not all(isinstance(value, str) and value and value == value.strip()
+                   for value in (item_id, spec_hash, spec_name, upstream_goods_id, upstream_sku_id)):
+            raise ValueError("规格映射需要完整、精确的商品和规格标识")
+        if platform_sku_id is not None and (
+            not isinstance(platform_sku_id, str) or platform_sku_id != platform_sku_id.strip()
+        ):
+            raise ValueError("平台 SKU ID 必须是精确的字符串")
+        with self.lock, self.conn:
+            self.conn.execute(
+                """UPDATE spec_stock_alerts SET active=0
+                   WHERE item_id=? AND spec_hash=? AND active=1 AND EXISTS (
+                     SELECT 1 FROM spec_mappings
+                     WHERE item_id=spec_stock_alerts.item_id AND spec_hash=spec_stock_alerts.spec_hash
+                       AND (upstream_goods_id<>? OR upstream_sku_id<>? OR stock_guard<>?
+                            OR platform_sku_id<>COALESCE(?, platform_sku_id))
+                   )""",
+                (item_id, spec_hash, upstream_goods_id, upstream_sku_id, int(stock_guard), platform_sku_id),
+            )
+            self.conn.execute(
+                """INSERT INTO spec_mappings
+                   (item_id, spec_hash, spec_name, upstream_goods_id, upstream_sku_id, stock_guard, platform_sku_id)
+                   VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, ''))
+                   ON CONFLICT (item_id, spec_hash) DO UPDATE SET
+                     spec_name=excluded.spec_name, upstream_goods_id=excluded.upstream_goods_id,
+                     upstream_sku_id=excluded.upstream_sku_id, stock_guard=excluded.stock_guard,
+                     platform_sku_id=COALESCE(?, spec_mappings.platform_sku_id),
+                     updated_at=CURRENT_TIMESTAMP""",
+                (item_id, spec_hash, spec_name, upstream_goods_id, upstream_sku_id, int(stock_guard),
+                 platform_sku_id, platform_sku_id),
+            )
+
+    def get_spec_mapping(self, item_id: str, spec_hash: str):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            row = cursor.execute(
+                "SELECT * FROM spec_mappings WHERE item_id=? AND spec_hash=?", (item_id, spec_hash),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def has_spec_mappings(self, item_id: str) -> bool:
+        with self.lock:
+            return bool(self.conn.execute(
+                "SELECT 1 FROM spec_mappings WHERE item_id=? LIMIT 1", (item_id,),
+            ).fetchone())
+
+    def get_stock_guard_mappings(self):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            return [dict(row) for row in cursor.execute(
+                """SELECT item_info.cookie_id, spec_mappings.* FROM spec_mappings
+                   JOIN item_info ON item_info.item_id=spec_mappings.item_id
+                   WHERE spec_mappings.stock_guard=1
+                   ORDER BY item_info.cookie_id, spec_mappings.item_id, spec_mappings.spec_hash""",
+            )]
+
+    def record_spec_stock_alert(self, cookie_id, item_id, spec_hash, reason):
+        with self.lock, self.conn:
+            key = (cookie_id, item_id, spec_hash, reason)
+            cursor = self.conn.execute(
+                """INSERT INTO spec_stock_alerts (cookie_id, item_id, spec_hash, reason)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT (cookie_id, item_id, spec_hash, reason) DO UPDATE
+                   SET active=1, zeroed=0, created_at=CURRENT_TIMESTAMP
+                   WHERE spec_stock_alerts.active=0""", key,
+            )
+            zeroed, = self.conn.execute(
+                """SELECT zeroed FROM spec_stock_alerts
+                   WHERE cookie_id=? AND item_id=? AND spec_hash=? AND reason=?""", key,
+            ).fetchone()
+            return cursor.rowcount == 1, bool(zeroed)
+
+    def resolve_spec_stock_alerts(self, cookie_id, item_id, spec_hash, *reasons):
+        with self.lock, self.conn:
+            self.conn.executemany(
+                """UPDATE spec_stock_alerts SET active=0
+                   WHERE cookie_id=? AND item_id=? AND spec_hash=? AND reason=? AND active=1""",
+                [(cookie_id, item_id, spec_hash, reason) for reason in reasons],
+            )
+
+    def mark_spec_stock_zeroed(self, cookie_id, item_id, spec_hash, reason):
+        with self.lock, self.conn:
+            self.conn.execute(
+                """UPDATE spec_stock_alerts SET zeroed=1
+                   WHERE cookie_id=? AND item_id=? AND spec_hash=? AND reason=? AND active=1""",
+                (cookie_id, item_id, spec_hash, reason),
+            )
+
+    def get_spec_stock_alerts(self, cookie_id):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            return [dict(row) for row in cursor.execute(
+                "SELECT * FROM spec_stock_alerts WHERE cookie_id=? ORDER BY item_id, spec_hash, reason",
+                (cookie_id,),
+            )]
+
+    def create_dropship_tasks(self, order_id, cookie_id, version, lines):
+        with self.lock, self.conn:
+            cursor = self.conn.execute(
+                """UPDATE orders SET dropship_status='pending_buy', version=version+1,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE order_id=? AND cookie_id=? AND version=? AND dropship_status=''
+                     AND order_status='pending_ship' AND COALESCE(system_shipped, 0)=0
+                     AND NOT EXISTS (SELECT 1 FROM voucher_async_reconcile WHERE order_id=orders.order_id)""",
+                (order_id, cookie_id, version),
+            )
+            if cursor.rowcount != 1:
+                return False
+            for position, line in enumerate(lines, start=1):
+                cursor = self.conn.execute(
+                    """INSERT INTO dropship_tasks (order_id, position, spec_hash, upstream_goods_id,
+                           upstream_sku_id, stock_guard, quantity, unit_price, platform_sku_id)
+                       SELECT orders.order_id, ?, mapping.spec_hash, mapping.upstream_goods_id,
+                              mapping.upstream_sku_id, mapping.stock_guard, ?, ?, mapping.platform_sku_id
+                       FROM orders JOIN spec_mappings AS mapping ON orders.item_id=mapping.item_id
+                       WHERE orders.order_id=? AND mapping.spec_hash=?""",
+                    (position, line.quantity, str(line.unit_price), order_id, line.spec_hash),
+                )
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return False
+            return True
+
+    def get_dropship_tasks(self, order_id, cookie_id):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            return [dict(row) for row in cursor.execute(
+                """SELECT task.*, task.order_id || '#' || task.position AS task_id
+                   FROM dropship_tasks AS task JOIN orders ON orders.order_id=task.order_id
+                   WHERE task.order_id=? AND orders.cookie_id=? ORDER BY task.position""",
+                (order_id, cookie_id),
+            )]
+
+    def update_dropship_task(self, order_id, cookie_id, position, previous, status, *,
+                             upstream_order_id=None, express_company=None, express_no=None):
+        with self.lock, self.conn:
+            cursor = self.conn.execute(
+                """UPDATE dropship_tasks SET status=?,
+                       upstream_order_id=COALESCE(?, upstream_order_id),
+                       express_company=COALESCE(?, express_company),
+                       express_no=COALESCE(?, express_no)
+                   WHERE order_id=? AND position=? AND status=? AND EXISTS (
+                     SELECT 1 FROM orders WHERE orders.order_id=dropship_tasks.order_id AND cookie_id=?
+                       AND (?<>'placing' OR (order_status='pending_ship'
+                         AND dropship_status IN ('pending_buy', 'placed')))
+                   )""",
+                (status, upstream_order_id, express_company, express_no,
+                 order_id, position, previous, cookie_id, status),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self.conn.execute("UPDATE orders SET version=version+1 WHERE order_id=?", (order_id,))
+            return True
+
+    def get_dropship_order(self, order_id: str, cookie_id: str):
+        with self.lock:
+            cursor = self.conn.execute(
+                """SELECT order_id, cookie_id, item_id, buyer_id, order_status, system_shipped, version, quantity,
+                          receiver_name, receiver_phone, receiver_address, receiver_city,
+                          upstream_order_id, express_no, express_company, dropship_status
+                   FROM orders WHERE order_id=? AND cookie_id=?""",
+                (order_id, cookie_id),
+            )
+            row = cursor.fetchone()
+            return dict(zip((column[0] for column in cursor.description), row)) if row else None
+
+    def dropship_orders_to_sync(self, cookie_id: str, *, include_upstream: bool = False):
+        with self.lock:
+            return [row[0] for row in self.conn.execute(
+                """SELECT order_id FROM orders
+                   WHERE cookie_id=? AND (
+                     (dropship_status='shipped' AND order_status IN ('pending_ship', 'refunding'))
+                     OR (? AND dropship_status IN ('pending_buy', 'placed', 'refund_intercepted'))
+                   )
+                   ORDER BY updated_at, order_id""",
+                (cookie_id, include_upstream),
+            )]
+
+    def dropship_sync_accounts(self, *, include_upstream: bool = False):
+        with self.lock:
+            return [row[0] for row in self.conn.execute(
+                """SELECT DISTINCT cookie_id FROM orders
+                   WHERE cookie_id IS NOT NULL AND cookie_id<>'' AND (
+                     (dropship_status='shipped' AND order_status IN ('pending_ship', 'refunding'))
+                     OR (? AND dropship_status IN ('pending_buy', 'placed', 'refund_intercepted'))
+                   )""",
+                (include_upstream,),
+            )]
+
+    def pending_dropship_cancellations(self, cookie_id: str):
+        with self.lock:
+            return self.conn.execute(
+                """SELECT order_id, upstream_order_id FROM orders
+                   WHERE cookie_id=? AND dropship_status='refund_intercepted' AND upstream_order_id<>''
+                   ORDER BY updated_at, order_id""",
+                (cookie_id,),
+            ).fetchall()
+
+    def update_dropship_order(
+        self, order_id: str, cookie_id: str, version: int, status: str, *,
+        upstream_order_id=None, express_no=None, express_company=None, order_status=None,
+    ) -> bool:
+        with self.lock, self.conn:
+            cursor = self.conn.execute(
+                """UPDATE orders SET dropship_status=?,
+                       upstream_order_id=COALESCE(?, upstream_order_id),
+                       express_no=COALESCE(?, express_no),
+                       express_company=COALESCE(?, express_company),
+                       order_status=COALESCE(?, order_status),
+                       updated_at=CURRENT_TIMESTAMP, version=version+1
+                   WHERE order_id=? AND cookie_id=? AND version=?
+                     AND NOT EXISTS (SELECT 1 FROM voucher_async_reconcile WHERE order_id=orders.order_id)""",
+                (status, upstream_order_id, express_no, express_company, order_status,
+                 order_id, cookie_id, version),
+            )
+            return cursor.rowcount == 1
+
+    def is_voucher_async_order(self, order_id: str, account_id: str) -> bool:
+        with self.lock:
+            return self.conn.execute(
+                "SELECT 1 FROM voucher_async_reconcile WHERE order_id=? AND account_id=?",
+                (order_id, account_id),
+            ).fetchone() is not None
+
+    def save_competitor_monitor_target(self, item_id: str, search_keyword: str,
+                                       price_floor: float, price_ceiling: float,
+                                       under_cut_delta: float = 0.1,
+                                       is_active: bool = True):
+        item_id = str(item_id or "").strip()
+        search_keyword = str(search_keyword or "").strip()
+        try:
+            floor = float(price_floor)
+            ceiling = float(price_ceiling)
+            delta = float(under_cut_delta)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("竞品盯盘价格配置无效") from exc
+        if (not item_id or not search_keyword
+                or not math.isfinite(floor) or floor <= 0
+                or not math.isfinite(ceiling) or ceiling < floor
+                or not math.isfinite(delta) or delta < 0):
+            raise ValueError("竞品盯盘目标参数无效")
+        with self.lock, self.conn:
+            self.conn.execute("""
+                INSERT INTO competitor_monitor_targets
+                    (item_id, search_keyword, price_floor, price_ceiling, under_cut_delta, is_active)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(item_id) DO UPDATE SET
+                    search_keyword=excluded.search_keyword,
+                    price_floor=excluded.price_floor,
+                    price_ceiling=excluded.price_ceiling,
+                    under_cut_delta=excluded.under_cut_delta,
+                    is_active=excluded.is_active
+            """, (item_id, search_keyword, floor, ceiling, delta, int(bool(is_active))))
+        return self.get_competitor_monitor_target(item_id)
+
+    def get_competitor_monitor_target(self, item_id: str):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            row = cursor.execute(
+                "SELECT * FROM competitor_monitor_targets WHERE item_id=?",
+                (str(item_id or "").strip(),),
+            ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["is_active"] = bool(data["is_active"])
+        return data
+
+    def list_competitor_monitor_targets(self, active_only: bool = False):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            rows = cursor.execute("""
+                SELECT * FROM competitor_monitor_targets
+                WHERE (?=0 OR is_active=1) ORDER BY item_id
+            """, (int(bool(active_only)),)).fetchall()
+        targets = []
+        for row in rows:
+            data = dict(row)
+            data["is_active"] = bool(data["is_active"])
+            targets.append(data)
+        return targets
+
+    def delete_competitor_monitor_target(self, item_id: str) -> bool:
+        with self.lock, self.conn:
+            return bool(self.conn.execute(
+                "DELETE FROM competitor_monitor_targets WHERE item_id=?",
+                (str(item_id or "").strip(),),
+            ).rowcount)
+
+    def reserve_competitor_revision(self, item_id: str, max_daily: int, now=None) -> bool:
+        if type(max_daily) is not int or max_daily < 1:
+            raise ValueError("max_daily 必须为正整数")
+        moment = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+        if moment.utcoffset() is None:
+            raise ValueError("改价时间须包含时区")
+        moment = moment.astimezone(timezone.utc)
+        stamp = moment.isoformat(timespec="seconds")
+        day = stamp[:10]
+        with self.lock, self.conn:
+            cursor = self.conn.execute("""
+                UPDATE competitor_monitor_targets SET
+                    daily_revision_count=CASE
+                        WHEN last_revised_at IS NULL OR substr(last_revised_at, 1, 10)<>?
+                        THEN 1 ELSE daily_revision_count + 1 END,
+                    last_revised_at=?
+                WHERE item_id=? AND is_active=1 AND (
+                    last_revised_at IS NULL OR substr(last_revised_at, 1, 10)<>?
+                    OR daily_revision_count<?
+                )
+            """, (day, stamp, str(item_id or "").strip(), day, max_daily))
+            return cursor.rowcount == 1
+
+    # ------------------------------------------------------------ 自动评价账本
+
+    def ensure_auto_review_record(self, order_id: str, account_id: str = "",
+                                  buyer_id: str = ""):
+        oid = str(order_id or "").strip()
+        if not oid:
+            raise ValueError("订单号不能为空")
+        with self.lock, self.conn:
+            self.conn.execute("""
+                INSERT OR IGNORE INTO auto_review_records
+                    (order_id, account_id, buyer_id)
+                VALUES (?, ?, ?)
+            """, (oid, str(account_id or ""), str(buyer_id or "")))
+            if account_id or buyer_id:
+                self.conn.execute("""
+                    UPDATE auto_review_records SET
+                        account_id=CASE WHEN ?<>'' THEN ? ELSE account_id END,
+                        buyer_id=CASE WHEN ?<>'' THEN ? ELSE buyer_id END,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE order_id=?
+                """, (str(account_id or ""), str(account_id or ""),
+                      str(buyer_id or ""), str(buyer_id or ""), oid))
+        return self.get_auto_review_record(oid)
+
+    def get_auto_review_record(self, order_id: str):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            row = cursor.execute(
+                "SELECT * FROM auto_review_records WHERE order_id=?",
+                (str(order_id or "").strip(),),
+            ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["gift_sent"] = bool(data["gift_sent"])
+        return data
+
+    def list_auto_review_records(self, limit: int = 100):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            rows = cursor.execute("""
+                SELECT * FROM auto_review_records
+                ORDER BY updated_at DESC LIMIT ?
+            """, (max(1, int(limit)),)).fetchall()
+        records = []
+        for row in rows:
+            data = dict(row)
+            data["gift_sent"] = bool(data["gift_sent"])
+            records.append(data)
+        return records
+
+    def update_auto_review_record(self, order_id: str, *,
+                                  buyer_rate_status: str = None,
+                                  seller_rate_status: str = None):
+        sets = []
+        args = []
+        if buyer_rate_status is not None:
+            sets.append("buyer_rate_status=?")
+            args.append(str(buyer_rate_status))
+        if seller_rate_status is not None:
+            sets.append("seller_rate_status=?")
+            args.append(str(seller_rate_status))
+        if not sets:
+            return self.get_auto_review_record(order_id)
+        sets.append("updated_at=CURRENT_TIMESTAMP")
+        args.append(str(order_id or "").strip())
+        with self.lock, self.conn:
+            self.conn.execute(
+                f"UPDATE auto_review_records SET {', '.join(sets)} WHERE order_id=?",
+                tuple(args),
+            )
+        return self.get_auto_review_record(order_id)
+
+    def claim_auto_review_rate(self, order_id: str) -> bool:
+        with self.lock, self.conn:
+            return self.conn.execute("""
+                UPDATE auto_review_records SET seller_rate_status='rating',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE order_id=? AND seller_rate_status='unrated'
+            """, (str(order_id or "").strip(),)).rowcount == 1
+
+    def release_auto_review_rate(self, order_id: str) -> bool:
+        with self.lock, self.conn:
+            return self.conn.execute("""
+                UPDATE auto_review_records SET seller_rate_status='unrated',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE order_id=? AND seller_rate_status='rating'
+            """, (str(order_id or "").strip(),)).rowcount == 1
+
+    def claim_review_gift(self, order_id: str) -> bool:
+        with self.lock, self.conn:
+            return self.conn.execute("""
+                UPDATE auto_review_records SET gift_sent=1,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE order_id=? AND gift_sent=0
+            """, (str(order_id or "").strip(),)).rowcount == 1
+
+    def release_review_gift(self, order_id: str) -> bool:
+        with self.lock, self.conn:
+            return self.conn.execute("""
+                UPDATE auto_review_records SET gift_sent=0,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE order_id=?
+            """, (str(order_id or "").strip(),)).rowcount == 1
+
+    def list_auto_review_candidates(self, limit: int = 50):
+        """已完成、但还没回评（或赠品还没发出）的订单。"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            rows = cursor.execute("""
+                SELECT o.order_id, o.cookie_id, o.item_id, o.buyer_id, o.order_status,
+                       r.seller_rate_status, r.buyer_rate_status, r.gift_sent
+                FROM orders o
+                LEFT JOIN auto_review_records r ON r.order_id=o.order_id
+                WHERE o.order_status='completed' AND (
+                    r.order_id IS NULL
+                    OR r.seller_rate_status='unrated'
+                    OR (r.gift_sent=0 AND r.buyer_rate_status='good')
+                )
+                ORDER BY o.updated_at ASC LIMIT ?
+            """, (max(1, int(limit)),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_item_review_gift_card(self, cookie_id: str, item_id: str, text: str) -> bool:
+        with self.lock, self.conn:
+            return self.conn.execute("""
+                UPDATE item_info SET review_gift_card=?, updated_at=CURRENT_TIMESTAMP
+                WHERE cookie_id=? AND item_id=?
+            """, (str(text or ""), cookie_id, item_id)).rowcount > 0
+
+    def get_item_review_gift_card(self, cookie_id: str, item_id: str) -> str:
+        try:
+            with self.lock:
+                row = self.conn.execute(
+                    "SELECT review_gift_card FROM item_info WHERE cookie_id=? AND item_id=?",
+                    (cookie_id, item_id),
+                ).fetchone()
+                return str(row[0] or "") if row else ""
+        except Exception as e:
+            logger.error(f"获取好评赠品配置失败: {e}")
+            return ""
+
+    # ------------------------------------------------------------ 限时议价会话
+
+    def create_bargain_session(self, session_id: str, account_id: str, buyer_id: str,
+                               item_id: str, original_price: float,
+                               concession_price: float, expires_at: str,
+                               created_at: str = None):
+        with self.lock, self.conn:
+            self.conn.execute("""
+                INSERT INTO bargain_sessions
+                    (session_id, account_id, buyer_id, item_id, original_price,
+                     concession_price, status, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'active', ?, COALESCE(?, CURRENT_TIMESTAMP))
+            """, (str(session_id), str(account_id), str(buyer_id), str(item_id),
+                  float(original_price), float(concession_price), str(expires_at),
+                  created_at))
+        return self.get_bargain_session(session_id)
+
+    def get_bargain_session(self, session_id: str):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            row = cursor.execute(
+                "SELECT * FROM bargain_sessions WHERE session_id=?",
+                (str(session_id or ""),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_bargain_sessions(self, status: str = None, limit: int = 100):
+        sql = "SELECT * FROM bargain_sessions"
+        args = []
+        if status is not None:
+            sql += " WHERE status=?"
+            args.append(str(status))
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        args.append(max(1, int(limit)))
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            rows = cursor.execute(sql, tuple(args)).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_active_bargain_session(self, account_id: str, buyer_id: str,
+                                    item_id: str, now: str):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            row = cursor.execute("""
+                SELECT * FROM bargain_sessions
+                WHERE account_id=? AND buyer_id=? AND item_id=?
+                  AND status='active' AND expires_at>?
+                ORDER BY created_at DESC LIMIT 1
+            """, (str(account_id), str(buyer_id), str(item_id), str(now))).fetchone()
+        return dict(row) if row is not None else None
+
+    def consume_bargain_session(self, session_id: str) -> bool:
+        with self.lock, self.conn:
+            return self.conn.execute("""
+                UPDATE bargain_sessions SET status='consumed'
+                WHERE session_id=? AND status='active'
+            """, (str(session_id),)).rowcount == 1
+
+    def fail_bargain_session(self, session_id: str) -> bool:
+        with self.lock, self.conn:
+            return self.conn.execute("""
+                UPDATE bargain_sessions SET status='failed'
+                WHERE session_id=? AND status='consumed'
+            """, (str(session_id),)).rowcount == 1
+
+    def list_due_bargain_sessions(self, now: str):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            rows = cursor.execute("""
+                SELECT * FROM bargain_sessions
+                WHERE status='active' AND expires_at<=?
+            """, (str(now),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_bargain_session_expired(self, session_id: str) -> bool:
+        with self.lock, self.conn:
+            return self.conn.execute("""
+                UPDATE bargain_sessions SET status='expired'
+                WHERE session_id=? AND status='active'
+            """, (str(session_id),)).rowcount == 1
+
+    def find_unpaid_order_for_bargain(self, account_id: str, buyer_id: str,
+                                      item_id: str, since: str):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            row = cursor.execute("""
+                SELECT order_id, item_id, buyer_id, cookie_id, amount, order_status, created_at
+                FROM orders
+                WHERE cookie_id=? AND buyer_id=? AND item_id=?
+                  AND order_status='processing' AND created_at>=?
+                ORDER BY created_at ASC LIMIT 1
+            """, (str(account_id), str(buyer_id), str(item_id), str(since))).fetchone()
+        return dict(row) if row is not None else None
+
     def get_order_by_id(self, order_id: str):
         """根据订单ID获取订单信息"""
         with self.lock:
@@ -5316,7 +6522,8 @@ class DBManager:
                 # 先尝试查询包含version的订单
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at, version, chat_id
+                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at, version, chat_id,
+                       spec_name_2, spec_value_2, upstream_order_id, express_no, express_company, dropship_status
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -5338,13 +6545,41 @@ class DBManager:
                         'created_at': row[10],
                         'updated_at': row[11],
                         'version': row[12] if len(row) > 12 else 1,  # 默认版本为1
-                        'chat_id': row[13] if len(row) > 13 else ''
+                        'chat_id': row[13] if len(row) > 13 else '',
+                        'spec_name_2': row[14] if len(row) > 14 else None,
+                        'spec_value_2': row[15] if len(row) > 15 else None,
+                        'upstream_order_id': row[16],
+                        'express_no': row[17],
+                        'express_company': row[18],
+                        'dropship_status': row[19],
                     }
                 return None
 
             except Exception as e:
                 logger.error(f"获取订单信息失败: {order_id} - {e}")
                 return None
+
+    def is_order_system_shipped(self, order_id: str) -> bool:
+        """该订单本机是否已经发过货（system_shipped=1）。
+
+        用于自动发货的重启兜底判重：内存里的冷却时间重启即失效，
+        只有库里这个标记能跨进程/跨重启拦住重复发货。
+        查不到订单、字段缺失、或值为 0/None，一律视为"没发过"。
+        """
+        if not order_id:
+            return False
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor, "SELECT system_shipped FROM orders WHERE order_id = ?", (order_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                return bool(row[0])
+            except Exception as e:
+                logger.error(f"查询订单发货标记失败: {order_id} - {e}")
+                raise  # 交给调用方按"保守跳过"处理，绝不默认放行
 
     def delete_order(self, order_id: str):
         """删除订单"""
@@ -5377,7 +6612,8 @@ class DBManager:
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at
+                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at,
+                       spec_name_2, spec_value_2
                 FROM orders
                 WHERE item_id = ? AND buyer_id = ?
                 ORDER BY created_at DESC
@@ -5399,7 +6635,9 @@ class DBManager:
                         'cookie_id': row[8],
                         'is_bargain': bool(row[9]) if row[9] is not None else False,
                         'created_at': row[10],
-                        'updated_at': row[11]
+                        'updated_at': row[11],
+                        'spec_name_2': row[12],
+                        'spec_value_2': row[13]
                     }
                 return None
 
@@ -5415,7 +6653,8 @@ class DBManager:
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
                        quantity, amount, order_status, is_bargain, created_at, updated_at,
-                       receiver_name, receiver_phone, receiver_address
+                       receiver_name, receiver_phone, receiver_address,
+                       spec_name_2, spec_value_2
                 FROM orders WHERE cookie_id = ?
                 ORDER BY created_at DESC LIMIT ?
                 ''', (cookie_id, limit))
@@ -5437,7 +6676,9 @@ class DBManager:
                         'updated_at': row[10],
                         'receiver_name': row[11],
                         'receiver_phone': row[12],
-                        'receiver_address': row[13]
+                        'receiver_address': row[13],
+                        'spec_name_2': row[14],
+                        'spec_value_2': row[15]
                     })
 
                 return orders
@@ -5453,7 +6694,8 @@ class DBManager:
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at
+                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at,
+                       spec_name_2, spec_value_2
                 FROM orders
                 ORDER BY created_at DESC LIMIT ?
                 ''', (limit,))
@@ -5473,7 +6715,9 @@ class DBManager:
                         'cookie_id': row[8],
                         'is_bargain': bool(row[9]) if row[9] is not None else False,
                         'created_at': row[10],
-                        'updated_at': row[11]
+                        'updated_at': row[11],
+                        'spec_name_2': row[12],
+                        'spec_value_2': row[13]
                     })
 
                 return orders
@@ -6080,19 +7324,23 @@ class DBManager:
                     where_conditions.append(f"order_status IN ({placeholders})")
                     params.extend(include_statuses)
 
-                where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+                where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else "WHERE 1=1"
+                # 金额未录入的订单参与计数，金额计算只使用已记账数据。
+                amount_expression = """
+                    CASE WHEN TRIM(amount) NOT IN ('', 'N/A')
+                         THEN CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL) END
+                """
 
                 # 1. 总收益统计（估值，实际会扣税等）
                 cursor.execute(f"""
                     SELECT
                         COUNT(DISTINCT order_id) as total_orders,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as total_amount,
-                        AVG(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as avg_amount,
+                        SUM({amount_expression}) as total_amount,
+                        AVG({amount_expression}) as avg_amount,
                         COUNT(DISTINCT buyer_id) as unique_buyers,
                         COUNT(DISTINCT item_id) as unique_items
                     FROM orders
                     {where_clause}
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
                 """, params)
 
                 row = cursor.fetchone()
@@ -6109,10 +7357,9 @@ class DBManager:
                     SELECT
                         DATE(created_at) as date,
                         COUNT(DISTINCT order_id) as order_count,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as daily_amount
+                        SUM({amount_expression}) as daily_amount
                     FROM orders
                     {where_clause}
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
                     GROUP BY DATE(created_at)
                     ORDER BY date DESC
                     LIMIT 30
@@ -6131,10 +7378,9 @@ class DBManager:
                     SELECT
                         order_status,
                         COUNT(DISTINCT order_id) as count,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as amount
+                        SUM({amount_expression}) as amount
                     FROM orders
                     {where_clause}
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
                     GROUP BY order_status
                     ORDER BY count DESC
                 """, params)
@@ -6152,11 +7398,10 @@ class DBManager:
                     SELECT
                         receiver_city,
                         COUNT(DISTINCT order_id) as order_count,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as total_amount
+                        SUM({amount_expression}) as total_amount
                     FROM orders
                     {where_clause}
                     AND receiver_city IS NOT NULL AND receiver_city != ''
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
                     GROUP BY receiver_city
                     ORDER BY order_count DESC
                     LIMIT 50
@@ -6175,12 +7420,11 @@ class DBManager:
                     SELECT
                         item_id,
                         COUNT(DISTINCT order_id) as order_count,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as total_amount,
-                        AVG(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as avg_amount
+                        SUM({amount_expression}) as total_amount,
+                        AVG({amount_expression}) as avg_amount
                     FROM orders
                     {where_clause}
                     AND item_id IS NOT NULL AND item_id != ''
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
                     GROUP BY item_id
                     ORDER BY order_count DESC
                     LIMIT 20
@@ -6333,6 +7577,405 @@ class DBManager:
                 logger.error(f"获取订单列表失败: {e}")
                 return []
 
+    # ------------------------------------------------------------------ 待付款催付账本
+
+    def ensure_unpaid_order_chase(self, order_id, account_id=None, item_id=None,
+                                  buyer_id=None, order_amount=None, created_at=None):
+        """幂等建立催付账本行；已存在时不覆盖进度。"""
+        oid = str(order_id or "").strip()
+        if not oid:
+            raise ValueError("催付账本缺少订单号")
+        stamp = created_at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        with self.lock:
+            self.conn.execute(
+                """INSERT OR IGNORE INTO unpaid_order_chases
+                   (order_id, account_id, item_id, buyer_id, order_amount,
+                    chase_stage, chase_state, last_chased_at, created_at, updated_at)
+                   VALUES (?,?,?,?,?,0,'active',NULL,?,?)""",
+                (oid, str(account_id or ""), str(item_id or ""), str(buyer_id or ""),
+                 float(order_amount or 0), stamp, stamp),
+            )
+            self.conn.commit()
+        return self.get_unpaid_order_chase(oid)
+
+    def get_unpaid_order_chase(self, order_id):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            row = cursor.execute(
+                "SELECT * FROM unpaid_order_chases WHERE order_id=? LIMIT 1",
+                (str(order_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_unpaid_order_chases(self, state=None, stage=None, limit=200):
+        sql = "SELECT * FROM unpaid_order_chases WHERE 1=1"
+        args = []
+        if state is not None:
+            sql += " AND chase_state=?"
+            args.append(str(state))
+        if stage is not None:
+            sql += " AND chase_stage=?"
+            args.append(int(stage))
+        sql += " ORDER BY created_at ASC LIMIT ?"
+        args.append(max(1, int(limit)))
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            rows = cursor.execute(sql, tuple(args)).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_unpaid_order_chase(self, order_id, *, chase_stage=None,
+                                  chase_state=None, last_chased_at=None):
+        if chase_state is not None and chase_state not in (
+                "active", "converted", "expired", "suspended"):
+            raise ValueError("催付状态非法")
+        fields = ["updated_at=CURRENT_TIMESTAMP"]
+        args = []
+        if chase_stage is not None:
+            stage = int(chase_stage)
+            if stage < 0 or stage > 2:
+                raise ValueError("催付阶段必须在 0~2 之间")
+            fields.append("chase_stage=?")
+            args.append(stage)
+        if chase_state is not None:
+            fields.append("chase_state=?")
+            args.append(str(chase_state))
+        if last_chased_at is not None:
+            fields.append("last_chased_at=?")
+            args.append(str(last_chased_at))
+        args.append(str(order_id))
+        with self.lock:
+            cursor = self.conn.execute(
+                f"UPDATE unpaid_order_chases SET {', '.join(fields)} WHERE order_id=?",
+                tuple(args),
+            )
+            self.conn.commit()
+        return cursor.rowcount == 1
+
+    def delete_unpaid_order_chase(self, order_id):
+        with self.lock:
+            cursor = self.conn.execute(
+                "DELETE FROM unpaid_order_chases WHERE order_id=?",
+                (str(order_id),),
+            )
+            self.conn.commit()
+        return cursor.rowcount == 1
+
+    def list_unpaid_orders_for_chase(self, limit=200):
+        """待付款订单 + 仍在跟踪中的账本行（含状态已变化的订单，用于收口）。"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            rows = cursor.execute(
+                """SELECT o.order_id, o.cookie_id AS account_id, o.item_id,
+                          o.buyer_id, o.amount, o.order_status,
+                          o.created_at AS order_created_at,
+                          c.chase_stage, c.chase_state, c.last_chased_at,
+                          c.created_at AS chase_created_at
+                   FROM orders o
+                   LEFT JOIN unpaid_order_chases c ON c.order_id = o.order_id
+                   WHERE o.order_status = 'processing'
+                      OR c.chase_state = 'active'
+                   ORDER BY o.created_at ASC
+                   LIMIT ?""",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def has_buyer_message_since(self, account_id, buyer_id, since):
+        """自 since 起买家是否在本账号会话里发过言（ai_conversations.role='user'）。"""
+        with self.lock:
+            row = self.conn.execute(
+                """SELECT 1 FROM ai_conversations
+                   WHERE cookie_id=? AND user_id=? AND role='user'
+                     AND created_at >= ?
+                   LIMIT 1""",
+                (str(account_id), str(buyer_id), str(since)),
+            ).fetchone()
+        return row is not None
+    # ------------------------------------------------------------------ 财务利润账本
+
+    def get_financial_profit_record(self, order_id):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            row = cursor.execute(
+                "SELECT * FROM financial_profit_records WHERE order_id=? LIMIT 1",
+                (str(order_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def upsert_financial_profit_record(self, record):
+        with self.lock:
+            self.conn.execute(
+                """INSERT INTO financial_profit_records
+                   (order_id, account_id, item_id, revenue, upstream_cost,
+                    shipping_cost, platform_fee, net_profit, margin_rate,
+                    settlement_status, created_at, settled_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(order_id) DO UPDATE SET
+                     account_id=excluded.account_id,
+                     item_id=excluded.item_id,
+                     revenue=excluded.revenue,
+                     upstream_cost=excluded.upstream_cost,
+                     shipping_cost=excluded.shipping_cost,
+                     platform_fee=excluded.platform_fee,
+                     net_profit=excluded.net_profit,
+                     margin_rate=excluded.margin_rate,
+                     settlement_status=excluded.settlement_status,
+                     settled_at=CASE
+                         WHEN financial_profit_records.settled_at IS NOT NULL
+                              AND excluded.settlement_status='settled'
+                         THEN financial_profit_records.settled_at
+                         ELSE excluded.settled_at
+                     END""",
+                (
+                    str(record["order_id"]),
+                    record.get("account_id"),
+                    record.get("item_id"),
+                    float(record.get("revenue") or 0),
+                    float(record.get("upstream_cost") or 0),
+                    float(record.get("shipping_cost") or 0),
+                    float(record.get("platform_fee") or 0),
+                    float(record.get("net_profit") or 0),
+                    float(record.get("margin_rate") or 0),
+                    record.get("settlement_status") or "pending",
+                    record.get("created_at"),
+                    record.get("settled_at"),
+                ),
+            )
+            self.conn.commit()
+
+    def list_orders_for_profit_ledger(self, days=None):
+        """按核算窗口取订单；窗口外但仍有 pending 账目的订单也继续重算。"""
+        clause = "1=1"
+        params = ()
+        if days is not None:
+            clause = """(o.created_at >= datetime('now', ?)
+                        OR EXISTS (SELECT 1 FROM financial_profit_records f
+                                   WHERE f.order_id = o.order_id
+                                     AND f.settlement_status = 'pending'))"""
+            params = (f"-{max(1, int(days))} days",)
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            rows = cursor.execute(
+                f"""SELECT o.order_id, o.cookie_id, o.item_id, o.amount,
+                           o.order_status, o.created_at
+                    FROM orders o
+                    WHERE COALESCE(o.order_id, '') <> '' AND {clause}""",
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_dropship_cost_for_order(self, order_id):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            row = cursor.execute(
+                """SELECT COALESCE(SUM(
+                       COALESCE(quantity, 0) * COALESCE(CAST(unit_price AS REAL), 0)
+                   ), 0) AS cost
+                   FROM dropship_tasks WHERE order_id=?""",
+                (str(order_id),),
+            ).fetchone()
+        return float(row["cost"] if row and row["cost"] is not None else 0)
+
+    def is_voucher_profit_order(self, order_id):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM voucher_async_reconcile WHERE order_id=? LIMIT 1",
+                (str(order_id),),
+            ).fetchone()
+        return row is not None
+
+    # ------------------------------------------------------------------ 退款争议账本
+
+    VALID_DISPUTE_STATES = {
+        "evidence_collected",
+        "refused",
+        "arbitrating",
+        "won",
+        "lost",
+    }
+
+    def upsert_dispute_case(self, order_id, account_id, item_id, buyer_id,
+                            refund_amount, refund_reason, dispute_state,
+                            evidence_json, statement_text,
+                            created_at=None):
+        order_id = str(order_id or "").strip()
+        if not order_id:
+            raise ValueError("订单号不能为空")
+        state = str(dispute_state or "evidence_collected")
+        if state not in self.VALID_DISPUTE_STATES:
+            raise ValueError(f"无效退款争议状态: {state}")
+        if isinstance(evidence_json, (dict, list)):
+            serialized_evidence = json.dumps(
+                evidence_json, ensure_ascii=False, sort_keys=True
+            )
+        else:
+            try:
+                json.loads(evidence_json or "{}")
+                serialized_evidence = str(evidence_json or "{}")
+            except (TypeError, json.JSONDecodeError):
+                serialized_evidence = "{}"
+        try:
+            amount = float(
+                str(refund_amount or "0").replace("¥", "").replace("￥", "")
+            )
+        except (TypeError, ValueError, OverflowError):
+            amount = 0.0
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            cursor.execute(
+                """INSERT INTO refund_dispute_cases (
+                       order_id, account_id, item_id, buyer_id, refund_amount,
+                       refund_reason, dispute_state, evidence_json,
+                       statement_text, created_at, updated_at
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(order_id) DO UPDATE SET
+                     account_id=excluded.account_id,
+                     item_id=excluded.item_id,
+                     buyer_id=excluded.buyer_id,
+                     refund_amount=excluded.refund_amount,
+                     refund_reason=excluded.refund_reason,
+                     dispute_state=excluded.dispute_state,
+                     evidence_json=excluded.evidence_json,
+                     statement_text=excluded.statement_text,
+                     updated_at=excluded.updated_at""",
+                (
+                    order_id,
+                    str(account_id or ""),
+                    str(item_id or ""),
+                    str(buyer_id or ""),
+                    amount,
+                    str(refund_reason or ""),
+                    state,
+                    serialized_evidence,
+                    str(statement_text or ""),
+                    created_at or now,
+                    now,
+                ),
+            )
+            self.conn.commit()
+            row = cursor.execute(
+                "SELECT * FROM refund_dispute_cases WHERE order_id=?",
+                (order_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_dispute_case(self, order_id):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            row = cursor.execute(
+                "SELECT * FROM refund_dispute_cases WHERE order_id=? LIMIT 1",
+                (str(order_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_active_disputes(self, limit=200):
+        max_rows = max(1, int(limit))
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            rows = cursor.execute(
+                """SELECT * FROM refund_dispute_cases
+                   WHERE dispute_state IN ('evidence_collected', 'refused', 'arbitrating')
+                   ORDER BY updated_at DESC LIMIT ?""",
+                (max_rows,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_refund_dispute_candidates(self, limit=200):
+        max_rows = max(1, int(limit))
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+            rows = cursor.execute(
+                """SELECT order_id, item_id, buyer_id, spec_name, spec_value,
+                          quantity, amount, order_status, cookie_id, is_bargain,
+                          created_at, updated_at, version, chat_id,
+                          spec_name_2, spec_value_2, upstream_order_id,
+                          express_no, express_company, dropship_status
+                   FROM orders
+                   WHERE order_status='refunding'
+                   ORDER BY created_at ASC LIMIT ?""",
+                (max_rows,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_order_spot_check_candidates(self, page=1, page_size=20, max_orders=3):
+        """
+        前 N 单新品/冷启动订单抽检算法（吸收自 GitHub 统一项目 PR #10）：
+        按商品分组，筛选仅出单 1 ~ max_orders（默认 3）单的商品及订单，
+        供卖家人工对新上架商品前几单进行履约与质量抽检。
+        """
+        page = max(1, int(page))
+        page_size = max(1, min(100, int(page_size)))
+        max_orders = max(1, int(max_orders))
+        offset = (page - 1) * page_size
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.row_factory = sqlite3.Row
+
+            candidates_query = """
+                SELECT item_id, COUNT(*) AS cnt
+                FROM orders
+                WHERE COALESCE(item_id, '') <> '' AND COALESCE(order_id, '') <> ''
+                GROUP BY item_id
+                HAVING COUNT(*) BETWEEN 1 AND ?
+                ORDER BY MAX(created_at) DESC
+                LIMIT ? OFFSET ?
+            """
+            candidate_rows = cursor.execute(
+                candidates_query, (max_orders, page_size + 1, offset)
+            ).fetchall()
+
+            has_next = len(candidate_rows) > page_size
+            candidate_page = candidate_rows[:page_size]
+            candidate_item_ids = [r["item_id"] for r in candidate_page]
+
+            if not candidate_item_ids:
+                return {
+                    "page": page,
+                    "page_size": page_size,
+                    "items": [],
+                    "has_next": False,
+                }
+
+            placeholders = ",".join("?" for _ in candidate_item_ids)
+            orders_query = f"""
+                SELECT order_id, item_id, buyer_id, amount, order_status, cookie_id, created_at
+                FROM orders
+                WHERE item_id IN ({placeholders})
+                ORDER BY created_at DESC
+            """
+            order_rows = cursor.execute(orders_query, candidate_item_ids).fetchall()
+
+            orders_by_item = {}
+            for r in order_rows:
+                orders_by_item.setdefault(r["item_id"], []).append(dict(r))
+
+            items = []
+            for c in candidate_page:
+                item_id = c["item_id"]
+                items.append({
+                    "item_id": item_id,
+                    "order_count": c["cnt"],
+                    "orders": orders_by_item.get(item_id, []),
+                })
+
+            return {
+                "page": page,
+                "page_size": page_size,
+                "items": items,
+                "has_next": has_next,
+            }
 
 # 全局单例
 db_manager = DBManager()

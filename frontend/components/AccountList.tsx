@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AccountDetail, AIReplySettings } from '../types';
+import AccountConnectionBadge from './AccountConnectionBadge';
 import {
   getAccountDetails,
   updateAccountStatus,
@@ -299,18 +300,14 @@ const AccountList: React.FC = () => {
             <div className="flex items-center gap-8">
               <div className="relative">
                 <AccountAvatar account={account} />
-                <div className={`absolute -bottom-1 -right-1 w-6 h-6 rounded-full border-4 border-white flex items-center justify-center ${account.enabled ? 'bg-green-500' : 'bg-gray-300'}`}>
-                    {account.enabled && <Check className="w-3 h-3 text-white" />}
+                <div className={`absolute -bottom-1 -right-1 w-6 h-6 rounded-full border-4 border-white flex items-center justify-center ${account.enabled && account.connection_state === 'connected' ? 'bg-green-500' : 'bg-gray-300'}`} aria-hidden="true">
+                    {account.enabled && account.connection_state === 'connected' && <Check className="w-3 h-3 text-white" />}
                 </div>
               </div>
               <div>
                 <div className="flex items-center gap-3 mb-1">
                     <h3 className="text-xl font-extrabold text-gray-900">{account.nickname || account.remark || `账号 ${account.id.substring(0,6)}...`}</h3>
-                    {account.enabled ? (
-                        <span className="px-2.5 py-0.5 rounded-lg bg-green-100 text-green-700 text-xs font-bold">在线</span>
-                    ) : (
-                        <span className="px-2.5 py-0.5 rounded-lg bg-gray-100 text-gray-500 text-xs font-bold">暂停</span>
-                    )}
+                    <AccountConnectionBadge account={account} />
                     {account.ai_enabled && (
                         <span className="px-2.5 py-0.5 rounded-lg bg-purple-100 text-purple-700 text-xs font-bold flex items-center gap-1">
                           <Bot className="w-3 h-3" /> AI
@@ -319,7 +316,7 @@ const AccountList: React.FC = () => {
                 </div>
                 <p className="text-sm text-gray-500 font-medium mb-3">{account.remark || account.note || '暂无备注'}</p>
                 <div className="flex gap-2">
-                   {account.auto_confirm && <span className="text-xs bg-yellow-50 text-yellow-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5"><MessageSquare className="w-3 h-3"/> 自动回复</span>}
+                   {account.auto_confirm && <span className="text-xs bg-yellow-50 text-yellow-800 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5"><MessageSquare className="w-3 h-3"/> 自动确认发货</span>}
                    {account.pause_duration > 0 && <span className="text-xs bg-blue-50 text-blue-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5"><Clock className="w-3 h-3"/> 暂停{account.pause_duration}分钟</span>}
                 </div>
               </div>

@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>退款处置</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b23; --line:#242c38; --txt:#e6edf3;
+    --dim:#8b98a9; --acc:#3fb950; --warn:#d29922; --err:#f85149; --blue:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:24px 20px 60px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 12px;font-weight:600}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:500;font-size:12px}
+  button,select{background:#21262d;color:var(--txt);border:1px solid var(--line);
+         border-radius:6px;padding:4px 11px;font:12px inherit;cursor:pointer}
+  button:hover{border-color:#3d4756}
+  button.okbtn{color:var(--acc);border-color:#1d4429}
+  .muted{color:var(--dim)} .ok{color:var(--acc)} .err{color:var(--err)} .warn{color:var(--warn)}
+  .hint{color:var(--dim);font-size:12px;margin-top:8px}
+  .note{background:#0f1620;border-left:3px solid var(--blue);padding:10px 14px;
+        border-radius:0 6px 6px 0;font-size:13px;color:#c3d0e0;margin-bottom:14px}
+  .note b{color:#fff}
+  .mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+  .big{font-size:22px;font-weight:600}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+  .tile{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  .tile .k{color:var(--dim);font-size:12px}
+  #toast{position:fixed;right:20px;bottom:20px;background:#21262d;border:1px solid var(--line);
+         border-radius:8px;padding:10px 16px;font-size:13px;opacity:0;transition:opacity .2s;
+         pointer-events:none;max-width:460px}
+  #toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>退款处置</h1>
+  <div class="sub">退款发生时，先记一笔账，再决定要不要人处理。</div>
+
+  <div class="note">
+    <b>为什么单独一张表：</b>卡密发出去就收不回来，退款对我们是<b>净损失</b>。
+    以前退款只是订单状态变了一下，没人知道这个月亏了多少、哪几单是钱货两失。
+    现在：<b>已发货 → 按订单金额记损失上限</b>（不是净亏，我们不知道进货成本）；
+    <b>还没发 → 停发即可，损失 0</b>。这里<b>不自动拉黑买家</b>，拉黑是你自己的开关。
+  </div>
+
+  <div class="card">
+    <h2>概览</h2>
+    <select id="days">
+      <option value="7">近 7 天</option>
+      <option value="30" selected>近 30 天</option>
+      <option value="90">近 90 天</option>
+      <option value="365">近一年</option>
+    </select>
+    <button id="btnRefresh">刷新</button>
+    <div class="grid" id="kpi" style="margin-top:12px"><span class="muted">加载中…</span></div>
+  </div>
+
+  <div class="card">
+    <h2>待处理</h2>
+    <div id="openWrap"><span class="muted">加载中…</span></div>
+    <div class="hint">「已发货」的单标成处理后就不再提醒；处理方式（协商/拉黑/认亏）由你定。</div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let T=null;
+function toast(m,bad){const t=$('#toast');t.textContent=m;t.style.borderColor=bad?'var(--err)':'var(--line)';
+  t.classList.add('show');clearTimeout(T);T=setTimeout(()=>t.classList.remove('show'),2600);}
+async function api(u,o){try{return await (await fetch(u,o)).json();}catch(e){return {ok:false,error:String(e)};}}
+
+function renderKpi(s){
+  if(!s||!s.ok){$('#kpi').innerHTML='<span class="err">加载失败：'+esc((s&&s.error)||'')+'</span>';return;}
+  $('#kpi').innerHTML=`
+    <div class="tile"><div class="k">退款单</div><div class="big">${s.count}</div></div>
+    <div class="tile"><div class="k">已发货（钱货两失）</div><div class="big ${s.with_sent?'err':''}">${s.with_sent}</div></div>
+    <div class="tile"><div class="k">损失上限</div><div class="big ${s.loss?'err':'ok'}">¥${Number(s.loss||0).toFixed(2)}</div></div>
+    <div class="tile"><div class="k">可回收（还没发）</div><div class="big ok">${s.recoverable}</div></div>
+    <div class="tile"><div class="k">待处理</div><div class="big">${s.open}</div></div>`;
+}
+
+function renderOpen(rows){
+  if(!rows||!rows.length){$('#openWrap').innerHTML='<span class="muted">没有待处理的退款</span>';return;}
+  const head=`<tr><th>订单</th><th>状态</th><th>已发</th><th>金额</th><th>损失</th><th>处置建议</th><th>时间</th><th>操作</th></tr>`;
+  const body=rows.map(r=>`<tr>
+    <td class="mono">${esc(r.order_id)}</td>
+    <td class="muted">${esc(r.status)}</td>
+    <td class="mono">${r.sent_cards}/${r.total_cards}</td>
+    <td class="mono">¥${Number(r.amount||0).toFixed(2)}</td>
+    <td class="${r.recoverable?'ok':'err'}">¥${Number(r.loss||0).toFixed(2)}</td>
+    <td class="muted">${esc(r.action)}</td>
+    <td class="muted mono">${esc((r.updated_at||'').replace('T',' '))}</td>
+    <td><button class="okbtn" data-id="${r.id}">已处理</button></td></tr>`).join('');
+  $('#openWrap').innerHTML=`<table>${head}${body}</table>`;
+  $('#openWrap').querySelectorAll('button[data-id]').forEach(b=>{
+    b.onclick=async()=>{
+      const note=prompt('怎么处理的？（协商/拉黑/认亏，可留空）','')||'';
+      const d=await api('/api/refund/resolve',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({id:+b.dataset.id,note})});
+      toast(d.ok?'已标记':('失败：'+(d.error||'')),!d.ok); load();
+    };
+  });
+}
+
+async function load(){
+  const days=$('#days').value;
+  const d=await api('/api/refund?days='+encodeURIComponent(days));
+  if(!d.ok){toast('加载失败：'+(d.error||''),true);return;}
+  renderKpi(d.stats); renderOpen(d.open);
+}
+$('#btnRefresh').onclick=load;
+$('#days').onchange=load;
+load();
+</script>
+</body>
+</html>

@@ -318,11 +318,21 @@ class AIReplyEngine:
                 '实诚价', '到100', '能到', '包个邮', '给个价', '什么价' # <-- 增加这些“口语化”的词
             ]
             
-            # 同样，你也可以通过正则表达式来匹配纯数字，比如 "100" "80"
-            # 但那可能有点复杂，先加关键词是最小改动
             if any(kw in msg_lower for kw in price_keywords):
                 logger.debug(f"本地意图检测: price ({message})")
                 return 'price'
+
+            # 买家最常见的回价其实**就是一个数字**：'167'、'160吧'、'165元'。
+            # 关键词表一条都命不中，于是整条消息落进 default：
+            # B3 不启动、get_bargain_count 也不计数（它只数 intent='price'），
+            # max_bargain_rounds 永远触发不了，模型可以一路让到成本线。
+            try:
+                import bargain_guard as _bg_i
+                if _bg_i.looks_like_price_offer(message):
+                    logger.debug(f"本地意图检测: price (纯数字报价) ({message})")
+                    return 'price'
+            except Exception:
+                pass
 
             # 技术相关关键词
             tech_keywords = ['怎么用', '参数', '坏了', '故障', '设置', '说明书', '功能', '用法', '教程', '驱动']
@@ -343,6 +353,31 @@ class AIReplyEngine:
             if chat_id not in self._chat_locks:
                 self._chat_locks[chat_id] = threading.Lock()
             return self._chat_locks[chat_id]
+
+    def _open_bargain_session(self, cookie_id: str, buyer_id: str, item_id: str,
+                              item_info: dict, decision: dict) -> None:
+        """议价被接受时登记 15 分钟限时会话；平台改价通道由调度器注入。"""
+        try:
+            from config import config
+
+            if config.get("BARGAIN_CLOSER.enabled") is not True:
+                return
+            import bargain_closer
+
+            original = float(item_info.get("price") or 0)
+            target = float(decision.get("target_price") or 0)
+            if original <= 0 or target <= 0 or target >= original:
+                return
+            closer = bargain_closer.BargainCloser(
+                db_manager, apply_concession=None, restore_price=None, release_stock=None,
+            )
+            session = closer.create_session(
+                cookie_id, buyer_id, item_id, original, target,
+            )
+            logger.info(f"已登记限时议价会话: {session.get('session_id')} "
+                        f"商品={item_id} 优惠价={target:g} 到期={session.get('expires_at')}")
+        except Exception as e:
+            logger.warning(f"限时议价会话登记失败（不影响回复）: {e}")
     
     def generate_reply(self, message: str, item_info: dict, chat_id: str,
                       cookie_id: str, user_id: str, item_id: str,
@@ -406,6 +441,43 @@ class AIReplyEngine:
                         self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", refuse_reply, intent)
                         return refuse_reply
 
+                # 5b. B3 议价护栏：底价和让步梯度改成**代码计算**，不再是提示词里的一句话。
+                #     开关在 data/bargain_config.json（默认关，第 31 天才建议开）。
+                #     这里只算约束；真正的保险丝在生成之后（见第 10b 步），因为模型可以不听。
+                bargain_dec = None
+                if intent == "price":
+                    try:
+                        import bargain_guard as _bg
+                        if _bg.get_config().get("enabled"):
+                            _lp = float(item_info.get("price") or 0)
+                            if _lp > 0:
+                                bargain_dec = _bg.decide(
+                                    message, _lp, chat_id, cookie_id, str(item_id),
+                                    item_floor=item_info.get("floor_price"))
+                                bargain_dec.update({"chat_id": chat_id,
+                                                    "cookie_id": cookie_id,
+                                                    "item_id": str(item_id)})
+                                logger.info(f"议价决策: {bargain_dec.get('action')} "
+                                            f"出价={bargain_dec.get('offer')} "
+                                            f"底价={bargain_dec.get('floor')} "
+                                            f"还价={bargain_dec.get('target_price')}")
+                                if bargain_dec.get("action") == "escalate":
+                                    # 谈不下去了：不自动回，交给人工
+                                    self.save_conversation(
+                                        chat_id, cookie_id, user_id, item_id, "assistant",
+                                        "[转人工] " + str(bargain_dec.get("note")), intent)
+                                    try:
+                                        from notify_service import send_event
+                                        send_event("risk", "议价转人工",
+                                                   f"会话 {chat_id} 议价 {bargain_dec.get('rounds')} 轮，"
+                                                   f"出价 {bargain_dec.get('offer')}，需人工接手",
+                                                   level="warn")
+                                    except Exception:
+                                        pass
+                                    return None
+                    except Exception as _e:
+                        logger.warning(f"议价护栏未生效（不影响主流程）: {_e}")
+
                 # 6. 构建提示词。账号级提示词可使用JSON，也兼容普通文本。
                 custom_prompt_text = ''
                 if settings.get('custom_prompts'):
@@ -442,7 +514,33 @@ class AIReplyEngine:
                 max_discount_percent = settings.get('max_discount_percent', 10)
                 max_discount_amount = settings.get('max_discount_amount', 100)
 
-                user_prompt = f"""商品信息：
+                # B3：有硬约束时用硬约束替换掉"请自由发挥"的软设置
+                if bargain_dec and bargain_dec.get("ok"):
+                    try:
+                        import bargain_guard as _bg
+                        bargain_block = _bg.prompt_block(bargain_dec)
+                    except Exception:
+                        bargain_block = ""
+                else:
+                    bargain_block = ""
+
+                if bargain_block:
+                    user_prompt = f"""商品信息：
+{item_desc}
+
+当前商品专属关键词知识：
+{keyword_knowledge}
+
+对话历史：
+{context_str}
+
+{bargain_block}
+
+买家消息：{message}
+
+请严格在上述价格约束内生成回复（不超过 60 字，口语化，不要罗列条款）："""
+                else:
+                    user_prompt = f"""商品信息：
 {item_desc}
 
 当前商品专属关键词知识：
@@ -496,8 +594,102 @@ class AIReplyEngine:
                 if not reply:
                     return None
 
+                # 10b. 思维链/提示词泄漏清理（所有回复都过，不只是议价）
+                #      推理模型会把 CoT 直接写进 content。我们塞给模型的约束块里
+                #      写着"绝对底价：xxx 元"，漏出去等于把底价和"这是机器人"
+                #      一起交给买家。命中就整条不发、转人工。
+                try:
+                    import bargain_guard as _bg0
+                    scr = _bg0.scrub_model_output(reply)
+                    if not scr["ok"]:
+                        logger.error(f"回复疑似泄漏思维链/提示词，已拦截: {scr['leak']}")
+                        self.save_conversation(
+                            chat_id, cookie_id, user_id, item_id, "assistant",
+                            f"[转人工] 回复含思维链/提示词泄漏：{scr['leak']}", intent)
+                        try:
+                            from notify_service import send_event
+                            send_event("risk", "AI 回复泄漏思维链，已拦截",
+                                       f"会话 {chat_id}：命中「{scr['leak']}」", level="err")
+                        except Exception:
+                            pass
+                        return None
+                    reply = scr["text"]
+                except Exception as _e:
+                    logger.warning(f"思维链清理异常（继续走保险丝）: {_e}")
+
+                # 10c. B3 保险丝：模型可以不听话，但发出去的字必须先过这里。
+                #      低于底价 → 改写；改写不了 → 整条拦掉转人工。
+                if bargain_dec and bargain_dec.get("ok"):
+                    try:
+                        import bargain_guard as _bg
+                        chk = _bg.enforce(reply, bargain_dec)
+                        if chk["violations"]:
+                            logger.warning(f"回复触碰议价红线，已处理: {chk['violations']}")
+                        if not chk["ok"]:
+                            logger.error(f"回复改写失败，转人工: {chk['violations']}")
+                            self.save_conversation(
+                                chat_id, cookie_id, user_id, item_id, "assistant",
+                                "[转人工] " + "；".join(chk["violations"]), intent)
+                            try:
+                                from notify_service import send_event
+                                send_event("risk", "回复被议价护栏拦截",
+                                           f"会话 {chat_id}：" + "；".join(chk["violations"]),
+                                           level="err")
+                            except Exception:
+                                pass
+                            return None
+                        reply = chk["reply"]
+                    except Exception as _e:
+                        # 保险丝自己炸了，宁可转人工也不能把未校验的报价发出去
+                        logger.error(f"议价保险丝异常，转人工: {_e}")
+                        self.save_conversation(
+                            chat_id, cookie_id, user_id, item_id, "assistant",
+                            f"[转人工] 议价保险丝异常：{_e}", intent)
+                        return None
+
+                # 10d. 回复侧合规闸：导流词/手机号/微信号，命中就整条不发。
+                #      发布侧早就有 publish_guard，回复侧一直是空的 —— 买家问
+                #      "能加微信吗"，模型顺着回一句就够判站外导流。这条只挡不发，
+                #      不做替换：一条含导流词的回复改成什么都不对了。
+                try:
+                    import reply_guard as _rg
+                    rg = _rg.classify(reply)
+                    if not rg["ok"]:
+                        logger.error(f"回复含站外导流/违规词，已拦截: {rg['blocked']}")
+                        self.save_conversation(
+                            chat_id, cookie_id, user_id, item_id, "assistant",
+                            "[转人工] " + rg["reason"], intent)
+                        try:
+                            from notify_service import send_event
+                            send_event("risk", "AI 回复含违规词，已拦截",
+                                       f"会话 {chat_id}：{rg['reason']}", level="err")
+                        except Exception:
+                            pass
+                        return None
+                    if rg["warned"]:
+                        # 极限词/绝对化承诺：二手语境太常见，只记录不拦
+                        logger.info(f"回复含极限词（已放行，仅记录）: {rg['warned']}")
+                    # 三档里的 draft（拆解 39 §八-3）：售后/退款/赔偿/承诺类。
+                    # 这里**只判定、不发送**：reply 照常返回，由唯一的发送口
+                    # （XianyuAutoAsync._outbox_begin）把它登记成 held 扣下。
+                    # 早先在这里 return None 有两个问题：①关键词回复根本不走
+                    # 本函数，等于只拦了 AI 那一半；②扣下的内容在发件箱里查不到，
+                    # 人不知道"有句话被拦了"。判定收口到发送口后两个问题一起消失。
+                    if rg.get("tier") == "draft":
+                        logger.info(f"draft 档回复（发送口会扣下待人工确认）: {rg.get('draft_hits')}")
+                except Exception as _e:
+                    logger.error(f"回复合规闸异常，转人工: {_e}")
+                    self.save_conversation(
+                        chat_id, cookie_id, user_id, item_id, "assistant",
+                        f"[转人工] 回复合规闸异常：{_e}", intent)
+                    return None
+
                 # 11. 保存AI回复到对话记录
                 self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", reply, intent)
+
+                if bargain_dec and bargain_dec.get("action") == "accept":
+                    self._open_bargain_session(cookie_id, user_id, item_id,
+                                               item_info, bargain_dec)
 
                 # 12. 更新议价次数 (此方法已在 get_bargain_count 中通过 SQL COUNT(*) 隐式实现)
                 if intent == "price":

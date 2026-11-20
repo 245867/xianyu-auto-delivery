@@ -70,7 +70,7 @@ class FileLogCollector:
                 level="INFO",  # 从DEBUG改为INFO，减少日志量
                 rotation="10 MB",
                 retention="3 days",  # 从7天改为3天，减少磁盘占用
-                enqueue=False,  # 改为False，避免队列延迟
+                enqueue=True,
                 buffering=1     # 行缓冲，立即写入
             )
             

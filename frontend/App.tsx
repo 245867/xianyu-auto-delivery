@@ -8,8 +8,11 @@ import ItemList from './components/ItemList';
 import Settings from './components/Settings';
 import Keywords from './components/Keywords';
 import BlacklistManager from './components/BlacklistManager';
+import ExposureOverview from './components/ExposureOverview';
+import SourcingCompare from './components/SourcingCompare';
+import WorkbenchIframeView from './components/WorkbenchIframeView';
 import { getAuthMode, login, verifyToken, type AuthMode } from './services/api';
-import { ShieldCheck, ArrowRight, Loader2, User, Lock, KeyRound, Moon, Sun } from 'lucide-react';
+import { ShieldCheck, ArrowRight, Loader2, User, Lock, KeyRound, Menu, Moon, Sun } from 'lucide-react';
 
 const App: React.FC = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -26,6 +29,7 @@ const App: React.FC = () => {
   });
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState('');
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isDark, setIsDark] = useState(() => {
     const savedTheme = localStorage.getItem('theme');
     if (savedTheme) return savedTheme === 'dark';
@@ -194,8 +198,55 @@ const App: React.FC = () => {
       case 'dashboard': return <Dashboard />;
       case 'accounts': return <AccountList />;
       case 'orders': return <OrderList />;
+      case 'fulfillment':
+        return (
+          <WorkbenchIframeView
+            title="发货可靠性台账"
+            subtitle="逐卡租约幂等管理、发货后24h异常回看、订单定位与两本账监控"
+            src="/static/delivery_reliability.html"
+            badge="P0 履约底座"
+          />
+        );
       case 'cards': return <CardList />;
       case 'items': return <ItemList />;
+      case 'templates':
+        return (
+          <WorkbenchIframeView
+            title="模板与批量发布"
+            subtitle="批量上架批次、参数变量填充、快鱼式 failurePolicy (skip/pause) 队列控制流"
+            src="/static/templates.html"
+            badge="批量队列"
+          />
+        );
+      case 'exposure': return <ExposureOverview />;
+      case 'sourcing': return <SourcingCompare />;
+      case 'care':
+        return (
+          <WorkbenchIframeView
+            title="智能催收与评价关怀"
+            subtitle="发货满24h催收货闭环、自动好评回读与小红花自动化"
+            src="/static/care.html"
+            badge="资金回款"
+          />
+        );
+      case 'diagnosis':
+        return (
+          <WorkbenchIframeView
+            title="店铺诊断与看门狗状态"
+            subtitle="全店健康体检、七类后台核心线程心跳守护与实时熔断状态"
+            src="/static/shop_diagnosis.html"
+            badge="实时守护"
+          />
+        );
+      case 'outbox':
+        return (
+          <WorkbenchIframeView
+            title="回复发件箱与合规闸"
+            subtitle="三档合规分流（auto直发 / draft扣下待审 / block丢弃），敏感词人工放行"
+            src="/static/reply_outbox.html"
+            badge="合规防封"
+          />
+        );
       case 'keywords': return <Keywords />;
       case 'blacklist': return <BlacklistManager />;
       case 'settings': return <Settings />;
@@ -204,19 +255,31 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className="flex min-h-screen bg-[#F4F5F7] dark:bg-[#111315] text-[#111] dark:text-gray-100">
+    <div className="flex min-h-screen overflow-x-hidden bg-[#F4F5F7] dark:bg-[#111315] text-[#111] dark:text-gray-100">
       {themeToggle}
+      <button
+        type="button"
+        onClick={() => setSidebarOpen(true)}
+        className="fixed left-4 top-4 z-30 flex h-10 w-10 items-center justify-center rounded-lg border border-gray-200 bg-white/90 text-gray-700 shadow-sm backdrop-blur hover:bg-gray-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FFE815] dark:border-gray-700 dark:bg-[#25282d] dark:text-gray-100 dark:hover:bg-[#343941] md:hidden"
+        aria-label="打开导航菜单"
+        aria-controls="app-sidebar"
+        aria-expanded={sidebarOpen}
+      >
+        <Menu className="h-5 w-5" aria-hidden="true" />
+      </button>
       <Sidebar 
         activeTab={activeTab} 
         setActiveTab={setActiveTab} 
+        mobileOpen={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
         onLogout={() => {
             localStorage.removeItem('auth_token');
             setIsLoggedIn(false);
         }} 
       />
       
-      <main className="flex-1 ml-64 p-6 md:p-8 overflow-y-auto h-screen relative scroll-smooth dark:bg-[#111315]">
-        <div className="max-w-[1400px] mx-auto pb-10">
+      <main className="relative h-dvh min-w-0 flex-1 overflow-y-auto scroll-smooth p-4 pt-16 sm:p-6 sm:pt-16 md:ml-64 md:p-8 dark:bg-[#111315]">
+        <div className="mx-auto max-w-[1400px] pb-10">
             {renderContent()}
         </div>
       </main>

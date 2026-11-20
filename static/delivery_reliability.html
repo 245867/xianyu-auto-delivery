@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>发货可靠性（C3）</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b23; --line:#242c38; --txt:#e6edf3;
+    --dim:#8b98a9; --acc:#3fb950; --warn:#d29922; --err:#f85149; --blue:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:24px 20px 60px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 12px;font-weight:600}
+  .row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+  label.f{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+  input,select{background:#0d1117;border:1px solid var(--line);color:var(--txt);
+    border-radius:6px;padding:6px 9px;font:13px/1.5 inherit;min-width:110px}
+  input:focus,select:focus{outline:none;border-color:var(--blue)}
+  button{background:#21262d;color:var(--txt);border:1px solid var(--line);
+         border-radius:6px;padding:6px 13px;font:13px inherit;cursor:pointer}
+  button:hover{border-color:#3d4756;background:#262d36}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+  button.primary:hover{background:#388bfd}
+  button.okbtn{color:var(--acc);border-color:#1d4429}
+  button.danger{color:var(--err);border-color:#5a2226}
+  button.mini{padding:3px 9px;font-size:12px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:500;font-size:12px}
+  .muted{color:var(--dim)} .ok{color:var(--acc)} .err{color:var(--err)} .warn{color:var(--warn)}
+  .hint{color:var(--dim);font-size:12px;margin-top:6px}
+  .kv{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .kv span{background:#0d1117;border:1px solid var(--line);border-radius:6px;
+           padding:3px 10px;font-size:12px}
+  .note{background:#0f1620;border-left:3px solid var(--blue);padding:10px 14px;
+        border-radius:0 6px 6px 0;font-size:13px;color:#c3d0e0;margin-bottom:14px}
+  .note b{color:#fff}
+  #toast{position:fixed;right:20px;bottom:20px;background:#21262d;border:1px solid var(--line);
+         border-radius:8px;padding:10px 16px;font-size:13px;opacity:0;transition:opacity .2s;
+         pointer-events:none;max-width:420px}
+  #toast.show{opacity:1}
+  .pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;border:1px solid var(--line)}
+  .p-failed{color:var(--err);border-color:#5a2226;background:#2a1618}
+  .p-unknown{color:var(--warn);border-color:#4a3a12;background:#241d09}
+  .mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+  .hidden{display:none !important}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>发货可靠性</h1>
+  <div class="sub">一单发多张卡时，发到第几张断了、哪张没发出去、要不要补——这里按卡记账。</div>
+
+  <div class="note">
+    <b>本轮修的核心不是一个新功能，是一个顺序错误。</b>
+    原来的流程在<b>发送之前</b>就把订单标成"已发货"（<span class="mono">system_shipped=1</span>），
+    于是卡密发到一半断线时，剩下的卡永远发不出去，买家再发消息也不会重试——判重认为发过了。
+    现在的顺序是：先把卡登记进账本 → 逐张发 → 全部落地才盖章。
+  </div>
+
+  <div class="card">
+    <h2>运行状态</h2>
+    <div class="kv" id="kv"><span class="muted">加载中…</span></div>
+    <div class="row">
+      <button id="btnRefresh">刷新</button>
+      <button id="btnScan">看看现在有哪些能补</button>
+      <button id="btnReap">清理卡住的租约</button>
+      <span class="hint">补发扫描挂在你账号的心跳上，约每 10 分钟一次；这里只是手动看看。</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>开关</h2>
+    <div class="row">
+      <label class="f">进程内重试
+        <select id="cRetryInline"><option value="1">开</option><option value="0">关</option></select>
+      </label>
+      <label class="f">进程内再试次数
+        <input type="number" id="cInlineRetries" min="0" max="5">
+      </label>
+      <label class="f">退避基数（秒）
+        <input type="number" id="cBackoff" min="0" max="60">
+      </label>
+      <label class="f">跨进程自动补发
+        <select id="cAutoResend"><option value="1">开</option><option value="0">关</option></select>
+      </label>
+      <label class="f">每张最多尝试
+        <input type="number" id="cMaxAttempts" min="1" max="10">
+      </label>
+      <label class="f">失败后多久补（分钟）
+        <input type="number" id="cDelay" min="0" max="1440">
+      </label>
+      <label class="f">租约（秒）
+        <input type="number" id="cLease" min="30" max="3600">
+      </label>
+      <label class="f">已发记录保留（天）
+        <input type="number" id="cKeep" min="7" max="365">
+      </label>
+    </div>
+    <div class="row"><button class="primary" id="btnSaveCfg">保存</button>
+      <span class="hint">"每次最多尝试"用满后不再自动补，只报警——连续失败通常不是抖动。</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>待处理 <span class="muted">（failed / unknown）</span></h2>
+    <div id="tblWrap" aria-live="polite"><span class="muted">暂无</span></div>
+    <div id="locateBox" class="hidden" style="margin-top:10px"></div>
+    <div class="hint">
+      <b>unknown</b> 表示"到底发没发不知道"（提交时断连/超时）。这类<b>不会自动补</b>——
+      自动补可能让买家拿到两张卡。请你到闲鱼聊天里看一眼，收到就点「已确认送达」，没收到就点「再补一次」。
+      「定位会话」会显示已记录的会话编号、买家 ID 和人工查找步骤；缺编号时按提示从订单进会话。
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>平台确认发货 <span class="muted">（内容发送已有账本记录，平台发货状态待确认）</span></h2>
+    <div class="kv" id="psKv"><span class="muted">加载中…</span></div>
+    <div id="psWrap"><span class="muted">暂无</span></div>
+    <div class="hint">
+      这是<b>另一本账</b>：卡密发成功 ≠ 平台状态机往前走了一步。三类别混着看会误判，所以分开列：
+      <b>待补</b>会自动重试；<b>已停止</b>是平台已经终态（已发货/已关闭）、或者我们签名错、或者风控，
+      重试不会改变结果——它不是故障，别去修；<b>卡死</b>是普通失败撞到次数上限，最该处理。
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>发货后 24 小时异常回看 <span class="muted">（只读，拆解 39 §八-2）</span></h2>
+    <div class="kv" id="rvKv"><span class="muted">加载中…</span></div>
+    <div id="rvWrap"><span class="muted">暂无</span></div>
+    <div class="hint" id="rvHint">窗口按订单更新时间近似，不是精确的发货后 24 小时；这里只读，不补发、不改状态。</div>
+  </div>
+
+  <div class="card">
+    <h2>新商品前 N 单人工抽查 <span class="muted">（只读、不拦截，拆解 39 §八-6）</span></h2>
+    <div class="kv" id="niKv"><span class="muted">加载中…</span></div>
+    <div id="niWrap"><span class="muted">暂无</span></div>
+    <div class="hint">规格配错的影响按单累积：前几单错了往往没人马上告诉你。这里只提示，超过阈值后自动从表里消失。</div>
+  </div>
+</div>
+
+<div id="toast"></div>
+<script>
+const $ = id => document.getElementById(id);
+function toast(msg, isErr){
+  const t = $('toast'); t.textContent = msg;
+  t.style.borderColor = isErr ? '#5a2226' : '#1d4429';
+  t.classList.add('show'); clearTimeout(t._t); t._t = setTimeout(()=>t.classList.remove('show'), 2600);
+}
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  return r.json();
+}
+function setVal(id, v){ const el = $(id); if(el) el.value = String(v); }
+
+async function load(){
+  const d = await api('/api/delivery/status');
+  if(!d.ok){ $('kv').innerHTML = '<span class="err">加载失败：'+(d.error||'')+'</span>'; return; }
+  const c = d.config || {}, by = d.by_status || {};
+  $('kv').innerHTML = [
+    `近 7 天订单 <b>${d.orders||0}</b>`,
+    `已发 <b>${by.sent||0}</b>`,
+    `失败 <b class="err">${by.failed||0}</b>`,
+    `未知 <b class="warn">${by.unknown||0}</b>`,
+    `待发 <b>${by.pending||0}</b>`,
+    c.auto_resend ? '<span class="ok">自动补发：开</span>' : '<span class="muted">自动补发：关</span>'
+  ].map(x=>`<span>${x}</span>`).join('');
+  setVal('cRetryInline', c.retry_inline ? 1 : 0);
+  setVal('cInlineRetries', c.inline_retries);
+  setVal('cBackoff', c.inline_backoff_seconds);
+  setVal('cAutoResend', c.auto_resend ? 1 : 0);
+  setVal('cMaxAttempts', c.max_attempts);
+  setVal('cDelay', c.resend_delay_minutes);
+  setVal('cLease', c.lease_seconds);
+  setVal('cKeep', c.keep_days);
+  renderRows(d.unresolved_rows || []);
+  loadPlatform();
+  loadReview();
+  loadNewItems();
+}
+
+async function loadPlatform(){
+  const d = await api('/api/delivery/platform-ship');
+  if(!d.ok){ $('psKv').innerHTML = '<span class="err">加载失败：'+(d.error||'')+'</span>'; return; }
+  const s = d.stats || {};
+  $('psKv').innerHTML = [
+    `待补 <b>${(d.pending||[]).length}</b>`,
+    `已停止 <b>${(d.stopped||[]).length}</b>`,
+    `卡死 <b class="err">${s.stuck_count || (d.stuck||[]).length}</b>`,
+    `累计已确认 <b class="ok">${s.done||0}</b>`
+  ].map(x=>`<span>${x}</span>`).join('');
+  const rows = [
+    ...(d.stuck||[]).map(r=>({...r, _kind:'卡死', _cls:'p-failed'})),
+    ...(d.stopped||[]).map(r=>({...r, _kind:'已停止', _cls:'p-unknown'})),
+    ...(d.pending||[]).map(r=>({...r, _kind:'待补', _cls:''})),
+  ];
+  if(!rows.length){ $('psWrap').innerHTML = '<span class="muted">没有待平台确认的单 🎉</span>'; return; }
+  const head = `<tr><th>订单</th><th>账号</th><th>分类</th><th>尝试</th>
+                <th>最近错误 / 停止原因</th><th>时间</th><th>操作</th></tr>`;
+  const body = rows.map(r => `<tr>
+      <td class="mono">${r.order_id}</td>
+      <td class="mono">${r.cookie_id}</td>
+      <td><span class="pill ${r._cls}">${r._kind}</span></td>
+      <td>${r.attempts}</td>
+      <td class="muted">${((r.stop_reason||r.last_error||'')+'').slice(0,72)}</td>
+      <td class="muted mono">${(r.updated_at||'').replace('T',' ')}</td>
+      <td>
+        <button class="mini" onclick="psAct('platform-retry','${r.order_id}','${r.cookie_id}')">再试一次</button>
+        <button class="mini okbtn" onclick="psAct('platform-confirmed','${r.order_id}','${r.cookie_id}')">平台已发货</button>
+      </td></tr>`).join('');
+  $('psWrap').innerHTML = `<table>${head}${body}</table>`;
+}
+
+async function psAct(kind, order_id, cookie_id){
+  const d = await api('/api/delivery/'+kind, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({order_id, cookie_id})
+  });
+  toast(d.ok ? '已处理' : ('失败：'+(d.error||'这条记录可能已经销账了')), !d.ok);
+  load();
+}
+
+function escapeText(value){
+  const node = document.createElement('span');
+  node.textContent = String(value ?? '');
+  return node.innerHTML;
+}
+// 本页统一用 escapeText；新增的两个卡片沿用了别的页面的 `esc` 叫法，
+// 别名一下比到处改调用点安全（写错名字只会在运行时静默炸掉整段渲染）。
+const esc = escapeText;
+
+function renderRows(rows){
+  if(!rows.length){ $('tblWrap').innerHTML = '<span class="muted">没有待处理的卡 🎉</span>'; return; }
+  const head = `<tr><th>订单</th><th>账号 / 会话</th><th>商品 / 规格</th><th>整单进度</th><th>第几张</th><th>状态</th><th>尝试</th>
+                <th>最近错误</th><th>时间</th><th>操作</th></tr>`;
+  const body = rows.map((r, index) => {
+    const cls = r.status === 'unknown' ? 'p-unknown' : 'p-failed';
+    return `<tr>
+      <td class="mono">${escapeText(r.order_id)}</td>
+      <td class="mono">${escapeText(r.cookie_id)}<br><span class="muted">${escapeText(r.chat_id || '会话编号未记录')}</span></td>
+      <td class="mono">${escapeText(r.item_id || '—')}<br><span class="muted">${r.spec ? escapeText(r.spec) : '规格未提供'}</span></td>
+      <td>账本已发 ${Number(r.order_sent)}/${Number(r.order_total)} · 待处理 ${Number(r.order_unresolved)}</td>
+      <td>#${Number(r.idx)+1} <span class="muted">(${escapeText(r.kind)})</span></td>
+      <td><span class="pill ${cls}">${escapeText(r.status)}</span></td>
+      <td>${Number(r.attempts)}</td>
+      <td class="muted">${escapeText((r.last_error||'').slice(0,60))}</td>
+      <td class="muted mono">${escapeText((r.updated_at||'').replace('T',' '))}</td>
+      <td>
+        <button class="mini" data-action="locate" data-row="${index}">定位会话</button>
+        <button class="mini okbtn" data-action="resolve" data-row="${index}">已确认送达</button>
+        <button class="mini" data-action="retry" data-row="${index}">再补一次</button>
+        <button class="mini danger" data-action="abandon" data-row="${index}">放弃</button>
+      </td></tr>`;
+  }).join('');
+  $('tblWrap').innerHTML = `<table>${head}${body}</table>`;
+  for (const button of $('tblWrap').querySelectorAll('button[data-action]')) {
+    button.addEventListener('click', () => {
+      const row = rows[Number(button.dataset.row)];
+      if (button.dataset.action === 'locate') { locate(row); return; }
+      act(button.dataset.action, row.order_id, row.cookie_id, row.idx);
+    });
+  }
+}
+
+async function locate(row){
+  const box = $('locateBox');
+  box.classList.remove('hidden');
+  box.innerHTML = '<span class="muted">读取定位信息…</span>';
+  const q = new URLSearchParams({order_id: row.order_id, cookie_id: row.cookie_id, idx: String(row.idx)});
+  let d;
+  try { d = await api('/api/delivery/locate?' + q.toString()); }
+  catch(e){ box.innerHTML = '<span class="err">请求失败：'+escapeText(e)+'</span>'; return; }
+  if(!d.ok){ box.innerHTML = '<span class="err">定位失败：'+escapeText(d.error||'')+'</span>'; return; }
+  const rowHtml = (k, v) => `<div><span class="muted">${k}：</span><span class="mono">${escapeText(v || '（未记录）')}</span></div>`;
+  const missing = (d.missing||[]).length
+    ? `<div class="err">缺失标识：${escapeText(d.missing.join('、'))}（按下方步骤人工查找）</div>` : '';
+  const acct = d.account_exists === false
+    ? '<div class="err">该账号在本机账号列表里不存在，确认是不是已删除/换号。</div>'
+    : (d.account_enabled === false ? '<div class="warn">该账号已停用，先到账号管理启用再处理。</div>' : '');
+  box.innerHTML = `
+    <div class="card" style="background:#12161c">
+      <h2 style="margin-top:0">会话定位 <span class="muted">（只读）</span></h2>
+      ${rowHtml('订单号', d.order_id)}
+      ${rowHtml('商品号', d.item_id)}
+      ${d.spec ? rowHtml('订单规格', d.spec) : '<div class="warn">订单规格：未提供（账本没有记录，需回订单页核对）</div>'}
+      ${rowHtml('账号', d.cookie_id)}
+      ${rowHtml('会话编号', d.chat_id)}
+      ${rowHtml('买家 ID', d.buyer_id)}
+      ${rowHtml('商品编号', d.item_id)}
+      <div><span class="muted">整单进度：</span>已发 ${Number(d.order_sent)}/${Number(d.order_total)} · 待处理 ${Number(d.order_unresolved)}</div>
+      ${acct}${missing}
+      <div style="margin-top:8px"><b>人工查找步骤</b></div>
+      <ol class="hint" style="margin:6px 0 6px 18px">${(d.manual_steps||[]).map(s=>`<li>${escapeText(s)}</li>`).join('')}</ol>
+      <div class="hint">${d.entry_verified ? '已有验证过的直达入口。' : '尚未验证过网页直达入口，所以这里不提供跳转链接，避免带错页面。'}</div>
+      <div class="row" style="margin-top:8px">
+        ${d.chat_id ? '<button class="mini" id="btnCopyChat">复制会话编号</button>' : ''}
+        ${d.buyer_id ? '<button class="mini" id="btnCopyBuyer">复制买家 ID</button>' : ''}
+        <button class="mini" id="btnCopyOrder">复制订单号</button>
+        <button class="mini" id="btnCloseLocate">关闭</button>
+      </div>
+    </div>`;
+  const copy = async (text) => {
+    try { await navigator.clipboard.writeText(text); toast('已复制'); }
+    catch(e){ toast('复制失败，请手动选中复制', true); }
+  };
+  if($('btnCopyChat')) $('btnCopyChat').onclick = ()=>copy(d.chat_id);
+  if($('btnCopyBuyer')) $('btnCopyBuyer').onclick = ()=>copy(d.buyer_id);
+  $('btnCopyOrder').onclick = ()=>copy(d.order_id);
+  $('btnCloseLocate').onclick = ()=>box.classList.add('hidden');
+}
+
+async function act(kind, order_id, cookie_id, idx){
+  if(kind === 'abandon' && !confirm('放弃后这张卡不会再自动补发，确定？')) return;
+  const d = await api('/api/delivery/'+kind, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({order_id, cookie_id, idx})
+  });
+  toast(d.ok ? '已处理' : ('失败：'+(d.error||'')), !d.ok);
+  load();
+}
+
+$('btnRefresh').onclick = load;
+$('btnScan').onclick = async () => {
+  const d = await api('/api/delivery/scan', {method:'POST'});
+  if(!d.ok){ toast('失败：'+(d.error||''), true); return; }
+  const n = (d.candidates||[]).length;
+  toast(n ? `现在有 ${n} 张卡可补` : '现在没有可补的卡（冷却中或次数已用满）', false);
+};
+$('btnReap').onclick = async () => {
+  const d = await api('/api/delivery/reap', {method:'POST'});
+  toast(d.ok ? `已释放 ${d.released} 个卡住的租约` : ('失败：'+(d.error||'')), !d.ok);
+  load();
+};
+async function loadReview(){
+  const d = await api('/api/delivery/after-sale-review?hours=24');
+  if(!d.ok){ $('rvKv').innerHTML = '<span class="err">加载失败：'+esc(d.error||'')+'</span>'; return; }
+  const c = d.counts || {};
+  $('rvKv').innerHTML = [
+    `窗口 <b>${esc(String(d.window_hours||24))}h</b>`,
+    `扫描 <b>${esc(String(d.scanned||0))}</b>`,
+    `有异常 <b class="${(d.flagged||[]).length?'warn':'ok'}">${(d.flagged||[]).length}</b>`,
+    `售后 <b class="${c.after_sale?'err':''}">${c.after_sale||0}</b>`,
+    `账本未完 <b class="${c.delivery_incomplete?'err':''}">${c.delivery_incomplete||0}</b>`,
+    `无账本 <b>${c.no_ledger||0}</b>`
+  ].map(x=>`<span>${x}</span>`).join('');
+  if(d.limitations && d.limitations.length){
+    $('rvHint').textContent = d.limitations.join('；') + '；这里只读，不补发、不改状态。';
+  }
+  const rows = d.flagged || [];
+  if(!rows.length){ $('rvWrap').innerHTML = '<span class="muted">最近窗口内没有带异常信号的已发货单</span>'; return; }
+  const head = `<tr><th>订单</th><th>商品</th><th>状态</th><th>异常信号</th><th>建议</th><th>时间</th></tr>`;
+  const body = rows.map(r=>{
+    const flags = (r.flags||[]).map(f=>`<div>${esc(f.text||f.code||'')}</div>`).join('');
+    return `<tr>
+      <td class="mono">${esc(r.order_id)}</td>
+      <td class="mono">${esc(r.item_id||'')} ${r.spec ? esc(r.spec) : '<span class="muted">规格未提供</span>'}</td>
+      <td>${esc(r.status||'')}</td>
+      <td class="warn">${flags}</td>
+      <td class="muted">${esc((r.suggested||'').slice(0,80))}</td>
+      <td class="muted mono">${esc((r.updated_at||'').replace('T',' '))}</td></tr>`;
+  }).join('');
+  $('rvWrap').innerHTML = `<table>${head}${body}</table>`;
+}
+
+async function loadNewItems(){
+  const d = await api('/api/delivery/new-item-checks?n=3');
+  if(!d.ok){ $('niKv').innerHTML = '<span class="err">加载失败：'+esc(d.error||'')+'</span>'; return; }
+  const rows = d.items || [];
+  $('niKv').innerHTML = [
+    `阈值 <b>${esc(String(d.threshold||3))}</b> 单`,
+    `待抽查商品 <b class="${rows.length?'warn':'ok'}">${rows.length}</b>`
+  ].map(x=>`<span>${x}</span>`).join('');
+  if(!rows.length){ $('niWrap').innerHTML = '<span class="muted">没有处于前 N 单区间的商品</span>'; return; }
+  const head = `<tr><th>商品</th><th>已售</th><th>最近订单</th><th>提示</th></tr>`;
+  const body = rows.map(r=>`<tr>
+      <td class="mono">${esc(r.item_id)}</td>
+      <td>${esc(r.order_count)} / ${esc(r.threshold)}</td>
+      <td class="muted mono">${esc((r.order_ids||[]).join(', '))}<br>${esc((r.latest_at||'').replace('T',' '))}</td>
+      <td class="warn">${esc(r.hint||'')}</td></tr>`).join('');
+  $('niWrap').innerHTML = `<table>${head}${body}</table>`;
+}
+
+$('btnSaveCfg').onclick = async () => {
+  const body = {
+    retry_inline: $('cRetryInline').value === '1',
+    inline_retries: Number($('cInlineRetries').value),
+    inline_backoff_seconds: Number($('cBackoff').value),
+    auto_resend: $('cAutoResend').value === '1',
+    max_attempts: Number($('cMaxAttempts').value),
+    resend_delay_minutes: Number($('cDelay').value),
+    lease_seconds: Number($('cLease').value),
+    keep_days: Number($('cKeep').value),
+  };
+  const d = await api('/api/delivery/config', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+  });
+  toast(d.ok ? '已保存' : ('失败：'+(d.error||'')), !d.ok);
+  load();
+};
+load();
+</script>
+</body>
+</html>
